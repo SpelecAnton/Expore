@@ -223,7 +223,7 @@ const _whiteTex = (() => {
 function runBSPWorker(buffer, textureBase, fallbackTexBase, onProgress) {
   return new Promise(async (resolve, reject) => {
     try {
-      const workerUrl = 'https://cdn.jsdelivr.net/gh/SpelecAnton/Expore@main/javascript/bsp_worker.js';
+      const workerUrl = 'https://spelecanton.github.io/Expore/javascript/bsp_worker.js';
       const code    = await fetch(workerUrl).then(r => r.text());
       const blob    = new Blob([code], { type: 'application/javascript' });
       const blobUrl = URL.createObjectURL(blob);

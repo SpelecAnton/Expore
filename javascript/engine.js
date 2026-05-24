@@ -23,8 +23,8 @@
  */
 
 import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.165.0/build/three.module.js';
-import { loadBSP, tickAnimatedTextures } from 'https://cdn.jsdelivr.net/gh/SpelecAnton/Expore@main/javascript/bsp_loader.js';
-import { createPhysics } from 'https://cdn.jsdelivr.net/gh/SpelecAnton/Expore@main/javascript/physics.js';
+import { loadBSP, tickAnimatedTextures } from 'https://spelecanton.github.io/Expore/javascript/bsp_loader.js';
+import { createPhysics } from 'https://spelecanton.github.io/Expore/javascript/physics.js';
 
 const PLAYER_HEIGHT = 80;
 const FOV           = 90;
