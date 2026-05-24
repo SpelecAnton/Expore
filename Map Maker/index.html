@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="cs">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>SPELEC — EXPLORE</title>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Share+Tech+Mono&display=swap');
+    *{margin:0;padding:0;box-sizing:border-box}
+    body{background:#000;overflow:hidden;font-family:'Share Tech Mono',monospace}
+    #canvas{display:block;width:100vw;height:100vh;cursor:default}
+    #fade{position:fixed;inset:0;background:#000;opacity:0;pointer-events:none;
+          transition:opacity .35s;z-index:200}
+    #fade.out{opacity:1}
+    #loading{position:fixed;inset:0;background:#000;display:flex;flex-direction:column;
+             align-items:center;justify-content:center;z-index:100;transition:opacity .5s}
+    #loading.gone{opacity:0;pointer-events:none}
+    #loading h1{color:#ff2200;font-size:4vh;letter-spacing:.5em;margin-bottom:4vh;
+                text-shadow:0 0 20px #ff220066}
+    .bar-wrap{width:30vh;height:2px;background:rgba(255,255,255,.1);overflow:hidden}
+    .bar{height:100%;background:#ff2200;width:0%;transition:width .15s linear;
+         box-shadow:0 0 8px #ff2200}
+    #loading p{margin-top:2vh;color:rgba(255,255,255,.3);font-size:1.4vh;letter-spacing:.2em}
+    #scanlines{position:fixed;inset:0;pointer-events:none;z-index:5;
+               background:repeating-linear-gradient(0deg,transparent,transparent 2px,
+               rgba(0,0,0,.07) 2px,rgba(0,0,0,.07) 4px)}
+    #vignette{position:fixed;inset:0;pointer-events:none;z-index:4;
+              background:radial-gradient(ellipse at center,transparent 50%,rgba(0,0,0,.75) 100%)}
+  </style>
+
+  <link rel="icon" type="image/png" href="/images/favicon/favicon-96x96.png" sizes="96x96" />
+  <link rel="icon" type="image/svg+xml" href="/images/favicon/favicon.svg" />
+  <link rel="shortcut icon" href="/images/favicon/favicon.ico" />
+  <link rel="apple-touch-icon" sizes="180x180" href="/images/favicon/apple-touch-icon.png" />
+  <link rel="manifest" href="/images/favicon/site.webmanifest" />
+</head>
+<body>
+<canvas id="canvas"></canvas>
+<div id="fade"></div>
+<div id="loading">
+  <h1>SPELEC</h1>
+  <div class="bar-wrap"><div class="bar" id="bar"></div></div>
+  <p id="load-status">LOADING...</p>
+</div>
+<div id="scanlines"></div>
+<div id="vignette"></div>
+<script type="module">
+  import { initEngine } from 'https://spelecanton.github.io/Expore/javascript/engine.js';
+
+  const bar     = document.getElementById('bar');
+  const loading = document.getElementById('loading');
+  const status  = document.getElementById('load-status');
+
+  try {
+    const canvas = document.getElementById('canvas');
+    canvas.width  = window.innerWidth;
+    canvas.height = window.innerHeight;
+
+    await initEngine({
+      canvas,
+      mapUrl:      './map.bsp',
+      textureBase: './textures/',
+      mapName:     'MaPnAmE',
+
+      onProgress(pct) {
+        bar.style.width = pct + '%';
+        if      (pct < 10)  status.textContent = 'LOADING MAP...';
+        else if (pct < 40)  status.textContent = 'LIGHTMAPS...';
+        else if (pct < 85)  status.textContent = 'GEOMETRY...';
+        else if (pct < 95)  status.textContent = 'TEXTURES...';
+        else                status.textContent = 'PREPARING SCENE...';
+      },
+
+      onReady() {
+        bar.style.width = '100%';
+        setTimeout(() => loading.classList.add('gone'), 400);
+      },
+    });
+  } catch (err) {
+    console.error('[Hub] Engine error:', err);
+    status.textContent = 'Error: ' + err.message;
+  }
+</script>
+</body>
+</html>
