@@ -1,15 +1,17 @@
 /**
- * SPELEC PHYSICS v1.1 — FIXED WITH SMOOTH LOOK UP/DOWN
+ * SPELEC PHYSICS v1.2 — EXTERNAL CONFIG
  * Gravitace, kolize se světem, step-up pro schody, svahy a plynulý pohled Q/E.
+ *
+ * CFG defaulty jsou zde — přepsat lze z index.html přes physicsConfig v initEngine().
  */
 
 import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.165.0/build/three.module.js';
 
 // ─────────────────────────────────────────────────────────────────────────────
-// CONFIG
+// DEFAULT CONFIG (přepsatelné zvenčí přes userCFG)
 // ─────────────────────────────────────────────────────────────────────────────
 
-const CFG = {
+const DEFAULT_CFG = {
   // Pohyb
   MOVE_SPEED:    280 * 0.02,        // jednotky/s (stejné jako engine, přepočteno)
   TURN_SPEED:    2.5,               // rad/s
@@ -79,7 +81,10 @@ function nearbyMeshes(collidables, origin, maxDist) {
 // PHYSICS CONTROLLER
 // ─────────────────────────────────────────────────────────────────────────────
 
-export function createPhysics(scene) {
+export function createPhysics(scene, userCFG = {}) {
+
+  // Merge: defaulty + co přijde z index.html
+  const CFG = { ...DEFAULT_CFG, ...userCFG };
 
   // ── Stav ──────────────────────────────────────────────────────────────────
   const velocity = new THREE.Vector3(0, 0, 0);
@@ -254,18 +259,15 @@ export function createPhysics(scene) {
     if (keys['d'] || keys['arrowright']) yaw -= CFG.TURN_SPEED * dt;
 
     // ── Vertikální naklonění (Pitch - nahoru/dolů) ─────────────────────────────
-    const MAX_PITCH = 45 * (Math.PI / 180); // Cílových 45 stupňů v radiánech
+    const MAX_PITCH = 45 * (Math.PI / 180);
 
     if (keys['q']) {
-      // Plynulý posun dolů (směr k -45°)
       currentPitch -= CFG.LOOK_SPEED * dt;
       if (currentPitch < -MAX_PITCH) currentPitch = -MAX_PITCH;
     } else if (keys['e']) {
-      // Plynulý posun nahoru (směr k +45°)
       currentPitch += CFG.LOOK_SPEED * dt;
       if (currentPitch > MAX_PITCH) currentPitch = MAX_PITCH;
     } else {
-      // Pokud se nic nemačká, plynule se vrať k 0 (vodorovně) pomocí lerpu
       if (currentPitch !== 0) {
         const signBefore = Math.sign(currentPitch);
         if (currentPitch > 0) {
@@ -273,14 +275,12 @@ export function createPhysics(scene) {
         } else {
           currentPitch += CFG.RETURN_SPEED * dt;
         }
-        // Ošetření překmitu nuly
         if (Math.sign(currentPitch) !== signBefore) {
           currentPitch = 0;
         }
       }
     }
 
-    // Aplikace výsledné rotace na kameru (pořadí YXZ je zásadní)
     camera.rotation.set(currentPitch, yaw, 0, 'YXZ');
 
     // ── Pohyb (horizontal) ───────────────────────────────────────────────────
