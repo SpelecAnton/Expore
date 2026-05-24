@@ -22,9 +22,9 @@
  *   kontroluje, zda mezi kamerou a portálem nestojí geometrie světa.
  */
 
-import * as THREE       from 'https://cdn.jsdelivr.net/npm/three@0.165.0/build/three.module.js';
-import { loadBSP, tickAnimatedTextures } from '/explore/bsp_loader.js';
-import { createPhysics } from '/explore/physics.js';
+import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.165.0/build/three.module.js';
+import { loadBSP, tickAnimatedTextures } from 'https://cdn.jsdelivr.net/gh/SpelecAnton/Expore@main/javascript/bsp_loader.js';
+import { createPhysics } from 'https://cdn.jsdelivr.net/gh/SpelecAnton/Expore@main/javascript/physics.js';
 
 const PLAYER_HEIGHT = 80;
 const FOV           = 90;

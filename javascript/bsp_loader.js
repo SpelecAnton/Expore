@@ -73,8 +73,6 @@ async function loadAnimatedTex(url) {
     console.log(`[BSP] Animated texture ${url}: ${frameCount} frames, decoding...`);
 
     // Dekóduj všechny framy sekvenčně do ImageBitmap
-    // (ImageDecoder podporuje paralelní decode přes frameIndex, ale framy
-    //  musíme zpracovat po pořadí kvůli dispose-after-use)
     const decoder = new ImageDecoder({
       data: new Blob([buffer], { type }).stream(),
       type,
@@ -219,16 +217,29 @@ const _whiteTex = (() => {
 })();
 
 // ── Worker runner ─────────────────────────────────────────────────────────────
+// bsp_worker.js se načte přes fetch z GitHubu CDN a spustí jako Blob URL —
+// tím obejdeme same-origin omezení prohlížeče pro new Worker(cross-origin-url).
+// Po skončení workeru se Blob URL automaticky uvolní přes revokeObjectURL.
 function runBSPWorker(buffer, textureBase, fallbackTexBase, onProgress) {
-  return new Promise((resolve, reject) => {
-    const worker = new Worker('/explore/bsp_worker.js');
-    worker.onmessage = ({ data }) => {
-      if (data.type === 'progress')     { onProgress?.(data.pct); }
-      else if (data.type === 'done')    { worker.terminate(); resolve(data); }
-      else if (data.type === 'error')   { worker.terminate(); reject(new Error(data.message)); }
-    };
-    worker.onerror = err => { worker.terminate(); reject(err); };
-    worker.postMessage({ buffer, textureBase, fallbackTexBase }, [buffer]);
+  return new Promise(async (resolve, reject) => {
+    try {
+      const workerUrl = 'https://cdn.jsdelivr.net/gh/SpelecAnton/Expore@main/javascript/bsp_worker.js';
+      const code    = await fetch(workerUrl).then(r => r.text());
+      const blob    = new Blob([code], { type: 'application/javascript' });
+      const blobUrl = URL.createObjectURL(blob);
+
+      const worker = new Worker(blobUrl);
+      worker.onmessage = ({ data }) => {
+        if (data.type === 'progress')   { onProgress?.(data.pct); }
+        else if (data.type === 'done')  { worker.terminate(); URL.revokeObjectURL(blobUrl); resolve(data); }
+        else if (data.type === 'error') { worker.terminate(); URL.revokeObjectURL(blobUrl); reject(new Error(data.message)); }
+      };
+      worker.onerror = err => { worker.terminate(); URL.revokeObjectURL(blobUrl); reject(err); };
+      worker.postMessage({ buffer, textureBase, fallbackTexBase }, [buffer]);
+
+    } catch (err) {
+      reject(err);
+    }
   });
 }
 
