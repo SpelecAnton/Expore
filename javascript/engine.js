@@ -316,6 +316,44 @@ export async function initEngine({
 
   if (onReady) onReady();
 
+  // ── Tlačítko "Kopírovat odkaz" ────────────────────────────────────────────
+  const copyBtn = document.createElement('button');
+  copyBtn.textContent = '📋 Kopírovat odkaz';
+  Object.assign(copyBtn.style, {
+    position:        'fixed',
+    bottom:          '20px',
+    right:           '20px',
+    zIndex:          '1000',
+    padding:         '8px 14px',
+    background:      'rgba(0,0,0,0.6)',
+    color:           '#fff',
+    border:          '1px solid rgba(255,255,255,0.25)',
+    borderRadius:    '6px',
+    fontFamily:      '"Share Tech Mono", monospace',
+    fontSize:        '13px',
+    cursor:          'pointer',
+    backdropFilter:  'blur(6px)',
+    transition:      'background 0.2s',
+  });
+  document.body.appendChild(copyBtn);
+
+  copyBtn.addEventListener('click', () => {
+    // Zapiš aktuální pozici do hashe těsně před kopírováním
+    writeHashState(
+      camera.position.x,
+      camera.position.y,
+      camera.position.z,
+      yaw
+    );
+    navigator.clipboard.writeText(window.location.href).then(() => {
+      copyBtn.textContent = '✅ Zkopírováno!';
+      setTimeout(() => { copyBtn.textContent = '📋 Kopírovat odkaz'; }, 2000);
+    }).catch(() => {
+      // Fallback pro prohlížeče bez clipboard API
+      prompt('Zkopíruj tuto URL:', window.location.href);
+    });
+  });
+
   // ── Render loop ────────────────────────────────────────────────────────────
   const clock = new THREE.Clock();
 
