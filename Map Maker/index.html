@@ -1,85 +1,109 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="cs">
 <head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>SPELEC — EXPLORE</title>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>EXPORE</title>
   <style>
-    @import url('https://fonts.googleapis.com/css2?family=Share+Tech+Mono&display=swap');
-    *{margin:0;padding:0;box-sizing:border-box}
-    body{background:#000;overflow:hidden;font-family:'Share Tech Mono',monospace}
-    #canvas{display:block;width:100vw;height:100vh;cursor:default}
-    #fade{position:fixed;inset:0;background:#000;opacity:0;pointer-events:none;
-          transition:opacity .35s;z-index:200}
-    #fade.out{opacity:1}
-    #loading{position:fixed;inset:0;background:#000;display:flex;flex-direction:column;
-             align-items:center;justify-content:center;z-index:100;transition:opacity .5s}
-    #loading.gone{opacity:0;pointer-events:none}
-    #loading h1{color:#ff2200;font-size:4vh;letter-spacing:.5em;margin-bottom:4vh;
-                text-shadow:0 0 20px #ff220066}
-    .bar-wrap{width:30vh;height:2px;background:rgba(255,255,255,.1);overflow:hidden}
-    .bar{height:100%;background:#ff2200;width:0%;transition:width .15s linear;
-         box-shadow:0 0 8px #ff2200}
-    #loading p{margin-top:2vh;color:rgba(255,255,255,.3);font-size:1.4vh;letter-spacing:.2em}
-    #scanlines{position:fixed;inset:0;pointer-events:none;z-index:5;
-               background:repeating-linear-gradient(0deg,transparent,transparent 2px,
-               rgba(0,0,0,.07) 2px,rgba(0,0,0,.07) 4px)}
-    #vignette{position:fixed;inset:0;pointer-events:none;z-index:4;
-              background:radial-gradient(ellipse at center,transparent 50%,rgba(0,0,0,.75) 100%)}
-  </style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { background: #000; overflow: hidden; }
+    canvas { display: block; }
 
-  <link rel="icon" type="image/png" href="/images/favicon/favicon-96x96.png" sizes="96x96" />
-  <link rel="icon" type="image/svg+xml" href="/images/favicon/favicon.svg" />
-  <link rel="shortcut icon" href="/images/favicon/favicon.ico" />
-  <link rel="apple-touch-icon" sizes="180x180" href="/images/favicon/apple-touch-icon.png" />
-  <link rel="manifest" href="/images/favicon/site.webmanifest" />
+    #loading {
+      position: fixed; inset: 0;
+      display: flex; flex-direction: column;
+      align-items: center; justify-content: center;
+      background: #000;
+      color: #fff;
+      font-family: "Share Tech Mono", monospace;
+      font-size: 14px;
+      gap: 16px;
+      z-index: 100;
+      transition: opacity 0.4s;
+    }
+    #loading.hidden { opacity: 0; pointer-events: none; }
+
+    #progress-bar {
+      width: 260px; height: 4px;
+      background: rgba(255,255,255,0.15);
+      border-radius: 2px;
+      overflow: hidden;
+    }
+    #progress-fill {
+      height: 100%; width: 0%;
+      background: #fff;
+      transition: width 0.2s;
+    }
+
+    #fade {
+      position: fixed; inset: 0;
+      background: #000;
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 0.35s;
+      z-index: 50;
+    }
+    #fade.out { opacity: 1; }
+  </style>
 </head>
 <body>
-<canvas id="canvas"></canvas>
-<div id="fade"></div>
+
 <div id="loading">
-  <h1>SPELEC</h1>
-  <div class="bar-wrap"><div class="bar" id="bar"></div></div>
-  <p id="load-status">LOADING...</p>
+  <div>Loading Map…</div>
+  <div id="progress-bar"><div id="progress-fill"></div></div>
 </div>
-<div id="scanlines"></div>
-<div id="vignette"></div>
+
+<div id="fade"></div>
+
+<canvas id="c"></canvas>
+
 <script type="module">
   import { initEngine } from 'https://spelecanton.github.io/Expore/javascript/engine.js';
 
-  const bar     = document.getElementById('bar');
-  const loading = document.getElementById('loading');
-  const status  = document.getElementById('load-status');
+  initEngine({
+    canvas:      document.getElementById('c'),
+    mapUrl:      'map.bsp',
+    textureBase: 'textures/',
+    mapName:     'MAP',
 
-  try {
-    const canvas = document.getElementById('canvas');
-    canvas.width  = window.innerWidth;
-    canvas.height = window.innerHeight;
+    physicsConfig: {
+      // Movement
+      MOVE_SPEED:      280 * 0.02,  // units/s
+      TURN_SPEED:      2.5,         // rad/s
+      LOOK_SPEED:      2.5,         // head tilt speed via Q/E
+      RETURN_SPEED:    5.0,         // smooth return speed of head to level
 
-    await initEngine({
-      canvas,
-      mapUrl:      './map.bsp',
-      textureBase: './textures/',
-      mapName:     'MaPnAmE',
+      // Gravity
+      GRAVITY:        -28.0,        // units/s² — increase for faster fall
+      JUMP_SPEED:      3.0,         // initial vertical velocity on jump
+      TERMINAL_VEL:  -30.0,         // terminal fall velocity
 
-      onProgress(pct) {
-        bar.style.width = pct + '%';
-        if      (pct < 10)  status.textContent = 'LOADING MAP...';
-        else if (pct < 40)  status.textContent = 'LIGHTMAPS...';
-        else if (pct < 85)  status.textContent = 'GEOMETRY...';
-        else if (pct < 95)  status.textContent = 'TEXTURES...';
-        else                status.textContent = 'PREPARING SCENE...';
-      },
+      // Player
+      PLAYER_HEIGHT:  80 * 0.02,    // camera height above the floor
+      PLAYER_RADIUS:   0.28,        // player capsule radius (XZ)
+      PLAYER_MASS:     1.0,         // (reserved for future use)
 
-      onReady() {
-        bar.style.width = '100%';
-        setTimeout(() => loading.classList.add('gone'), 400);
-      },
-    });
-  } catch (err) {
-    console.error('[Hub] Engine error:', err);
-    status.textContent = 'Error: ' + err.message;
-  }
+      // Collision
+      STEP_HEIGHT:     0.45,        // max stair/slope step height
+      SLOPE_MAX_ANGLE: 50,          // max stair angle (°) — above this = wall
+      SKIN_WIDTH:      0.02,        // small offset to prevent player from sinking into walls
+      GROUND_CHECK:    0.18,        // ground raycast length below player
+
+      // Raycast
+      NUM_SIDE_RAYS:   8,           // number of side collision rays
+      NUM_SLOPE_RAYS:  4,           // rays for slope detection below player
+    },
+
+    onProgress(pct) {
+      document.getElementById('progress-fill').style.width = pct + '%';
+    },
+    onReady() {
+      const el = document.getElementById('loading');
+      el.classList.add('hidden');
+      setTimeout(() => el.remove(), 500);
+    },
+  });
 </script>
+
 </body>
 </html>
