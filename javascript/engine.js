@@ -1,25 +1,13 @@
 /**
- * SPELEC EXPLORE ENGINE v6.4 — WORKER LOADING EDITION
+ * SPELEC EXPLORE ENGINE v6.5 — URL POSITION SYNC
  *
- * Změny oproti v6.2:
- * - Předává onProgress do loadBSP → loading bar reaguje reálně na průběh
- * parsování (ne jen falešný ticker)
- * - Ticker v index.html lze zrušit — engine posílá přesná % zpět přes callback
- * - Zbytek kódu beze změny (render loop, portály, fyzika)
+ * Změny oproti v6.4:
+ * - Pozice a rotace hráče se ukládají do URL hashe každou sekundu
+ * - Při načtení stránky se pozice obnoví z hashe (pokud existuje)
+ * - Formát hashe: #x,y,z,yaw  (zaokrouhleno na 3 desetinná místa)
+ * - Sdílení: stačí zkopírovat URL z adresního řádku a poslat
  *
- * Změny v6.4:
- * - Portál podporuje vlastnost "opacity" (0.0–1.0, výchozí 0.78)
- * - Portál podporuje "width" a "height" v BSP jednotkách
- * - Pokud není zadáno width/height, použije se "size" → čtverec
- * - Pokud není zadáno nic, výchozí čtverec 110×110
- * - OPRAVA: Průhlednost a světla již nejsou animovaná, drží statické hodnoty
- * - OPRAVA 2: Okraj (border) portálu nyní správně aplikuje transparentnost
- * * Úprava (Label):
- * - Pokud je label prázdný, nezobrazuje se URL ani prázdný mesh letadla.
- *
- * Změny v6.5:
- * - OPRAVA: Portály nelze klikat skrz zdi — getHoveredPortal() nyní
- *   kontroluje, zda mezi kamerou a portálem nestojí geometrie světa.
+ * Ostatní funkce beze změny (portály, fyzika, animované textury, okluze).
  */
 
 import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.165.0/build/three.module.js';
@@ -29,6 +17,37 @@ import { createPhysics } from 'https://spelecanton.github.io/Expore/javascript/p
 const PLAYER_HEIGHT = 80;
 const FOV           = 90;
 const UNIT          = 0.02;
+
+// ── URL hash helpers ──────────────────────────────────────────────────────────
+
+/**
+ * Přečte stav z URL hashe.
+ * Formát: #x,y,z,yaw
+ * Vrátí objekt nebo null pokud hash neexistuje / je neplatný.
+ */
+function readHashState() {
+  const hash = window.location.hash.slice(1); // odstraní '#'
+  if (!hash) return null;
+
+  const parts = hash.split(',').map(Number);
+  if (parts.length < 4 || parts.some(isNaN)) return null;
+
+  return {
+    x:   parts[0],
+    y:   parts[1],
+    z:   parts[2],
+    yaw: parts[3],
+  };
+}
+
+/**
+ * Zapíše aktuální stav do URL hashe bez přidání záznamu do historie.
+ */
+function writeHashState(x, y, z, yaw) {
+  const r = v => Math.round(v * 1000) / 1000; // 3 desetinná místa
+  const hash = `${r(x)},${r(y)},${r(z)},${r(yaw)}`;
+  history.replaceState(null, '', '#' + hash);
+}
 
 // ── Portal label ──────────────────────────────────────────────────────────────
 function buildPortalLabel(label, col, mesh) {
@@ -183,7 +202,13 @@ export async function initEngine({
 
     for (const props of result.portals) buildPortal(props, scene, portals);
 
-    if (result.playerStart) {
+    // ── Nastav startovní pozici: z URL hashe, nebo z playerStart ─────────────
+    const hashState = readHashState();
+
+    if (hashState) {
+      camera.position.set(hashState.x, hashState.y, hashState.z);
+      yaw = hashState.yaw;
+    } else if (result.playerStart) {
       const ps = result.playerStart;
       camera.position.set(ps.x, ps.y + PLAYER_HEIGHT * UNIT, ps.z);
       yaw = ps.angle * Math.PI / 180;
@@ -218,8 +243,13 @@ export async function initEngine({
 
   // ── Fyzika ────────────────────────────────────────────────────────────────
   const physics = createPhysics(scene);
+
   window._cam     = camera;
   window._physics = physics;
+
+  // ── URL hash sync — zapisuje polohu každou sekundu ────────────────────────
+  let _lastHashWrite = 0;
+  const HASH_WRITE_INTERVAL = 1000; // ms
 
   // ── Portálový raycaster ───────────────────────────────────────────────────
   const portalRaycaster = new THREE.Raycaster();
@@ -302,6 +332,18 @@ export async function initEngine({
       const p = portals[i];
       p.mesh.material.opacity = p.opacity;
       p.ptLight.intensity     = 3.0; 
+    }
+
+    // ── Zápis pozice do URL hashe (každou sekundu) ──────────────────────────
+    const now = performance.now();
+    if (now - _lastHashWrite >= HASH_WRITE_INTERVAL) {
+      _lastHashWrite = now;
+      writeHashState(
+        camera.position.x,
+        camera.position.y,
+        camera.position.z,
+        yaw
+      );
     }
 
     canvas.style.cursor = getHoveredPortal() ? 'pointer' : 'default';
