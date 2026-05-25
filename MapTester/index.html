@@ -13,51 +13,37 @@
       position: fixed; inset: 0;
       display: flex; flex-direction: column;
       align-items: center; justify-content: center;
-      background: #000;
-      color: #fff;
+      background: #000; color: #fff;
       font-family: "Share Tech Mono", monospace;
-      font-size: 14px;
-      gap: 16px;
-      z-index: 100;
+      font-size: 14px; gap: 16px; z-index: 100;
       transition: opacity 0.4s;
     }
     #loading.hidden { opacity: 0; pointer-events: none; }
-
     #progress-bar {
       width: 260px; height: 4px;
       background: rgba(255,255,255,0.15);
-      border-radius: 2px;
-      overflow: hidden;
+      border-radius: 2px; overflow: hidden;
     }
     #progress-fill {
-      height: 100%; width: 0%;
-      background: #fff;
+      height: 100%; width: 0%; background: #fff;
       transition: width 0.2s;
     }
-
     #fade {
-      position: fixed; inset: 0;
-      background: #000;
-      opacity: 0;
-      pointer-events: none;
-      transition: opacity 0.35s;
-      z-index: 50;
+      position: fixed; inset: 0; background: #000;
+      opacity: 0; pointer-events: none;
+      transition: opacity 0.35s; z-index: 50;
     }
     #fade.out { opacity: 1; }
-
     #picker {
       position: fixed; inset: 0;
       display: flex; flex-direction: column;
       align-items: center; justify-content: center;
-      background: #000;
-      color: #fff;
+      background: #000; color: #fff;
       font-family: "Share Tech Mono", monospace;
-      gap: 24px;
-      z-index: 200;
+      gap: 24px; z-index: 200;
     }
     #picker h1 { font-size: 22px; letter-spacing: 0.15em; opacity: 0.9; }
     #picker p  { font-size: 12px; opacity: 0.45; max-width: 340px; text-align: center; line-height: 1.7; }
-
     .pick-row { display: flex; flex-direction: column; gap: 8px; width: 320px; }
     .pick-label { font-size: 11px; opacity: 0.5; letter-spacing: 0.1em; text-transform: uppercase; }
     .pick-btn {
@@ -65,27 +51,22 @@
       padding: 10px 16px;
       background: rgba(255,255,255,0.06);
       border: 1px solid rgba(255,255,255,0.12);
-      border-radius: 6px;
-      color: #fff;
+      border-radius: 6px; color: #fff;
       font-family: "Share Tech Mono", monospace;
-      font-size: 13px;
-      cursor: pointer;
+      font-size: 13px; cursor: pointer;
       transition: background 0.15s, border-color 0.15s;
     }
     .pick-btn:hover { background: rgba(255,255,255,0.11); border-color: rgba(255,255,255,0.25); }
     .pick-btn.ok { border-color: rgba(255,255,255,0.4); }
     .pick-btn .icon { font-size: 18px; }
     .pick-btn .name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-
     #start-btn {
-      margin-top: 8px;
-      padding: 11px 36px;
+      margin-top: 8px; padding: 11px 36px;
       background: #fff; color: #000;
       border: none; border-radius: 6px;
       font-family: "Share Tech Mono", monospace;
       font-size: 14px; cursor: pointer;
-      letter-spacing: 0.08em;
-      transition: opacity 0.15s;
+      letter-spacing: 0.08em; transition: opacity 0.15s;
     }
     #start-btn:disabled { opacity: 0.25; cursor: default; }
     #start-btn:not(:disabled):hover { opacity: 0.85; }
@@ -96,7 +77,6 @@
 
 <div id="picker">
   <h1>EXPORE</h1>
-
   <div class="pick-row">
     <div class="pick-label">BSP mapa *</div>
     <button class="pick-btn" id="btn-bsp" onclick="document.getElementById('in-bsp').click()">
@@ -105,7 +85,6 @@
     </button>
     <input type="file" id="in-bsp" accept=".bsp">
   </div>
-
   <div class="pick-row">
     <div class="pick-label">Složka s texturami (volitelné)</div>
     <button class="pick-btn" id="btn-tex" onclick="document.getElementById('in-tex').click()">
@@ -114,7 +93,6 @@
     </button>
     <input type="file" id="in-tex" webkitdirectory multiple>
   </div>
-
   <button id="start-btn" disabled>Spustit →</button>
   <p>Soubory zůstávají v prohlížeči — nic se nenahrává na internet.</p>
 </div>
@@ -123,17 +101,102 @@
   <div>Loading Map…</div>
   <div id="progress-bar"><div id="progress-fill"></div></div>
 </div>
-
 <div id="fade"></div>
 <canvas id="c"></canvas>
+
+<script>
+// ═══════════════════════════════════════════════════════════════════════════
+// TEXTURE INTERCEPT — musí běžet PŘED importem engine.js
+//
+// Problém: ImageDecoder volá fetch() interně v prohlížeči (C++ vrstva),
+// monkey-patch window.fetch ho nezachytí.
+//
+// Řešení: textureBase = '' (prázdný string), ale přepíšeme ImageDecoder
+// a THREE.TextureLoader tak, aby URL začínající "local-tex:///" přeložily
+// na blob: URL které jsme předpřipravili při výběru složky.
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Globální mapa:  "basename_lowercase" → blob:URL  (např. "fire1" → "blob:...")
+// Klíč je BEZ přípony — hledáme best-match přes přípony
+window._localTexMap = new Map(); // "fire1.gif" → "blob:...", "fire1.png" → "blob:..."
+
+const LOCAL_PREFIX = 'local-tex:///';
+
+// ── Patch: window.fetch ────────────────────────────────────────────────────
+const _origFetch = window.fetch.bind(window);
+
+function resolveLocalUrl(url) {
+  if (!url || !url.startsWith(LOCAL_PREFIX)) return null;
+  const path = url.slice(LOCAL_PREFIX.length).toLowerCase(); // "fire1.gif"
+  const m    = window._localTexMap;
+
+  // 1. Přesná shoda: "fire1.gif"
+  if (m.has(path)) return m.get(path);
+
+  // 2. Jen basename: "textures/fire1.gif" → "fire1.gif"
+  const base = path.split('/').pop();
+  if (m.has(base)) return m.get(base);
+
+  // 3. Libovolná přípona pro stejný stem
+  const stem = path.replace(/\.[^.]+$/, '');
+  const baseStem = base.replace(/\.[^.]+$/, '');
+  for (const [k, v] of m) {
+    const kstem = k.replace(/\.[^.]+$/, '');
+    if (kstem === stem || kstem === baseStem) return v;
+  }
+
+  return null;
+}
+
+window.fetch = async function(input, init) {
+  const url = typeof input === 'string' ? input
+            : (input instanceof Request ? input.url : String(input));
+
+  if (url && url.startsWith(LOCAL_PREFIX)) {
+    const blobUrl = resolveLocalUrl(url);
+
+    if (!blobUrl) return new Response(null, { status: 404 });
+
+    if (init && init.method === 'HEAD') {
+      const ext = url.split('.').pop().toLowerCase();
+      const mime = { gif:'image/gif', avif:'image/avif', webp:'image/webp',
+                     png:'image/png', jpg:'image/jpeg', jpeg:'image/jpeg' };
+      return new Response(null, {
+        status: 200,
+        headers: { 'Content-Type': mime[ext] || 'application/octet-stream' },
+      });
+    }
+
+    return _origFetch(blobUrl, init);
+  }
+
+  return _origFetch(input, init);
+};
+
+// ── Patch: ImageDecoder ────────────────────────────────────────────────────
+// ImageDecoder přijímá { data: ReadableStream | ... }
+// Pokud mu dáme blob URL místo local-tex://, funguje normálně.
+// Ale bsp_loader.js si staví data stream sám z fetch() výsledku —
+// takže fetch patch stačí pro tělo, ale ImageDecoder dostane stream
+// z blob URL přes náš fetch → OK.
+//
+// Jenže: bsp_loader.js dělá:
+//   const response = await fetch(url);          ← náš fetch vrátí fetch(blobUrl)
+//   const buffer   = await response.arrayBuffer();
+//   new ImageDecoder({ data: new Blob([buffer]).stream(), ... })
+// → ImageDecoder dostane Blob stream, NE local-tex:// URL → funguje!
+//
+// Problém byl že dřív fetch vracel Response z _origFetch(blobUrl) ale
+// blobUrl byl undefined protože resolveLocalUrl vracel null.
+// Teď máme správnou mapu, takže fetch vrátí správný blob a vše funguje.
+
+console.log('[LocalTex] Fetch intercept aktivní');
+</script>
 
 <script type="module">
   import { initEngine } from 'https://spelecanton.github.io/Expore/javascript/engine.js';
 
-  let bspFile    = null;
-  // texBlobMap: klíč = "name" (bez přípony, lowercase) → Map přípona→blobURL
-  // Např. "fire1" → { ".gif": "blob:...", ".png": "blob:..." }
-  const texBlobMap = new Map();
+  let bspFile = null;
 
   const startBtn = document.getElementById('start-btn');
   const lblBsp   = document.getElementById('lbl-bsp');
@@ -141,7 +204,7 @@
   const btnBsp   = document.getElementById('btn-bsp');
   const btnTex   = document.getElementById('btn-tex');
 
-  // ── BSP výběr ──────────────────────────────────────────────────────────────
+  // ── BSP výběr ────────────────────────────────────────────────────────────
   document.getElementById('in-bsp').addEventListener('change', e => {
     bspFile = e.target.files[0] || null;
     if (bspFile) {
@@ -151,114 +214,33 @@
     }
   });
 
-  // ── Textura složka ─────────────────────────────────────────────────────────
-  // Předem vytvoříme blob: URL pro každý soubor a indexujeme je.
-  // Klíč = basename bez přípony (lowercase), value = Map(ext → blobURL)
+  // ── Textura složka ────────────────────────────────────────────────────────
+  // Každý File → blob: URL, uloženo do window._localTexMap
+  // Klíč = filename lowercase ("fire1.gif"), value = "blob:..."
   document.getElementById('in-tex').addEventListener('change', e => {
-    texBlobMap.clear();
+    // Uvolni staré blob URL
+    for (const v of window._localTexMap.values()) URL.revokeObjectURL(v);
+    window._localTexMap.clear();
+
     for (const f of e.target.files) {
-      const fullName = f.name.toLowerCase();
-      const dotIdx   = fullName.lastIndexOf('.');
-      const base     = dotIdx >= 0 ? fullName.slice(0, dotIdx) : fullName;
-      const ext      = dotIdx >= 0 ? fullName.slice(dotIdx) : '';
+      const name    = f.name.toLowerCase();                     // "fire1.gif"
+      const blobUrl = URL.createObjectURL(f);
+      window._localTexMap.set(name, blobUrl);
 
-      // Také index podle relativní cesty bez root složky
-      const parts   = f.webkitRelativePath.toLowerCase().split('/');
-      const relBase = parts.slice(1).join('/').replace(/\.[^.]+$/, '');
-
-      const blobURL = URL.createObjectURL(f);
-
-      for (const key of [base, relBase]) {
-        if (!texBlobMap.has(key)) texBlobMap.set(key, new Map());
-        texBlobMap.get(key).set(ext, blobURL);
-      }
+      // Také relativní cesta bez root složky: "textures/fire1.gif" → "fire1.gif"
+      const parts  = f.webkitRelativePath.toLowerCase().split('/');
+      const relKey = parts.slice(1).join('/');                  // "fire1.gif" nebo "sub/fire1.gif"
+      if (relKey !== name) window._localTexMap.set(relKey, blobUrl);
     }
+
     const count = e.target.files.length;
     lblTex.textContent = count ? `${count} souborů vybráno` : 'Vybrat složku textur…';
     if (count) btnTex.classList.add('ok');
-    console.log('[Local] Textur indexováno:', texBlobMap.size, 'unikátních názvů');
+    console.log('[LocalTex] Indexováno:', window._localTexMap.size, 'záznamů');
+    console.log('[LocalTex] Klíče:', [...window._localTexMap.keys()].slice(0, 10));
   });
 
-  // ── Fetch intercept ────────────────────────────────────────────────────────
-  // bsp_loader.js volá:
-  //   fetch(url, { method: 'HEAD' })  — probe jestli soubor existuje
-  //   fetch(url)                       — stažení
-  // url má tvar:  LOCAL_TEX_BASE + name + ext
-  //   kde name může být "fire1" nebo "textures/fire1" atd.
-  //
-  // Náš intercept: pokud URL začíná LOCAL_PREFIX, extrahuje name+ext,
-  // najde blob URL v texBlobMap a vrátí správnou Response.
-
-  const LOCAL_PREFIX = 'local-tex:///';
-  const _origFetch   = window.fetch.bind(window);
-  const TEX_EXTS     = ['.gif', '.avif', '.webp', '.png', '.jpg', '.jpeg'];
-
-  function findBlobUrl(name, ext) {
-    // name může být "fire1" nebo "textures/fire1" nebo "textures/base/fire1"
-    const lname = name.toLowerCase();
-    const lext  = ext.toLowerCase();
-
-    // Přesná shoda
-    const exactMap = texBlobMap.get(lname);
-    if (exactMap) {
-      if (exactMap.has(lext)) return exactMap.get(lext);
-      // Vrať cokoliv co máme pro tento název (jiná přípona)
-      if (exactMap.size > 0) return exactMap.values().next().value;
-    }
-
-    // Zkus jen basename (poslední segment)
-    const basename = lname.split('/').pop();
-    const baseMap  = texBlobMap.get(basename);
-    if (baseMap) {
-      if (baseMap.has(lext)) return baseMap.get(lext);
-      if (baseMap.size > 0) return baseMap.values().next().value;
-    }
-
-    return null;
-  }
-
-  window.fetch = async function(input, init) {
-    const url = typeof input === 'string' ? input
-              : (input instanceof Request ? input.url : String(input));
-
-    if (url && url.startsWith(LOCAL_PREFIX)) {
-      // Extrahuj "name.ext" z URL
-      const path  = url.slice(LOCAL_PREFIX.length);          // např. "fire1.gif"
-      const dotIdx = path.lastIndexOf('.');
-      const name  = dotIdx >= 0 ? path.slice(0, dotIdx) : path;
-      const ext   = dotIdx >= 0 ? path.slice(dotIdx) : '';
-
-      if (texBlobMap.size === 0) {
-        // Žádné textury nenačteny — 404
-        return new Response(null, { status: 404 });
-      }
-
-      const blobUrl = findBlobUrl(name, ext);
-
-      if (!blobUrl) {
-        return new Response(null, { status: 404 });
-      }
-
-      // HEAD probe — vrať jen OK + typ
-      if (init && init.method === 'HEAD') {
-        const mimeMap = {
-          '.gif': 'image/gif', '.avif': 'image/avif', '.webp': 'image/webp',
-          '.png': 'image/png', '.jpg':  'image/jpeg', '.jpeg': 'image/jpeg',
-        };
-        return new Response(null, {
-          status:  200,
-          headers: { 'Content-Type': mimeMap[ext] || 'application/octet-stream' },
-        });
-      }
-
-      // GET — fetchni blob: URL (to je same-origin, funguje)
-      return _origFetch(blobUrl, init);
-    }
-
-    return _origFetch(input, init);
-  };
-
-  // ── BSP jako blob URL ──────────────────────────────────────────────────────
+  // ── BSP → blob URL ────────────────────────────────────────────────────────
   function bspToBlobUrl(file) {
     return new Promise((resolve, reject) => {
       const reader = new FileReader();
@@ -270,7 +252,7 @@
     });
   }
 
-  // ── Start ──────────────────────────────────────────────────────────────────
+  // ── Start ─────────────────────────────────────────────────────────────────
   startBtn.addEventListener('click', async () => {
     if (!bspFile) return;
 
@@ -286,16 +268,15 @@
       return;
     }
 
-    // textureBase = náš LOCAL_PREFIX (fetch intercept ho zachytí)
-    // fallbackTexBase = '' (aby nesahal na file://)
-    const texBase = texBlobMap.size > 0 ? LOCAL_PREFIX : '';
+    const hasLocalTex = window._localTexMap.size > 0;
+    const texBase     = hasLocalTex ? LOCAL_PREFIX : '';
 
     try {
       await initEngine({
         canvas:          document.getElementById('c'),
         mapUrl:          bspBlobUrl,
         textureBase:     texBase,
-        fallbackTexBase: '',   // <-- důležité: zakáže fallback na file://
+        fallbackTexBase: '',   // zakáže fallback na file://
         mapName:         bspFile.name.replace(/\.bsp$/i, '').toUpperCase(),
 
         physicsConfig: {
