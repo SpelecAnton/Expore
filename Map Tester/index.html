@@ -1,0 +1,339 @@
+<!DOCTYPE html>
+<html lang="cs">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>EXPORE</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { background: #000; overflow: hidden; }
+    canvas { display: block; }
+
+    #loading {
+      position: fixed; inset: 0;
+      display: flex; flex-direction: column;
+      align-items: center; justify-content: center;
+      background: #000;
+      color: #fff;
+      font-family: "Share Tech Mono", monospace;
+      font-size: 14px;
+      gap: 16px;
+      z-index: 100;
+      transition: opacity 0.4s;
+    }
+    #loading.hidden { opacity: 0; pointer-events: none; }
+
+    #progress-bar {
+      width: 260px; height: 4px;
+      background: rgba(255,255,255,0.15);
+      border-radius: 2px;
+      overflow: hidden;
+    }
+    #progress-fill {
+      height: 100%; width: 0%;
+      background: #fff;
+      transition: width 0.2s;
+    }
+
+    #fade {
+      position: fixed; inset: 0;
+      background: #000;
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 0.35s;
+      z-index: 50;
+    }
+    #fade.out { opacity: 1; }
+
+    #picker {
+      position: fixed; inset: 0;
+      display: flex; flex-direction: column;
+      align-items: center; justify-content: center;
+      background: #000;
+      color: #fff;
+      font-family: "Share Tech Mono", monospace;
+      gap: 24px;
+      z-index: 200;
+    }
+    #picker h1 { font-size: 22px; letter-spacing: 0.15em; opacity: 0.9; }
+    #picker p  { font-size: 12px; opacity: 0.45; max-width: 340px; text-align: center; line-height: 1.7; }
+
+    .pick-row { display: flex; flex-direction: column; gap: 8px; width: 320px; }
+    .pick-label { font-size: 11px; opacity: 0.5; letter-spacing: 0.1em; text-transform: uppercase; }
+    .pick-btn {
+      display: flex; align-items: center; gap: 12px;
+      padding: 10px 16px;
+      background: rgba(255,255,255,0.06);
+      border: 1px solid rgba(255,255,255,0.12);
+      border-radius: 6px;
+      color: #fff;
+      font-family: "Share Tech Mono", monospace;
+      font-size: 13px;
+      cursor: pointer;
+      transition: background 0.15s, border-color 0.15s;
+    }
+    .pick-btn:hover { background: rgba(255,255,255,0.11); border-color: rgba(255,255,255,0.25); }
+    .pick-btn.ok { border-color: rgba(255,255,255,0.4); }
+    .pick-btn .icon { font-size: 18px; }
+    .pick-btn .name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+    #start-btn {
+      margin-top: 8px;
+      padding: 11px 36px;
+      background: #fff; color: #000;
+      border: none; border-radius: 6px;
+      font-family: "Share Tech Mono", monospace;
+      font-size: 14px; cursor: pointer;
+      letter-spacing: 0.08em;
+      transition: opacity 0.15s;
+    }
+    #start-btn:disabled { opacity: 0.25; cursor: default; }
+    #start-btn:not(:disabled):hover { opacity: 0.85; }
+    input[type="file"] { display: none; }
+  </style>
+</head>
+<body>
+
+<div id="picker">
+  <h1>EXPORE</h1>
+
+  <div class="pick-row">
+    <div class="pick-label">BSP mapa *</div>
+    <button class="pick-btn" id="btn-bsp" onclick="document.getElementById('in-bsp').click()">
+      <span class="icon">🗺️</span>
+      <span class="name" id="lbl-bsp">Vybrat soubor .bsp…</span>
+    </button>
+    <input type="file" id="in-bsp" accept=".bsp">
+  </div>
+
+  <div class="pick-row">
+    <div class="pick-label">Složka s texturami (volitelné)</div>
+    <button class="pick-btn" id="btn-tex" onclick="document.getElementById('in-tex').click()">
+      <span class="icon">🖼️</span>
+      <span class="name" id="lbl-tex">Vybrat složku textur…</span>
+    </button>
+    <input type="file" id="in-tex" webkitdirectory multiple>
+  </div>
+
+  <button id="start-btn" disabled>Spustit →</button>
+  <p>Soubory zůstávají v prohlížeči — nic se nenahrává na internet.</p>
+</div>
+
+<div id="loading" style="display:none">
+  <div>Loading Map…</div>
+  <div id="progress-bar"><div id="progress-fill"></div></div>
+</div>
+
+<div id="fade"></div>
+<canvas id="c"></canvas>
+
+<script type="module">
+  import { initEngine } from 'https://spelecanton.github.io/Expore/javascript/engine.js';
+
+  let bspFile    = null;
+  // texBlobMap: klíč = "name" (bez přípony, lowercase) → Map přípona→blobURL
+  // Např. "fire1" → { ".gif": "blob:...", ".png": "blob:..." }
+  const texBlobMap = new Map();
+
+  const startBtn = document.getElementById('start-btn');
+  const lblBsp   = document.getElementById('lbl-bsp');
+  const lblTex   = document.getElementById('lbl-tex');
+  const btnBsp   = document.getElementById('btn-bsp');
+  const btnTex   = document.getElementById('btn-tex');
+
+  // ── BSP výběr ──────────────────────────────────────────────────────────────
+  document.getElementById('in-bsp').addEventListener('change', e => {
+    bspFile = e.target.files[0] || null;
+    if (bspFile) {
+      lblBsp.textContent = bspFile.name;
+      btnBsp.classList.add('ok');
+      startBtn.disabled = false;
+    }
+  });
+
+  // ── Textura složka ─────────────────────────────────────────────────────────
+  // Předem vytvoříme blob: URL pro každý soubor a indexujeme je.
+  // Klíč = basename bez přípony (lowercase), value = Map(ext → blobURL)
+  document.getElementById('in-tex').addEventListener('change', e => {
+    texBlobMap.clear();
+    for (const f of e.target.files) {
+      const fullName = f.name.toLowerCase();
+      const dotIdx   = fullName.lastIndexOf('.');
+      const base     = dotIdx >= 0 ? fullName.slice(0, dotIdx) : fullName;
+      const ext      = dotIdx >= 0 ? fullName.slice(dotIdx) : '';
+
+      // Také index podle relativní cesty bez root složky
+      const parts   = f.webkitRelativePath.toLowerCase().split('/');
+      const relBase = parts.slice(1).join('/').replace(/\.[^.]+$/, '');
+
+      const blobURL = URL.createObjectURL(f);
+
+      for (const key of [base, relBase]) {
+        if (!texBlobMap.has(key)) texBlobMap.set(key, new Map());
+        texBlobMap.get(key).set(ext, blobURL);
+      }
+    }
+    const count = e.target.files.length;
+    lblTex.textContent = count ? `${count} souborů vybráno` : 'Vybrat složku textur…';
+    if (count) btnTex.classList.add('ok');
+    console.log('[Local] Textur indexováno:', texBlobMap.size, 'unikátních názvů');
+  });
+
+  // ── Fetch intercept ────────────────────────────────────────────────────────
+  // bsp_loader.js volá:
+  //   fetch(url, { method: 'HEAD' })  — probe jestli soubor existuje
+  //   fetch(url)                       — stažení
+  // url má tvar:  LOCAL_TEX_BASE + name + ext
+  //   kde name může být "fire1" nebo "textures/fire1" atd.
+  //
+  // Náš intercept: pokud URL začíná LOCAL_PREFIX, extrahuje name+ext,
+  // najde blob URL v texBlobMap a vrátí správnou Response.
+
+  const LOCAL_PREFIX = 'local-tex:///';
+  const _origFetch   = window.fetch.bind(window);
+  const TEX_EXTS     = ['.gif', '.avif', '.webp', '.png', '.jpg', '.jpeg'];
+
+  function findBlobUrl(name, ext) {
+    // name může být "fire1" nebo "textures/fire1" nebo "textures/base/fire1"
+    const lname = name.toLowerCase();
+    const lext  = ext.toLowerCase();
+
+    // Přesná shoda
+    const exactMap = texBlobMap.get(lname);
+    if (exactMap) {
+      if (exactMap.has(lext)) return exactMap.get(lext);
+      // Vrať cokoliv co máme pro tento název (jiná přípona)
+      if (exactMap.size > 0) return exactMap.values().next().value;
+    }
+
+    // Zkus jen basename (poslední segment)
+    const basename = lname.split('/').pop();
+    const baseMap  = texBlobMap.get(basename);
+    if (baseMap) {
+      if (baseMap.has(lext)) return baseMap.get(lext);
+      if (baseMap.size > 0) return baseMap.values().next().value;
+    }
+
+    return null;
+  }
+
+  window.fetch = async function(input, init) {
+    const url = typeof input === 'string' ? input
+              : (input instanceof Request ? input.url : String(input));
+
+    if (url && url.startsWith(LOCAL_PREFIX)) {
+      // Extrahuj "name.ext" z URL
+      const path  = url.slice(LOCAL_PREFIX.length);          // např. "fire1.gif"
+      const dotIdx = path.lastIndexOf('.');
+      const name  = dotIdx >= 0 ? path.slice(0, dotIdx) : path;
+      const ext   = dotIdx >= 0 ? path.slice(dotIdx) : '';
+
+      if (texBlobMap.size === 0) {
+        // Žádné textury nenačteny — 404
+        return new Response(null, { status: 404 });
+      }
+
+      const blobUrl = findBlobUrl(name, ext);
+
+      if (!blobUrl) {
+        return new Response(null, { status: 404 });
+      }
+
+      // HEAD probe — vrať jen OK + typ
+      if (init && init.method === 'HEAD') {
+        const mimeMap = {
+          '.gif': 'image/gif', '.avif': 'image/avif', '.webp': 'image/webp',
+          '.png': 'image/png', '.jpg':  'image/jpeg', '.jpeg': 'image/jpeg',
+        };
+        return new Response(null, {
+          status:  200,
+          headers: { 'Content-Type': mimeMap[ext] || 'application/octet-stream' },
+        });
+      }
+
+      // GET — fetchni blob: URL (to je same-origin, funguje)
+      return _origFetch(blobUrl, init);
+    }
+
+    return _origFetch(input, init);
+  };
+
+  // ── BSP jako blob URL ──────────────────────────────────────────────────────
+  function bspToBlobUrl(file) {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload  = e => resolve(URL.createObjectURL(
+        new Blob([e.target.result], { type: 'application/octet-stream' })
+      ));
+      reader.onerror = reject;
+      reader.readAsArrayBuffer(file);
+    });
+  }
+
+  // ── Start ──────────────────────────────────────────────────────────────────
+  startBtn.addEventListener('click', async () => {
+    if (!bspFile) return;
+
+    document.getElementById('picker').style.display  = 'none';
+    document.getElementById('loading').style.display = 'flex';
+
+    let bspBlobUrl;
+    try {
+      bspBlobUrl = await bspToBlobUrl(bspFile);
+    } catch(err) {
+      document.getElementById('loading').innerHTML =
+        `<div style="color:#f55">Chyba čtení BSP: ${err.message}</div>`;
+      return;
+    }
+
+    // textureBase = náš LOCAL_PREFIX (fetch intercept ho zachytí)
+    // fallbackTexBase = '' (aby nesahal na file://)
+    const texBase = texBlobMap.size > 0 ? LOCAL_PREFIX : '';
+
+    try {
+      await initEngine({
+        canvas:          document.getElementById('c'),
+        mapUrl:          bspBlobUrl,
+        textureBase:     texBase,
+        fallbackTexBase: '',   // <-- důležité: zakáže fallback na file://
+        mapName:         bspFile.name.replace(/\.bsp$/i, '').toUpperCase(),
+
+        physicsConfig: {
+          MOVE_SPEED:      280 * 0.02,
+          TURN_SPEED:      2.5,
+          LOOK_SPEED:      2.5,
+          RETURN_SPEED:    5.0,
+          GRAVITY:        -28.0,
+          JUMP_SPEED:      3.0,
+          TERMINAL_VEL:  -30.0,
+          PLAYER_HEIGHT:  80 * 0.02,
+          PLAYER_RADIUS:   0.28,
+          PLAYER_MASS:     1.0,
+          STEP_HEIGHT:     0.45,
+          SLOPE_MAX_ANGLE: 50,
+          SKIN_WIDTH:      0.02,
+          GROUND_CHECK:    0.18,
+          NUM_SIDE_RAYS:   8,
+          NUM_SLOPE_RAYS:  4,
+        },
+
+        onProgress(pct) {
+          document.getElementById('progress-fill').style.width = pct + '%';
+        },
+        onReady() {
+          URL.revokeObjectURL(bspBlobUrl);
+          const el = document.getElementById('loading');
+          el.classList.add('hidden');
+          setTimeout(() => el.remove(), 500);
+        },
+      });
+    } catch(err) {
+      console.error(err);
+      document.getElementById('loading').innerHTML =
+        `<div style="color:#f55">Chyba enginu: ${err.message}</div>`;
+    }
+  });
+</script>
+
+</body>
+</html>
