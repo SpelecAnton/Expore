@@ -144,7 +144,7 @@
 "origin" "-440 -504 328"
 "angle" "90"
 "color" "0x0044ff"
-"opacity" "0.9"
+"opacity" "0.8"
 "target_url" "https://spelec.cz/expore/sounds/liguere.ogg"
 "label" "This will play sound"
 }
@@ -177,7 +177,7 @@
 "label" "This one is wide"
 "angle" "90"
 "color" "0x00ff00"
-"opacity" "0.4"
+"opacity" "0.2"
 "width" "300"
 "height" "100"
 }
