@@ -110,6 +110,8 @@ async function loadAnimatedTex(url) {
     const tex = new THREE.CanvasTexture(canvas);
     tex.wrapS       = tex.wrapT = THREE.RepeatWrapping;
     tex.colorSpace  = THREE.SRGBColorSpace;
+    tex.minFilter   = THREE.NearestFilter;
+    tex.magFilter   = THREE.NearestFilter;
     tex.needsUpdate = true;
 
     _animList.push({
@@ -137,6 +139,8 @@ function loadStaticTex(url) {
       tex => {
         tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
         tex.colorSpace = THREE.SRGBColorSpace;
+        tex.minFilter = THREE.NearestFilter;
+        tex.magFilter = THREE.NearestFilter;
         res(tex);
       },
       undefined,
@@ -205,6 +209,8 @@ const _whiteTex = (() => {
   c.getContext('2d').fillRect(0, 0, 1, 1);
   const t = new THREE.CanvasTexture(c);
   t.colorSpace = THREE.SRGBColorSpace;
+  t.minFilter = THREE.NearestFilter;
+  t.magFilter = THREE.NearestFilter;
   return t;
 })();
 
