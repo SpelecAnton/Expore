@@ -7,6 +7,11 @@
  *   statické PNG/JPG/AVIF/WEBP (1 frame) → TextureLoader
  *
  * findTex: paralelní HEAD probe pro všechny přípony → rychlý loading
+ *
+ * v2 — func_wall / noclip:
+ *   Batch s noclip=true dostane material.depthWrite = false
+ *   → physics.js ho automaticky vynechá z kolizních objektů.
+ *   Mesh je stále viditelný, jen bez kolize.
  */
 
 import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.165.0/build/three.module.js';
@@ -22,7 +27,7 @@ const _loader   = new THREE.TextureLoader();
 // Každý záznam: { frames: [{bitmap, duration}], canvas, ctx, tex, frameIdx, nextFrameTime }
 const _animList = [];
 
-// ── Tick — voláno každý frame z render loopu (synchronní, bez await) ──────────
+// ── Tick — voláno každý frame z render loopu ──────────────────────────────────
 export function tickAnimatedTextures() {
   if (!_animList.length) return;
   const now = performance.now();
@@ -39,7 +44,7 @@ export function tickAnimatedTextures() {
   }
 }
 
-// ── ImageDecoder loader — předekóduje všechny framy do ImageBitmap[] ──────────
+// ── ImageDecoder loader ───────────────────────────────────────────────────────
 async function loadAnimatedTex(url) {
   if (typeof ImageDecoder === 'undefined') {
     console.warn('[BSP] ImageDecoder is not available, static fallback:', url);
@@ -55,7 +60,6 @@ async function loadAnimatedTex(url) {
     const typeMap = { '.gif': 'image/gif', '.avif': 'image/avif', '.webp': 'image/webp' };
     const type    = typeMap[ext] ?? 'image/gif';
 
-    // Zjisti počet framů
     const probeDecoder = new ImageDecoder({
       data: new Blob([buffer], { type }).stream(),
       type,
@@ -65,14 +69,10 @@ async function loadAnimatedTex(url) {
     const frameCount = probeDecoder.tracks.selectedTrack?.frameCount ?? 1;
     probeDecoder.close();
 
-    // Statický obrázek — TextureLoader je rychlejší
-    if (frameCount <= 1) {
-      return loadStaticTex(url);
-    }
+    if (frameCount <= 1) return loadStaticTex(url);
 
     console.log(`[BSP] Animated texture ${url}: ${frameCount} frames, decoding...`);
 
-    // Dekóduj všechny framy sekvenčně do ImageBitmap
     const decoder = new ImageDecoder({
       data: new Blob([buffer], { type }).stream(),
       type,
@@ -84,10 +84,8 @@ async function loadAnimatedTex(url) {
     let w = 0, h = 0;
 
     for (let i = 0; i < frameCount; i++) {
-      const result  = await decoder.decode({ frameIndex: i });
-      const img     = result.image;
-
-      // Trvání framu v ms (metadata je v mikrosekundách)
+      const result   = await decoder.decode({ frameIndex: i });
+      const img      = result.image;
       const duration = (img.duration != null ? img.duration / 1000 : 100);
 
       if (i === 0) {
@@ -95,18 +93,14 @@ async function loadAnimatedTex(url) {
         h = img.displayHeight || img.codedHeight || 128;
       }
 
-      // Překopíruj do ImageBitmap aby šel zavřít originál
       const bitmap = await createImageBitmap(img, { resizeWidth: w, resizeHeight: h });
       img.close();
-
       frames.push({ bitmap, duration });
     }
 
     decoder.close();
-
     if (!frames.length) return loadStaticTex(url);
 
-    // Vytvoř canvas + Three.js texturu
     const canvas = document.createElement('canvas');
     canvas.width  = w;
     canvas.height = h;
@@ -151,7 +145,7 @@ function loadStaticTex(url) {
   });
 }
 
-// ── tryLoadTex — HEAD probe + správný loader ──────────────────────────────────
+// ── tryLoadTex ────────────────────────────────────────────────────────────────
 async function tryLoadTex(url) {
   if (_texCache.has(url)) return _texCache.get(url);
 
@@ -172,12 +166,11 @@ async function tryLoadTex(url) {
   return tex;
 }
 
-// ── findTex — paralelní HEAD probe, načte první nalezenou ────────────────────
+// ── findTex — paralelní HEAD probe ────────────────────────────────────────────
 async function findTex(bases, name) {
   for (const base of bases) {
     if (!base) continue;
 
-    // Paralelní HEAD pro všechny přípony najednou
     const probes = await Promise.all(
       TEX_EXTENSIONS.map(async ext => {
         const url = base + name + ext;
@@ -188,7 +181,6 @@ async function findTex(bases, name) {
       })
     );
 
-    // První existující v pořadí TEX_EXTENSIONS
     const found = probes.find(u => u !== null);
     if (!found) continue;
 
@@ -217,9 +209,6 @@ const _whiteTex = (() => {
 })();
 
 // ── Worker runner ─────────────────────────────────────────────────────────────
-// bsp_worker.js se načte přes fetch z GitHubu CDN a spustí jako Blob URL —
-// tím obejdeme same-origin omezení prohlížeče pro new Worker(cross-origin-url).
-// Po skončení workeru se Blob URL automaticky uvolní přes revokeObjectURL.
 function runBSPWorker(buffer, textureBase, fallbackTexBase, onProgress) {
   return new Promise(async (resolve, reject) => {
     try {
@@ -279,7 +268,7 @@ export async function loadBSP({
     lmTex.minFilter = lmTex.magFilter = THREE.LinearFilter;
   }
 
-  // ── Albedo textury — paralelně per textura ────────────────────────────────
+  // ── Albedo textury ────────────────────────────────────────────────────────
   const texBases    = [textureBase, fallbackTexBase];
   const uniqueNames = [...new Set(batches.map(b => texNames[b.texIdx] || 'default'))];
   const albedoMap   = new Map();
@@ -292,7 +281,7 @@ export async function loadBSP({
   onProgress?.(95);
 
   // ── Build meshů ───────────────────────────────────────────────────────────
-  let totalMeshes = 0, meshesWithLM = 0;
+  let totalMeshes = 0, meshesWithLM = 0, noclipMeshes = 0;
 
   for (const b of batches) {
     const pos = new Float32Array(b.pos);
@@ -318,6 +307,14 @@ export async function loadBSP({
       alphaTest: 0.5,
     });
 
+    // ── Noclip (func_wall apod.) ──────────────────────────────────────────
+    // depthWrite = false → physics.js ho přeskočí při buildování collidables
+    // Mesh je stále plně viditelný ve scéně.
+    if (b.noclip) {
+      mat.depthWrite = false;
+      noclipMeshes++;
+    }
+
     if (b.hasLM && lmTex) {
       mat.lightMap          = lmTex;
       mat.lightMapIntensity = 1.0;
@@ -328,7 +325,7 @@ export async function loadBSP({
     totalMeshes++;
   }
 
-  console.log(`[BSP] Meshs: ${totalMeshes}, with lightmap: ${meshesWithLM}`);
+  console.log(`[BSP] Meshes: ${totalMeshes}, s lightmapou: ${meshesWithLM}, noclip: ${noclipMeshes}`);
   onProgress?.(100);
 
   const result = { portals, playerStart };

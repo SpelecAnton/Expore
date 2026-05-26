@@ -10,6 +10,12 @@
  *   OUT { type: 'done',    ...ParsedBSP }   — úspěch
  *   OUT { type: 'error',   message }         — chyba
  *   OUT { type: 'progress', pct }            — průběh 0–100
+ *
+ * v2 — func_wall / noclip podpora:
+ *   Entity s classname v NOCLIP_CLASSNAMES mají model="*N".
+ *   Submodel N v LUMP_MODELS definuje firstFace + numFaces.
+ *   Tyto face indexy jsou předány do buildBatches → batch.noclip = true.
+ *   Loader pak nastaví material.depthWrite = false → physics je ignoruje.
  */
 
 'use strict';
@@ -19,16 +25,26 @@ const MAGIC           = 0x50534249; // 'IBSP'
 const VERSION         = 46;
 const LUMP_ENTITIES   = 0;
 const LUMP_TEXTURES   = 1;
+const LUMP_MODELS     = 7;   // ← submodely (func_* entity)
 const LUMP_LIGHTMAPS  = 14;
 const LUMP_VERTS      = 10;
 const LUMP_MESH_VERTS = 11;
 const LUMP_FACES      = 13;
 
-const TEX_RECORD_SIZE  = 72;
-const VERT_RECORD_SIZE = 44;
-const FACE_RECORD_SIZE = 104;
-const LM_SIZE          = 128 * 128 * 3;
-const UNIT             = 0.02;
+const TEX_RECORD_SIZE   = 72;
+const VERT_RECORD_SIZE  = 44;
+const FACE_RECORD_SIZE  = 104;
+const MODEL_RECORD_SIZE = 36;   // mins(12) + maxs(12) + face(4) + nFaces(4) + brush(4) + nBrushes(4)
+const LM_SIZE           = 128 * 128 * 3;
+const UNIT              = 0.02;
+
+// ── Entity classnames které mají být průchozí (bez kolize) ───────────────────
+const NOCLIP_CLASSNAMES = new Set([
+  'func_wall',
+  'func_illusionary',
+  'func_detail',
+  'func_fog',
+]);
 
 // ── Entity parser ─────────────────────────────────────────────────────────────
 function parseEntityLump(text) {
@@ -66,9 +82,37 @@ function parseEntityLump(text) {
   return entities;
 }
 
+// ── Zjisti noclip face indexy z entity + model lump ──────────────────────────
+// Vrátí Set<number> — absolutní indexy faces které patří noclip entitám.
+function buildNoclipFaceSet(entities, buffer, modelLump) {
+  const noclipFaces = new Set();
+  const modelCount  = (modelLump.length / MODEL_RECORD_SIZE) | 0;
+  const view        = new DataView(buffer);
+
+  // Submodel 0 = worldspawn — přeskočíme
+  // Submodely 1..N odpovídají entitám s model="*1", "*2", ...
+  for (const e of entities) {
+    if (!NOCLIP_CLASSNAMES.has(e.classname)) continue;
+
+    const modelStr = e.model ?? '';
+    if (!modelStr.startsWith('*')) continue;
+
+    const subIdx = parseInt(modelStr.slice(1), 10);
+    if (isNaN(subIdx) || subIdx < 1 || subIdx >= modelCount) continue;
+
+    const mOff      = modelLump.offset + subIdx * MODEL_RECORD_SIZE;
+    const firstFace = view.getInt32(mOff + 24, true);
+    const numFaces  = view.getInt32(mOff + 28, true);
+
+    for (let fi = firstFace; fi < firstFace + numFaces; fi++) {
+      noclipFaces.add(fi);
+    }
+  }
+
+  return noclipFaces;
+}
+
 // ── Lightmap atlas — kopírování po řádcích místo po pixelech ─────────────────
-// Uint8Array.set() je nativní memcpy — cca 20× rychlejší než pixel-loop.
-// RGB → RGBA konverze: pomocný buffer, pak set po řádcích.
 function buildLightmapAtlas(buffer, lmLump, lmCount) {
   if (lmCount === 0) return null;
 
@@ -78,10 +122,8 @@ function buildLightmapAtlas(buffer, lmLump, lmCount) {
   const H     = rows * 128;
   const atlas = new Uint8Array(W * H * 4);
 
-  // Předalokovaný řádkový buffer (128 px * 3 kanály)
   const rowRGB = new Uint8Array(128 * 3);
-
-  let nonZero = 0;
+  let nonZero  = 0;
 
   for (let idx = 0; idx < lmCount; idx++) {
     const chunkOffset = lmLump.offset + idx * LM_SIZE;
@@ -89,14 +131,10 @@ function buildLightmapAtlas(buffer, lmLump, lmCount) {
     const row = (idx / cols) | 0;
     const ox  = col * 128;
     const oy  = row * 128;
-
     const src = new Uint8Array(buffer, chunkOffset, LM_SIZE);
 
     for (let y = 0; y < 128; y++) {
-      // Jeden řádek RGB (128 * 3 bytes)
       rowRGB.set(src.subarray(y * 384, y * 384 + 384));
-
-      // Zapsat do atlasu (RGBA) — konverze inline po řádku
       const dstBase = ((oy + y) * W + ox) * 4;
       for (let x = 0; x < 128; x++) {
         const s = x * 3;
@@ -113,7 +151,7 @@ function buildLightmapAtlas(buffer, lmLump, lmCount) {
   return { atlasData: atlas.buffer, W, H, cols, rows, nonZero };
 }
 
-// ── Vertex buffer parsing — přímý DataView bez mezikopií ─────────────────────
+// ── Vertex buffer parsing ─────────────────────────────────────────────────────
 function parseVertices(buffer, vLump) {
   const vCount = (vLump.length / VERT_RECORD_SIZE) | 0;
   const view   = new DataView(buffer);
@@ -149,17 +187,17 @@ function parseVertices(buffer, vLump) {
   return { rawPos, rawUV1, rawUV2, rawNorm };
 }
 
-// ── Face batching + mesh building — vše v Workeru ─────────────────────────────
-// Vrací pole batch objektů; každý obsahuje hotové Float32Array buffery
-// připravené rovnou pro THREE.BufferGeometry (lze transferovat).
-function buildBatches(buffer, fLump, mvLump, rawPos, rawUV1, rawUV2, rawNorm, lmAtlas, lmCount) {
-  const view     = new DataView(buffer);
-  const fCount   = (fLump.length / FACE_RECORD_SIZE) | 0;
-  const mvCount  = (mvLump.length / 4) | 0;
+// ── Face batching + mesh building ─────────────────────────────────────────────
+// noclipFaces: Set<number> — face indexy které mají být průchozí
+function buildBatches(buffer, fLump, mvLump, rawPos, rawUV1, rawUV2, rawNorm, lmAtlas, lmCount, noclipFaces) {
+  const view      = new DataView(buffer);
+  const fCount    = (fLump.length / FACE_RECORD_SIZE) | 0;
+  const mvCount   = (mvLump.length / 4) | 0;
   const meshVerts = new Int32Array(buffer, mvLump.offset, mvCount);
 
   // ── Fáze 1: nasbírej indexy do batchů ────────────────────────────────────
-  const batchMap = new Map(); // key → { texIdx, lmIdx, absIndices: Int32Array[] }
+  // Klíč zahrnuje noclip flag — noclip face nesmí sdílet batch s normálními
+  const batchMap = new Map();
 
   for (let fi = 0; fi < fCount; fi++) {
     const fo       = fLump.offset + fi * FACE_RECORD_SIZE;
@@ -175,10 +213,13 @@ function buildBatches(buffer, fLump, mvLump, rawPos, rawUV1, rawUV2, rawNorm, lm
     const mvCount2 = view.getInt32(fo + 24, true);
     const lmIdx    = view.getInt32(fo + 28, true);
 
-    const key = `${texIdx}:${lmIdx}`;
+    // Noclip flag — oddělí batch od normálních
+    const isNoclip = noclipFaces.has(fi);
+    const key      = `${texIdx}:${lmIdx}:${isNoclip ? 'n' : 's'}`;
+
     let b = batchMap.get(key);
     if (!b) {
-      b = { texIdx, lmIdx, absIndices: [] };
+      b = { texIdx, lmIdx, noclip: isNoclip, absIndices: [] };
       batchMap.set(key, b);
     }
 
@@ -195,9 +236,9 @@ function buildBatches(buffer, fLump, mvLump, rawPos, rawUV1, rawUV2, rawNorm, lm
   }
 
   // ── Fáze 2: build geometry buffers ───────────────────────────────────────
-  const lmCols   = lmAtlas ? lmAtlas.cols : 1;
-  const lmW      = lmAtlas ? lmAtlas.W    : 1;
-  const lmH      = lmAtlas ? lmAtlas.H    : 1;
+  const lmCols = lmAtlas ? lmAtlas.cols : 1;
+  const lmW    = lmAtlas ? lmAtlas.W    : 1;
+  const lmH    = lmAtlas ? lmAtlas.H    : 1;
 
   const builtBatches = [];
 
@@ -205,13 +246,10 @@ function buildBatches(buffer, fLump, mvLump, rawPos, rawUV1, rawUV2, rawNorm, lm
     const absIdx = batch.absIndices;
     if (!absIdx.length) continue;
 
-    // Int32Array jako přímý lookup: globalIndex → localIndex (-1 = neexistuje)
-    // Najdi max global index pro alokaci
     let maxGI = 0;
     for (const gi of absIdx) if (gi > maxGI) maxGI = gi;
     const g2l = new Int32Array(maxGI + 1).fill(-1);
 
-    // Předalokuj výstupní buffery (worst case = absIdx.length unikátních vrcholů)
     const maxVerts = absIdx.length;
     const posArr  = new Float32Array(maxVerts * 3);
     const nrmArr  = new Float32Array(maxVerts * 3);
@@ -223,10 +261,10 @@ function buildBatches(buffer, fLump, mvLump, rawPos, rawUV1, rawUV2, rawNorm, lm
     if (lmAtlas && batch.lmIdx >= 0 && batch.lmIdx < lmCount) {
       const col  = batch.lmIdx % lmCols;
       const row  = (batch.lmIdx / lmCols) | 0;
-      lmOffU    = (col * 128) / lmW;
-      lmOffV    = (row * 128) / lmH;
-      lmScaleU  = 128 / lmW;
-      lmScaleV  = 128 / lmH;
+      lmOffU     = (col * 128) / lmW;
+      lmOffV     = (row * 128) / lmH;
+      lmScaleU   = 128 / lmW;
+      lmScaleV   = 128 / lmH;
     }
 
     let vertCount = 0;
@@ -257,10 +295,10 @@ function buildBatches(buffer, fLump, mvLump, rawPos, rawUV1, rawUV2, rawNorm, lm
       idxArr[i] = li;
     }
 
-    // Ořízni na skutečnou velikost (subarray = zero-copy view)
     builtBatches.push({
       texIdx:  batch.texIdx,
       lmIdx:   batch.lmIdx,
+      noclip:  batch.noclip,  // ← předáme loaderu
       hasLM:   lmAtlas !== null && batch.lmIdx >= 0 && batch.lmIdx < lmCount,
       pos:     posArr.subarray(0, vertCount * 3),
       nrm:     nrmArr.subarray(0, vertCount * 3),
@@ -316,6 +354,13 @@ self.onmessage = function ({ data }) {
 
     self.postMessage({ type: 'progress', pct: 10 });
 
+    // ── Noclip face set (func_wall atd.) ────────────────────────────────────
+    const modelLump   = lump(LUMP_MODELS);
+    const noclipFaces = buildNoclipFaceSet(entities, buffer, modelLump);
+    if (noclipFaces.size > 0) {
+      console.log(`[BSP Worker] Noclip faces: ${noclipFaces.size} (func_wall apod.)`);
+    }
+
     // ── Texture names ────────────────────────────────────────────────────────
     const texLump  = lump(LUMP_TEXTURES);
     const texCount = (texLump.length / TEX_RECORD_SIZE) | 0;
@@ -352,18 +397,17 @@ self.onmessage = function ({ data }) {
       lump(LUMP_FACES),
       lump(LUMP_MESH_VERTS),
       rawPos, rawUV1, rawUV2, rawNorm,
-      lmAtlas, lmCount
+      lmAtlas, lmCount,
+      noclipFaces,  // ← nové
     );
 
     self.postMessage({ type: 'progress', pct: 85 });
 
-    // ── Připrav transferable seznam ──────────────────────────────────────────
-    // Subarray sdílí buffer s originálem — musíme slice() pro bezpečný transfer
+    // ── Transferable ─────────────────────────────────────────────────────────
     const transferList = [];
     if (lmAtlas) transferList.push(lmAtlas.atlasData);
 
     for (const b of batches) {
-      // slice = vlastní buffer (subarray je jen view)
       b.pos = b.pos.slice().buffer;
       b.nrm = b.nrm.slice().buffer;
       b.uv1 = b.uv1.slice().buffer;
@@ -382,11 +426,11 @@ self.onmessage = function ({ data }) {
       ambientColorArr,
       texNames,
       lmAtlas: lmAtlas ? {
-        data: lmAtlas.atlasData,
-        W: lmAtlas.W,
-        H: lmAtlas.H,
-        cols: lmAtlas.cols,
-        rows: lmAtlas.rows,
+        data:    lmAtlas.atlasData,
+        W:       lmAtlas.W,
+        H:       lmAtlas.H,
+        cols:    lmAtlas.cols,
+        rows:    lmAtlas.rows,
         nonZero: lmAtlas.nonZero,
       } : null,
       batches,
