@@ -209,11 +209,32 @@ const _whiteTex = (() => {
 })();
 
 // ── Worker runner ─────────────────────────────────────────────────────────────
+// Zkusí načíst worker v tomto pořadí:
+//   1. Relativní cesta vedle loaderu (lokální dev)
+//   2. GitHub CDN (produkce)
+async function fetchWorkerCode() {
+  // Zjisti base URL tohoto modulu — worker hledáme vedle něj
+  const loaderUrl  = import.meta.url;
+  const loaderBase = loaderUrl.substring(0, loaderUrl.lastIndexOf('/') + 1);
+  const localUrl   = loaderBase + 'bsp_worker.js';
+  const remoteUrl  = 'https://spelecanton.github.io/Expore/javascript/bsp_worker.js';
+
+  for (const url of [localUrl, remoteUrl]) {
+    try {
+      const r = await fetch(url);
+      if (r.ok) {
+        console.log('[BSP] Worker načten z:', url);
+        return await r.text();
+      }
+    } catch { /* zkusíme další */ }
+  }
+  throw new Error('bsp_worker.js nenalezen (ani lokálně ani na GitHubu)');
+}
+
 function runBSPWorker(buffer, textureBase, fallbackTexBase, onProgress) {
   return new Promise(async (resolve, reject) => {
     try {
-      const workerUrl = 'https://spelecanton.github.io/Expore/javascript/bsp_worker.js';
-      const code    = await fetch(workerUrl).then(r => r.text());
+      const code    = await fetchWorkerCode();
       const blob    = new Blob([code], { type: 'application/javascript' });
       const blobUrl = URL.createObjectURL(blob);
 
@@ -221,7 +242,7 @@ function runBSPWorker(buffer, textureBase, fallbackTexBase, onProgress) {
       worker.onmessage = ({ data }) => {
         if (data.type === 'progress')   { onProgress?.(data.pct); }
         else if (data.type === 'done')  { worker.terminate(); URL.revokeObjectURL(blobUrl); resolve(data); }
-        else if (data.type === 'error') { worker.terminate(); URL.revokeObjectURL(blobUrl); reject(new Error(data.message)); }
+        else if (data.type === 'error') { worker.terminate(); URL.revokeObjectURL(blobUrl); reject(new Error(`[BSP Worker] ${data.message}`)); }
       };
       worker.onerror = err => { worker.terminate(); URL.revokeObjectURL(blobUrl); reject(err); };
       worker.postMessage({ buffer, textureBase, fallbackTexBase }, [buffer]);
