@@ -330,9 +330,13 @@ export async function loadBSP({
 
     // ── Noclip (func_wall apod.) ──────────────────────────────────────────
     // depthWrite = false → physics.js ho přeskočí při buildování collidables
-    // Mesh je stále plně viditelný ve scéně.
+    // polygonOffset → posunutí depth hodnoty aby nedocházelo k z-fightingu
+    // s world geometrií která leží na stejném místě.
     if (b.noclip) {
-      mat.depthWrite = false;
+      mat.depthWrite      = false;
+      mat.polygonOffset   = true;
+      mat.polygonOffsetFactor = -1;
+      mat.polygonOffsetUnits  = -1;
       noclipMeshes++;
     }
 
