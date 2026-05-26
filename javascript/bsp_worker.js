@@ -34,7 +34,7 @@ const LUMP_FACES      = 13;
 const TEX_RECORD_SIZE   = 72;
 const VERT_RECORD_SIZE  = 44;
 const FACE_RECORD_SIZE  = 104;
-const MODEL_RECORD_SIZE = 36;   // mins(12) + maxs(12) + face(4) + nFaces(4) + brush(4) + nBrushes(4)
+const MODEL_RECORD_SIZE = 40;   // mins(12) + maxs(12) + face(4) + nFaces(4) + brush(4) + nBrushes(4)
 const LM_SIZE           = 128 * 128 * 3;
 const UNIT              = 0.02;
 
@@ -103,6 +103,14 @@ function buildNoclipFaceSet(entities, buffer, modelLump) {
     const mOff      = modelLump.offset + subIdx * MODEL_RECORD_SIZE;
     const firstFace = view.getInt32(mOff + 24, true);
     const numFaces  = view.getInt32(mOff + 28, true);
+
+    console.log(`[BSP Worker] ${e.classname} model=*${subIdx}: firstFace=${firstFace}, numFaces=${numFaces}`);
+
+    // Sanity check — garbage hodnoty způsobují overflow dál
+    if (firstFace < 0 || numFaces < 0 || numFaces > 100000) {
+      console.warn(`[BSP Worker] Přeskakuji ${e.classname} — neplatné face hodnoty`);
+      continue;
+    }
 
     for (let fi = firstFace; fi < firstFace + numFaces; fi++) {
       noclipFaces.add(fi);
