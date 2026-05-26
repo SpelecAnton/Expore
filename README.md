@@ -1,6 +1,6 @@
 # Expore 🚶‍♂️✨
 
-A 3D "vibe-coded" walking simulator framework made specifically for people who don't know how to make a game.
+A 3D "vibe-coded" walking simulator inspired by worlds.com made specifically for people who don't know how to make a game.
 
 ---
 
