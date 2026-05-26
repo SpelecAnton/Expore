@@ -199,6 +199,9 @@ function buildBatches(buffer, fLump, mvLump, rawPos, rawUV1, rawUV2, rawNorm, lm
   // Klíč zahrnuje noclip flag — noclip face nesmí sdílet batch s normálními
   const batchMap = new Map();
 
+  // Celkový počet vrcholů — pro bounds check
+  const totalVerts = rawPos.length / 3;
+
   for (let fi = 0; fi < fCount; fi++) {
     const fo       = fLump.offset + fi * FACE_RECORD_SIZE;
     const texIdx   = view.getInt32(fo,      true);
@@ -208,6 +211,9 @@ function buildBatches(buffer, fLump, mvLump, rawPos, rawUV1, rawUV2, rawNorm, lm
     const vertStart = view.getInt32(fo + 12, true);
     const vertCount = view.getInt32(fo + 16, true);
     if (vertCount < 3) continue;
+
+    // Bounds check — poškozená data v BSP způsobují overflow
+    if (vertStart < 0 || vertStart >= totalVerts) continue;
 
     const mvStart  = view.getInt32(fo + 20, true);
     const mvCount2 = view.getInt32(fo + 24, true);
@@ -226,11 +232,17 @@ function buildBatches(buffer, fLump, mvLump, rawPos, rawUV1, rawUV2, rawNorm, lm
     const abs = b.absIndices;
     if (mvCount2 > 0) {
       for (let m = 0; m < mvCount2; m++) {
-        abs.push(vertStart + meshVerts[mvStart + m]);
+        const mvIdx = mvStart + m;
+        if (mvIdx < 0 || mvIdx >= mvCount) continue;
+        const gi = vertStart + meshVerts[mvIdx];
+        if (gi >= 0 && gi < totalVerts) abs.push(gi);
       }
     } else {
       for (let t = 1; t < vertCount - 1; t++) {
-        abs.push(vertStart, vertStart + t, vertStart + t + 1);
+        const a = vertStart, c_ = vertStart + t, d_ = vertStart + t + 1;
+        if (a < totalVerts && c_ < totalVerts && d_ < totalVerts) {
+          abs.push(a, c_, d_);
+        }
       }
     }
   }
@@ -246,9 +258,8 @@ function buildBatches(buffer, fLump, mvLump, rawPos, rawUV1, rawUV2, rawNorm, lm
     const absIdx = batch.absIndices;
     if (!absIdx.length) continue;
 
-    let maxGI = 0;
-    for (const gi of absIdx) if (gi > maxGI) maxGI = gi;
-    const g2l = new Int32Array(maxGI + 1).fill(-1);
+    // Map místo flat Int32Array — vyhne se allocation overflow při extrémních indexech
+    const g2l = new Map();
 
     const maxVerts = absIdx.length;
     const posArr  = new Float32Array(maxVerts * 3);
@@ -271,11 +282,11 @@ function buildBatches(buffer, fLump, mvLump, rawPos, rawUV1, rawUV2, rawNorm, lm
 
     for (let i = 0; i < absIdx.length; i++) {
       const gi = absIdx[i];
-      let li   = g2l[gi];
+      let li   = g2l.get(gi);
 
-      if (li === -1) {
+      if (li === undefined) {
         li = vertCount++;
-        g2l[gi] = li;
+        g2l.set(gi, li);
 
         posArr[li * 3]     = rawPos[gi * 3];
         posArr[li * 3 + 1] = rawPos[gi * 3 + 1];
