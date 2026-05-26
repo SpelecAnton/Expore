@@ -12,6 +12,13 @@
  *   Batch s noclip=true dostane material.depthWrite = false
  *   → physics.js ho automaticky vynechá z kolizních objektů.
  *   Mesh je stále viditelný, jen bez kolize.
+ *
+ * v3 — mipmaps + anizotropní filtrování:
+ *   minFilter = LinearMipmapLinearFilter → mipmaps generuje GPU automaticky,
+ *   nulový dopad na loading time, výrazně lepší kvalita textur na dálku.
+ *   magFilter = NearestFilter zůstává → zachovává retro pixel-art styl zblízka.
+ *   Anizotropní filtrování (až 8×) → lepší kvalita na šikmých plochách (podlahy, stropy).
+ *   initTexLoader(renderer) musí být voláno z engine.js před loadBSP().
  */
 
 import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.165.0/build/three.module.js';
@@ -19,6 +26,18 @@ import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.165.0/build/three.m
 // ── Konfigurace ───────────────────────────────────────────────────────────────
 const TEX_EXTENSIONS = ['.gif', '.avif', '.webp', '.png', '.jpg'];
 const ANIM_EXTS      = new Set(['.gif', '.avif', '.webp']);
+
+// ── Anizotropie — nastavena z engine.js přes initTexLoader() ─────────────────
+let _maxAniso = 1;
+
+/**
+ * Voláno z engine.js ihned po vytvoření rendereru.
+ * Zjistí maximální podporovanou anizotropii GPU a uloží ji pro všechny textury.
+ */
+export function initTexLoader(renderer) {
+  _maxAniso = Math.min(8, renderer.capabilities.getMaxAnisotropy());
+  console.log(`[BSP] Anizotropní filtrování: ${_maxAniso}×`);
+}
 
 // ── Interní state ─────────────────────────────────────────────────────────────
 const _texCache = new Map();
@@ -42,6 +61,19 @@ export function tickAnimatedTextures() {
     anim.frameIdx      = (anim.frameIdx + 1) % anim.frames.length;
     anim.nextFrameTime = now + frame.duration;
   }
+}
+
+// ── Aplikuj společné nastavení filtrování na texturu ─────────────────────────
+// minFilter: LinearMipmapLinear → mipmaps pro vzdálené textury (GPU generuje automaticky)
+// magFilter: Nearest            → pixel-art styl zblízka zachován
+// anisotropy: _maxAniso         → lepší kvalita na šikmých plochách
+function applyTexFilters(tex, { linearMag = false } = {}) {
+  tex.wrapS      = tex.wrapT = THREE.RepeatWrapping;
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.minFilter  = THREE.LinearMipmapLinearFilter;
+  tex.magFilter  = linearMag ? THREE.LinearFilter : THREE.NearestFilter;
+  tex.anisotropy = _maxAniso;
+  tex.generateMipmaps = true;
 }
 
 // ── ImageDecoder loader ───────────────────────────────────────────────────────
@@ -108,10 +140,7 @@ async function loadAnimatedTex(url) {
     ctx.drawImage(frames[0].bitmap, 0, 0, w, h);
 
     const tex = new THREE.CanvasTexture(canvas);
-    tex.wrapS       = tex.wrapT = THREE.RepeatWrapping;
-    tex.colorSpace  = THREE.SRGBColorSpace;
-    tex.minFilter   = THREE.NearestFilter;
-    tex.magFilter   = THREE.NearestFilter;
+    applyTexFilters(tex);
     tex.needsUpdate = true;
 
     _animList.push({
@@ -137,10 +166,7 @@ function loadStaticTex(url) {
     _loader.load(
       url,
       tex => {
-        tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
-        tex.colorSpace = THREE.SRGBColorSpace;
-        tex.minFilter = THREE.NearestFilter;
-        tex.magFilter = THREE.NearestFilter;
+        applyTexFilters(tex);
         res(tex);
       },
       undefined,
@@ -209,8 +235,9 @@ const _whiteTex = (() => {
   c.getContext('2d').fillRect(0, 0, 1, 1);
   const t = new THREE.CanvasTexture(c);
   t.colorSpace = THREE.SRGBColorSpace;
-  t.minFilter = THREE.NearestFilter;
-  t.magFilter = THREE.NearestFilter;
+  // 1×1 textura → mipmaps zbytečné, ale LinearFilter pro konzistenci
+  t.minFilter = THREE.LinearFilter;
+  t.magFilter = THREE.LinearFilter;
   return t;
 })();
 
@@ -288,11 +315,15 @@ export async function loadBSP({
 
     const atlasArr = new Uint8Array(lmAtlas.data);
     lmTex = new THREE.DataTexture(atlasArr, lmAtlas.W, lmAtlas.H, THREE.RGBAFormat);
-    lmTex.colorSpace  = THREE.SRGBColorSpace;
-    lmTex.channel     = 1;
-    lmTex.needsUpdate = true;
+    lmTex.colorSpace = THREE.SRGBColorSpace;
+    lmTex.channel    = 1;
+    // Lightmap: LinearMipmap + Linear mag → žádný pixel-art styl, chceme hladké světlo
+    lmTex.minFilter  = THREE.LinearMipmapLinearFilter;
+    lmTex.magFilter  = THREE.LinearFilter;
+    lmTex.anisotropy = _maxAniso;
+    lmTex.generateMipmaps = true;
     lmTex.wrapS = lmTex.wrapT = THREE.ClampToEdgeWrapping;
-    lmTex.minFilter = lmTex.magFilter = THREE.LinearFilter;
+    lmTex.needsUpdate = true;
   }
 
   // ── Albedo textury ────────────────────────────────────────────────────────
