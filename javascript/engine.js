@@ -1,12 +1,13 @@
 /**
- * SPELEC EXPLORE ENGINE v6.6 — EXTERNAL PHYSICS CONFIG
+ * SPELEC EXPLORE ENGINE v6.7 — AUDIO PORTALS + BACKGROUND MUSIC
  *
- * Změny oproti v6.5:
- * - initEngine() přijímá volitelný parametr physicsConfig
- * - physicsConfig se předá do createPhysics() — přepíše jen zadané hodnoty CFG
- * - Kompletní CFG s komentáři je vždy viditelný v index.html (viz níže)
- *
- * Ostatní funkce beze změny (portály, URL hash sync, animované textury, okluze).
+ * Změny oproti v6.6:
+ * - trigger_portal s target_url odkazující na .mp3/.ogg/.wav/.flac/.aac
+ *   nepřejde na stránku — pouze přehraje (nebo pauzuje) daný audio soubor.
+ * - initEngine() při startu automaticky hledá background.mp3 / .ogg / .wav
+ *   ve stejné složce jako mapa (mapBase). Pokud soubor existuje, přehraje ho
+ *   ve smyčce jako ambientní hudbu. Přehrávání startuje při prvním stisku
+ *   klávesy (Browser autoplay policy).
  *
  * ─── Použití v index.html ────────────────────────────────────────────────────
  *
@@ -14,29 +15,7 @@
  *    canvas:      document.getElementById('c'),
  *    mapUrl:      './maps/mymap.bsp',
  *    textureBase: './textures/',
- *    physicsConfig: {
- *      // Pohyb
- *      MOVE_SPEED:    280 * 0.02,
- *      TURN_SPEED:    2.5,
- *      LOOK_SPEED:    2.5,
- *      RETURN_SPEED:  5.0,
- *      // Gravitace
- *      GRAVITY:       -28.0,
- *      JUMP_SPEED:     3.0,
- *      TERMINAL_VEL:  -30.0,
- *      // Hráč
- *      PLAYER_HEIGHT:  80 * 0.02,
- *      PLAYER_RADIUS:   0.28,
- *      PLAYER_MASS:     1.0,
- *      // Kolize
- *      STEP_HEIGHT:     0.45,
- *      SLOPE_MAX_ANGLE: 50,
- *      SKIN_WIDTH:      0.02,
- *      GROUND_CHECK:    0.18,
- *      // Raycast
- *      NUM_SIDE_RAYS:   8,
- *      NUM_SLOPE_RAYS:  4,
- *    },
+ *    physicsConfig: { ... },
  *  });
  *
  * ─────────────────────────────────────────────────────────────────────────────
@@ -59,21 +38,86 @@ function readHashState() {
   const parts = hash.split(',').map(Number);
   if (parts.length < 4 || parts.some(isNaN)) return null;
 
-  return {
-    x:   parts[0],
-    y:   parts[1],
-    z:   parts[2],
-    yaw: parts[3],
-  };
+  return { x: parts[0], y: parts[1], z: parts[2], yaw: parts[3] };
 }
 
 function writeHashState(x, y, z, yaw) {
-  const r = v => Math.round(v * 1000) / 1000;
+  const r    = v => Math.round(v * 1000) / 1000;
   const hash = `${r(x)},${r(y)},${r(z)},${r(yaw)}`;
   history.replaceState(null, '', '#' + hash);
 }
 
+// ── Audio helpers ─────────────────────────────────────────────────────────────
+
+const AUDIO_EXTS = new Set(['.mp3', '.ogg', '.wav', '.flac', '.aac']);
+
+function isAudioUrl(url) {
+  try {
+    const path = new URL(url, location.href).pathname;
+    const ext  = path.substring(path.lastIndexOf('.')).toLowerCase();
+    return AUDIO_EXTS.has(ext);
+  } catch { return false; }
+}
+
+let _activePortalAudio = null;
+
+function playPortalAudio(url) {
+  const resolved = new URL(url, location.href).href;
+
+  // Stejný zdroj → toggle play/pause
+  if (_activePortalAudio && _activePortalAudio.src === resolved) {
+    if (_activePortalAudio.paused) _activePortalAudio.play();
+    else                           _activePortalAudio.pause();
+    return;
+  }
+
+  // Jiný zdroj → zastav předchozí
+  if (_activePortalAudio) {
+    _activePortalAudio.pause();
+    _activePortalAudio = null;
+  }
+
+  const audio = new Audio(resolved);
+  audio.play().catch(err => console.warn('[Engine] Portal audio play failed:', err));
+  _activePortalAudio = audio;
+}
+
+// ── Background music ──────────────────────────────────────────────────────────
+// Zkusí HEAD probe na background.mp3, .ogg, .wav v pořadí.
+// Vrátí Audio objekt připravený ke spuštění, nebo null.
+
+const BG_CANDIDATES = ['background.mp3', 'background.ogg', 'background.wav'];
+
+async function findBackgroundMusic(mapBase) {
+  for (const file of BG_CANDIDATES) {
+    const url = mapBase + file;
+    try {
+      const res = await fetch(url, { method: 'HEAD' });
+      if (res.ok) {
+        console.log(`[Engine] Background music found: ${url}`);
+        const audio  = new Audio(url);
+        audio.loop   = true;
+        audio.volume = 0.5;
+        return audio;
+      }
+    } catch { /* síťová chyba, zkusíme dál */ }
+  }
+  console.log('[Engine] No background music found (background.mp3/ogg/wav).');
+  return null;
+}
+
+// Odvodi base URL složky z mapUrl (odstraní filename).
+function mapBaseFromUrl(mapUrl) {
+  try {
+    const abs = new URL(mapUrl, location.href).href;
+    return abs.substring(0, abs.lastIndexOf('/') + 1);
+  } catch {
+    return './';
+  }
+}
+
 // ── Portal label ──────────────────────────────────────────────────────────────
+
 function buildPortalLabel(label, col, mesh) {
   if (!label) return null;
 
@@ -91,7 +135,7 @@ function buildPortalLabel(label, col, mesh) {
   ctx.textBaseline = 'middle';
   ctx.fillText(label.toUpperCase(), 256, 40);
 
-  const tex     = new THREE.CanvasTexture(canvas);
+  const tex = new THREE.CanvasTexture(canvas);
   tex.needsUpdate = true;
 
   const plane = new THREE.Mesh(
@@ -106,6 +150,7 @@ function buildPortalLabel(label, col, mesh) {
 }
 
 // ── Portal builder ────────────────────────────────────────────────────────────
+
 function buildPortal(props, scene, portals) {
   const [ox, oy, oz] = (props.origin || '0 0 0').split(' ').map(Number);
   const url   = props.target_url || '#';
@@ -135,7 +180,7 @@ function buildPortal(props, scene, portals) {
 
   mesh.add(new THREE.LineSegments(
     new THREE.EdgesGeometry(geo),
-    new THREE.LineBasicMaterial({ color: col, opacity: opacity, transparent: true })
+    new THREE.LineBasicMaterial({ color: col, opacity, transparent: true })
   ));
 
   const ptLight = new THREE.PointLight(col, 3.0, 7);
@@ -143,11 +188,12 @@ function buildPortal(props, scene, portals) {
   scene.add(ptLight);
 
   buildPortalLabel(label, col, mesh);
-  
+
   portals.push({ x, y, z, url, label, col, mesh, ptLight, opacity });
 }
 
 // ── Fallback room ─────────────────────────────────────────────────────────────
+
 function _fallbackRoom(scene) {
   const floorMat   = new THREE.MeshLambertMaterial({ color: 0x1a1a2e });
   const wallMat    = new THREE.MeshLambertMaterial({ color: 0x16213e });
@@ -176,6 +222,7 @@ function _fallbackRoom(scene) {
 }
 
 // ── initEngine ────────────────────────────────────────────────────────────────
+
 export async function initEngine({
   canvas,
   mapUrl          = '/explore/hub/maps/hub.bsp',
@@ -183,7 +230,7 @@ export async function initEngine({
   mapName         = 'MAP',
   onReady         = null,
   onProgress      = null,
-  physicsConfig   = {},   // ← sem patří CFG hodnoty z index.html
+  physicsConfig   = {},
 }) {
   const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
   renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
@@ -201,10 +248,13 @@ export async function initEngine({
   const ambient = new THREE.AmbientLight(0xffffff, 1.0);
   scene.add(ambient);
 
-  const portals = [];
-  let   yaw     = 0;
+  const portals    = [];
+  let   yaw        = 0;
+  let   worldMeshes = [];
 
-  let worldMeshes = [];
+  // ── Hledej background music paralelně s načítáním mapy ───────────────────
+  const mapBase    = mapBaseFromUrl(mapUrl);
+  const bgMusicPromise = findBackgroundMusic(mapBase);
 
   try {
     const result = await loadBSP({
@@ -255,11 +305,21 @@ export async function initEngine({
     });
   }
 
-  // ── Fyzika — předáme physicsConfig z index.html ───────────────────────────
+  // ── Fyzika ────────────────────────────────────────────────────────────────
   const physics = createPhysics(scene, physicsConfig);
 
   window._cam     = camera;
   window._physics = physics;
+
+  // ── Background music — spustí se při prvním stisku klávesy ───────────────
+  const bgMusic = await bgMusicPromise;
+  let   bgMusicStarted = false;
+
+  function startBgMusic() {
+    if (bgMusicStarted || !bgMusic) return;
+    bgMusicStarted = true;
+    bgMusic.play().catch(err => console.warn('[Engine] BG music play failed:', err));
+  }
 
   // ── URL hash sync ─────────────────────────────────────────────────────────
   let _lastHashWrite = 0;
@@ -298,16 +358,32 @@ export async function initEngine({
 
   // ── Input ─────────────────────────────────────────────────────────────────
   const keys = {};
+
   window.addEventListener('keydown', e => {
     keys[e.key.toLowerCase()] = true;
     if (e.key === ' ') e.preventDefault();
+    // Spustí background music i autoplay video při prvním stisku
+    startBgMusic();
     document.querySelectorAll('video').forEach(v => v.play().catch(() => {}));
   });
+
   window.addEventListener('keyup', e => { keys[e.key.toLowerCase()] = false; });
 
+  // Click: audio portál vs. normální portál
   window.addEventListener('click', () => {
+    // Každý klik také startuje BG music (klik je user gesture)
+    startBgMusic();
+
     const portal = getHoveredPortal();
     if (!portal) return;
+
+    if (isAudioUrl(portal.url)) {
+      // Audio portál — přehrát / pauzovat, bez přechodu na stránku
+      playPortalAudio(portal.url);
+      return;
+    }
+
+    // Normální portál — přechod na URL
     document.getElementById('fade')?.classList.add('out');
     setTimeout(() => { window.location.href = portal.url; }, 350);
   });
@@ -334,7 +410,7 @@ export async function initEngine({
     for (let i = 0; i < portals.length; i++) {
       const p = portals[i];
       p.mesh.material.opacity = p.opacity;
-      p.ptLight.intensity     = 3.0; 
+      p.ptLight.intensity     = 3.0;
     }
 
     const now = performance.now();
