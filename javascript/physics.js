@@ -1,13 +1,16 @@
 /**
- * SPELEC PHYSICS v1.2 — EXTERNAL CONFIG
- * Gravitace, kolize se světem, step-up pro schody, svahy a plynulý pohled Q/E.
+ * SPELEC PHYSICS v1.4 — OPTIMIZED COLLIDABLES
  *
- * CFG defaulty jsou zde — přepsat lze z index.html přes physicsConfig v initEngine().
+ * Změny oproti v1.3:
+ * - refreshCollidables() je nyní veřejná metoda volatelná ihned po loadBSP()
+ *   z engine.js → eliminuje lazy-init sekání při prvním framu.
+ * - nearbyMeshes: přidán pevný CULL_DIST limit (30 jednotek) jako první
+ *   rychlý filtr před výpočtem boundingSphere → snížení CPU zátěže při
+ *   velkých mapách s mnoha meshy.
+ * - Malý refactor: _scaleVec vytažen mimo nearbyMeshes jako sdílený vektor.
  *
  * v1.3 — noclip podpora:
  *   Meshe s userData.noclip = true jsou ignorovány při buildování collidables.
- *   (Dříve se používalo material.depthWrite === false, ale to způsobovalo
- *    renderovací artefakty — průhlednost, z-fighting.)
  */
 
 import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.165.0/build/three.module.js';
@@ -29,15 +32,18 @@ const DEFAULT_CFG = {
   GROUND_CHECK:    0.18,
   NUM_SIDE_RAYS:   8,
   NUM_SLOPE_RAYS:  4,
+
+  // OPTIMALIZACE: Maximální vzdálenost pro zahrnutí meshe do kolizních testů.
+  // Meshe dál než CULL_DIST jednotek od hráče jsou přeskočeny ještě před
+  // výpočtem boundingSphere → výrazně méně práce při velkých mapách.
+  CULL_DIST: 30,
 };
 
 function collectCollidables(scene) {
   const list = [];
   scene.traverse(obj => {
     if (obj.isMesh && obj.geometry) {
-      // Přeskoč noclip meshe (func_wall apod.) — průchozí zdi
       if (obj.userData.noclip) return;
-      // Přeskoč průhledné meshe (portály apod.)
       if (obj.material && obj.material.depthWrite === false) return;
       if (!obj.geometry.attributes.position) return;
       list.push(obj);
@@ -46,22 +52,36 @@ function collectCollidables(scene) {
   return list;
 }
 
-function nearbyMeshes(collidables, origin, maxDist) {
+// Sdílený vektor pro nearbyMeshes — vyhne se alokaci na každé volání.
+const _scaleVec  = new THREE.Vector3();
+const _centerVec = new THREE.Vector3();
+
+// OPTIMALIZACE: Dvoustupňový filtr:
+//   1. Rychlý CULL_DIST test (squared distance, žádná odmocnina) →
+//      vyhodí vzdálené meshe ještě před výpočtem boundingSphere.
+//   2. Přesný boundingSphere test pro zbývající kandidáty.
+function nearbyMeshes(collidables, origin, maxDist, cullDistSq) {
   const result = [];
-  const scaleVec = new THREE.Vector3();
 
   for (const mesh of collidables) {
-    if (!mesh.geometry.boundingSphere) mesh.geometry.computeBoundingSphere();
-    const center = mesh.geometry.boundingSphere.center
-      .clone()
-      .applyMatrix4(mesh.matrixWorld);
+    // Stupeň 1: hrubý prostorový cull (světové pozice meshe)
+    const wx = mesh.matrixWorld.elements[12];
+    const wy = mesh.matrixWorld.elements[13];
+    const wz = mesh.matrixWorld.elements[14];
+    const dx = wx - origin.x, dy = wy - origin.y, dz = wz - origin.z;
+    if (dx*dx + dy*dy + dz*dz > cullDistSq) continue;
 
-    scaleVec.setFromMatrixScale(mesh.matrixWorld);
-    const maxScale = Math.max(scaleVec.x, scaleVec.y, scaleVec.z);
+    // Stupeň 2: přesný boundingSphere test
+    if (!mesh.geometry.boundingSphere) mesh.geometry.computeBoundingSphere();
+    _centerVec.copy(mesh.geometry.boundingSphere.center)
+              .applyMatrix4(mesh.matrixWorld);
+
+    _scaleVec.setFromMatrixScale(mesh.matrixWorld);
+    const maxScale = Math.max(_scaleVec.x, _scaleVec.y, _scaleVec.z);
     const r = mesh.geometry.boundingSphere.radius * maxScale;
 
     const totalDist = maxDist + r;
-    if (center.distanceToSquared(origin) < totalDist * totalDist) {
+    if (_centerVec.distanceToSquared(origin) < totalDist * totalDist) {
       result.push(mesh);
     }
   }
@@ -71,6 +91,7 @@ function nearbyMeshes(collidables, origin, maxDist) {
 export function createPhysics(scene, userCFG = {}) {
 
   const CFG = { ...DEFAULT_CFG, ...userCFG };
+  const cullDistSq = CFG.CULL_DIST * CFG.CULL_DIST;
 
   const velocity = new THREE.Vector3(0, 0, 0);
   let   onGround = false;
@@ -87,6 +108,8 @@ export function createPhysics(scene, userCFG = {}) {
 
   let collidablesReady = false;
 
+  // OPTIMALIZACE: refreshCollidables je veřejná — engine.js ji zavolá
+  // ihned po loadBSP(), takže první frame fyziky nemá žádný overhead.
   function refreshCollidables() {
     collidables = collectCollidables(scene);
     collidablesReady = true;
@@ -111,12 +134,12 @@ export function createPhysics(scene, userCFG = {}) {
       raycaster.set(_origin, new THREE.Vector3(0, -1, 0));
       raycaster.far = checkDist;
 
-      const nearby = nearbyMeshes(collidables, _origin, checkDist + 1);
+      const nearby = nearbyMeshes(collidables, _origin, checkDist + 1, cullDistSq);
       const hits   = raycaster.intersectObjects(nearby, false);
 
       if (hits.length > 0) {
         const hit = hits[0];
-        
+
         let normal = hit.face?.normal
           .clone()
           .transformDirection(hit.object.matrixWorld) ?? _yAxis.clone();
@@ -155,12 +178,12 @@ export function createPhysics(scene, userCFG = {}) {
         raycaster.set(_origin, _dir);
         raycaster.far = CFG.PLAYER_RADIUS + CFG.SKIN_WIDTH;
 
-        const nearby = nearbyMeshes(collidables, _origin, CFG.PLAYER_RADIUS + 1.0);
+        const nearby = nearbyMeshes(collidables, _origin, CFG.PLAYER_RADIUS + 1.0, cullDistSq);
         const hits   = raycaster.intersectObjects(nearby, false);
 
         if (hits.length > 0) {
           const hit = hits[0];
-          
+
           let normal = hit.face?.normal
             .clone()
             .transformDirection(hit.object.matrixWorld) ?? new THREE.Vector3();
@@ -198,7 +221,7 @@ export function createPhysics(scene, userCFG = {}) {
     raycaster.set(stepOrigin, _dir);
     raycaster.far = CFG.PLAYER_RADIUS + moveDelta.length() + CFG.SKIN_WIDTH;
 
-    const nearby = nearbyMeshes(collidables, stepOrigin, raycaster.far + 1.0);
+    const nearby = nearbyMeshes(collidables, stepOrigin, raycaster.far + 1.0, cullDistSq);
     const hits   = raycaster.intersectObjects(nearby, false);
 
     _origin.set(position.x, feetY + 0.1, position.z);
@@ -221,6 +244,8 @@ export function createPhysics(scene, userCFG = {}) {
   function update(camera, keys, yaw, dt) {
     dt = Math.min(dt, 0.05);
 
+    // OPTIMALIZACE: Lazy init ponechán jako záchrana pro případ, že by
+    // refreshCollidables() nebyl zavolán z engine.js (zpětná kompatibilita).
     if (!collidablesReady) refreshCollidables();
 
     if (keys['a'] || keys['arrowleft'])  yaw += CFG.TURN_SPEED * dt;
