@@ -329,14 +329,11 @@ export async function loadBSP({
     });
 
     // ── Noclip (func_wall apod.) ──────────────────────────────────────────
-    // depthWrite = false → physics.js ho přeskočí při buildování collidables
-    // polygonOffset → posunutí depth hodnoty aby nedocházelo k z-fightingu
-    // s world geometrií která leží na stejném místě.
+    // userData.noclip = true → physics.js ho přeskočí při buildování collidables
+    // Material je normální — depthWrite zapnutý, žádný z-fighting.
+    const mesh = new THREE.Mesh(geo, mat);
     if (b.noclip) {
-      mat.depthWrite      = false;
-      mat.polygonOffset   = true;
-      mat.polygonOffsetFactor = -1;
-      mat.polygonOffsetUnits  = -1;
+      mesh.userData.noclip = true;
       noclipMeshes++;
     }
 
@@ -346,7 +343,7 @@ export async function loadBSP({
       meshesWithLM++;
     }
 
-    scene.add(new THREE.Mesh(geo, mat));
+    scene.add(mesh);
     totalMeshes++;
   }
 

@@ -3,50 +3,41 @@
  * Gravitace, kolize se světem, step-up pro schody, svahy a plynulý pohled Q/E.
  *
  * CFG defaulty jsou zde — přepsat lze z index.html přes physicsConfig v initEngine().
+ *
+ * v1.3 — noclip podpora:
+ *   Meshe s userData.noclip = true jsou ignorovány při buildování collidables.
+ *   (Dříve se používalo material.depthWrite === false, ale to způsobovalo
+ *    renderovací artefakty — průhlednost, z-fighting.)
  */
 
 import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.165.0/build/three.module.js';
 
-// ─────────────────────────────────────────────────────────────────────────────
-// DEFAULT CONFIG (přepsatelné zvenčí přes userCFG)
-// ─────────────────────────────────────────────────────────────────────────────
-
 const DEFAULT_CFG = {
-  // Pohyb
-  MOVE_SPEED:    280 * 0.02,        // jednotky/s (stejné jako engine, přepočteno)
-  TURN_SPEED:    2.5,               // rad/s
-  LOOK_SPEED:    2.5,               // rychlost naklánění hlavy přes Q/E
-  RETURN_SPEED:  5.0,               // rychlost plynulého návratu hlavy do roviny
-
-  // Gravitace
-  GRAVITY:       -28.0,             // jednotky/s² — zvyš pro rychlejší pád
-  JUMP_SPEED:     3.0,              // počáteční vertikální rychlost při skoku
-  TERMINAL_VEL:  -30.0,            // terminální rychlost pádu
-
-  // Hráč
-  PLAYER_HEIGHT:  80 * 0.02,        // výška kamery nad podlahou
-  PLAYER_RADIUS:   0.28,            // poloměr kapsle hráče (XZ)
-  PLAYER_MASS:     1.0,             // (rezerva pro budoucí rozšíření)
-
-  // Kolize
-  STEP_HEIGHT:     0.45,            // max výška kroku schodů/slope
-  SLOPE_MAX_ANGLE: 50,              // max úhel schodů (°) — nad tím = stěna
-  SKIN_WIDTH:      0.02,            // malý offset, aby hráč "nevisel" ve stěně
-  GROUND_CHECK:    0.18,            // délka ground raycastu pod hráče
-
-  // Raycast
-  NUM_SIDE_RAYS:   8,               // počet bočních paprsků kolize
-  NUM_SLOPE_RAYS:  4,               // paprsků pro detekci slope pod hráče
+  MOVE_SPEED:    280 * 0.02,
+  TURN_SPEED:    2.5,
+  LOOK_SPEED:    2.5,
+  RETURN_SPEED:  5.0,
+  GRAVITY:       -28.0,
+  JUMP_SPEED:     3.0,
+  TERMINAL_VEL:  -30.0,
+  PLAYER_HEIGHT:  80 * 0.02,
+  PLAYER_RADIUS:   0.28,
+  PLAYER_MASS:     1.0,
+  STEP_HEIGHT:     0.45,
+  SLOPE_MAX_ANGLE: 50,
+  SKIN_WIDTH:      0.02,
+  GROUND_CHECK:    0.18,
+  NUM_SIDE_RAYS:   8,
+  NUM_SLOPE_RAYS:  4,
 };
-
-// ─────────────────────────────────────────────────────────────────────────────
-// POMOCNÉ FUNKCE
-// ─────────────────────────────────────────────────────────────────────────────
 
 function collectCollidables(scene) {
   const list = [];
   scene.traverse(obj => {
     if (obj.isMesh && obj.geometry) {
+      // Přeskoč noclip meshe (func_wall apod.) — průchozí zdi
+      if (obj.userData.noclip) return;
+      // Přeskoč průhledné meshe (portály apod.)
       if (obj.material && obj.material.depthWrite === false) return;
       if (!obj.geometry.attributes.position) return;
       list.push(obj);
@@ -77,26 +68,18 @@ function nearbyMeshes(collidables, origin, maxDist) {
   return result;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// PHYSICS CONTROLLER
-// ─────────────────────────────────────────────────────────────────────────────
-
 export function createPhysics(scene, userCFG = {}) {
 
-  // Merge: defaulty + co přijde z index.html
   const CFG = { ...DEFAULT_CFG, ...userCFG };
 
-  // ── Stav ──────────────────────────────────────────────────────────────────
   const velocity = new THREE.Vector3(0, 0, 0);
   let   onGround = false;
   let   collidables = [];
-  let   currentPitch = 0; // Aktuální vertikální úhel pohledu
+  let   currentPitch = 0;
 
-  // Raycastery
   const raycaster = new THREE.Raycaster();
   raycaster.firstHitOnly = true;
 
-  // Pomocné vektory
   const _dir    = new THREE.Vector3();
   const _origin = new THREE.Vector3();
   const _move   = new THREE.Vector3();
@@ -110,7 +93,6 @@ export function createPhysics(scene, userCFG = {}) {
     console.log(`[Physics] Kolizní objekty: ${collidables.length}`);
   }
 
-  // ── Detekce země ───────────────────────────────────────────────────────────
   function groundCheck(position) {
     const offsets = [
       [0, 0],
@@ -139,9 +121,7 @@ export function createPhysics(scene, userCFG = {}) {
           .clone()
           .transformDirection(hit.object.matrixWorld) ?? _yAxis.clone();
 
-        if (normal.dot(raycaster.ray.direction) > 0) {
-          normal.negate();
-        }
+        if (normal.dot(raycaster.ray.direction) > 0) normal.negate();
 
         const angle = Math.acos(Math.max(-1, Math.min(1,
           normal.dot(_yAxis)))) * (180 / Math.PI);
@@ -158,7 +138,6 @@ export function createPhysics(scene, userCFG = {}) {
     return highestHit;
   }
 
-  // ── Boční kolize (stěny) ──────────────────────────────────────────────────
   function resolveWalls(position, moveDelta) {
     const resolved = moveDelta.clone();
     const checkHeights = [
@@ -180,15 +159,13 @@ export function createPhysics(scene, userCFG = {}) {
         const hits   = raycaster.intersectObjects(nearby, false);
 
         if (hits.length > 0) {
-          const hit    = hits[0];
+          const hit = hits[0];
           
           let normal = hit.face?.normal
             .clone()
             .transformDirection(hit.object.matrixWorld) ?? new THREE.Vector3();
 
-          if (normal.dot(raycaster.ray.direction) > 0) {
-            normal.negate();
-          }
+          if (normal.dot(raycaster.ray.direction) > 0) normal.negate();
 
           const slopeAngle = Math.acos(
             Math.max(-1, Math.min(1, normal.dot(_yAxis)))
@@ -197,14 +174,10 @@ export function createPhysics(scene, userCFG = {}) {
           if (slopeAngle > CFG.SLOPE_MAX_ANGLE) {
             const flatNormal = new THREE.Vector3(normal.x, 0, normal.z).normalize();
             const dot = resolved.dot(flatNormal);
-            if (dot < 0) {
-              resolved.addScaledVector(flatNormal, -dot);
-            }
+            if (dot < 0) resolved.addScaledVector(flatNormal, -dot);
 
             const penetration = CFG.PLAYER_RADIUS + CFG.SKIN_WIDTH - hit.distance;
-            if (penetration > 0) {
-              resolved.addScaledVector(flatNormal, penetration);
-            }
+            if (penetration > 0) resolved.addScaledVector(flatNormal, penetration);
           }
         }
       }
@@ -213,13 +186,11 @@ export function createPhysics(scene, userCFG = {}) {
     return resolved;
   }
 
-  // ── Step-up (schody + slopes) ─────────────────────────────────────────────
   function tryStepUp(position, moveDelta) {
     if (!onGround) return moveDelta;
     if (moveDelta.lengthSq() < 0.00001) return moveDelta;
 
     const feetY = position.y - CFG.PLAYER_HEIGHT;
-
     const stepOrigin = position.clone();
     stepOrigin.y = feetY + CFG.STEP_HEIGHT + 0.05;
 
@@ -237,28 +208,24 @@ export function createPhysics(scene, userCFG = {}) {
 
     if (hitsLow.length > 0 && hits.length === 0) {
       const testPos = position.clone().add(moveDelta);
-      testPos.y += CFG.STEP_HEIGHT; 
-      
+      testPos.y += CFG.STEP_HEIGHT;
       const groundY = groundCheck(testPos);
       if (groundY !== null && groundY - position.y < CFG.STEP_HEIGHT + 0.01) {
-        return moveDelta; 
+        return moveDelta;
       }
     }
 
     return moveDelta;
   }
 
-  // ── Hlavní update ──────────────────────────────────────────────────────────
   function update(camera, keys, yaw, dt) {
     dt = Math.min(dt, 0.05);
 
     if (!collidablesReady) refreshCollidables();
 
-    // ── Otočení (Yaw - do stran) ─────────────────────────────────────────────
     if (keys['a'] || keys['arrowleft'])  yaw += CFG.TURN_SPEED * dt;
     if (keys['d'] || keys['arrowright']) yaw -= CFG.TURN_SPEED * dt;
 
-    // ── Vertikální naklonění (Pitch - nahoru/dolů) ─────────────────────────────
     const MAX_PITCH = 45 * (Math.PI / 180);
 
     if (keys['q']) {
@@ -270,20 +237,14 @@ export function createPhysics(scene, userCFG = {}) {
     } else {
       if (currentPitch !== 0) {
         const signBefore = Math.sign(currentPitch);
-        if (currentPitch > 0) {
-          currentPitch -= CFG.RETURN_SPEED * dt;
-        } else {
-          currentPitch += CFG.RETURN_SPEED * dt;
-        }
-        if (Math.sign(currentPitch) !== signBefore) {
-          currentPitch = 0;
-        }
+        if (currentPitch > 0) currentPitch -= CFG.RETURN_SPEED * dt;
+        else currentPitch += CFG.RETURN_SPEED * dt;
+        if (Math.sign(currentPitch) !== signBefore) currentPitch = 0;
       }
     }
 
     camera.rotation.set(currentPitch, yaw, 0, 'YXZ');
 
-    // ── Pohyb (horizontal) ───────────────────────────────────────────────────
     _move.set(0, 0, 0);
     if (keys['w'] || keys['arrowup'])   _move.z -= 1;
     if (keys['s'] || keys['arrowdown']) _move.z += 1;
@@ -294,13 +255,11 @@ export function createPhysics(scene, userCFG = {}) {
         .applyAxisAngle(_yAxis, yaw);
     }
 
-    // ── Skok ────────────────────────────────────────────────────────────────
     if ((keys[' '] || keys['space']) && onGround) {
       velocity.y = CFG.JUMP_SPEED;
       onGround = false;
     }
 
-    // ── Gravitace ───────────────────────────────────────────────────────────
     if (!onGround) {
       velocity.y += CFG.GRAVITY * dt;
       velocity.y = Math.max(velocity.y, CFG.TERMINAL_VEL);
@@ -308,15 +267,13 @@ export function createPhysics(scene, userCFG = {}) {
       velocity.y = Math.min(velocity.y, 0);
     }
 
-    // ── Fyzikální testy pohybu a kolizí ──────────────────────────────────────
-    const movedXZ = tryStepUp(camera.position, _move);
+    const movedXZ    = tryStepUp(camera.position, _move);
     const resolvedXZ = resolveWalls(camera.position, movedXZ);
 
     camera.position.x += resolvedXZ.x;
     camera.position.z += resolvedXZ.z;
     camera.position.y += velocity.y * dt;
 
-    // ── Ground detection + přichycení ────────────────────────────────────────
     const groundY = groundCheck(camera.position);
 
     if (groundY !== null) {
