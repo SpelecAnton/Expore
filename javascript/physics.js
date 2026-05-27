@@ -1,16 +1,18 @@
 /**
- * SPELEC PHYSICS v1.4 — OPTIMIZED COLLIDABLES
+ * SPELEC PHYSICS v1.5 — SWEEP FIX
  *
- * Změny oproti v1.3:
- * - refreshCollidables() je nyní veřejná metoda volatelná ihned po loadBSP()
- *   z engine.js → eliminuje lazy-init sekání při prvním framu.
- * - nearbyMeshes: přidán pevný CULL_DIST limit (30 jednotek) jako první
- *   rychlý filtr před výpočtem boundingSphere → snížení CPU zátěže při
- *   velkých mapách s mnoha meshy.
- * - Malý refactor: _scaleVec vytažen mimo nearbyMeshes jako sdílený vektor.
+ * Změny oproti v1.4:
+ * - groundCheck: checkDist zvýšen z PLAYER_HEIGHT + GROUND_CHECK (1.78)
+ *   na PLAYER_HEIGHT + 2.0 → paprsek dosáhne podlahy i při rychlém pádu.
+ * - groundCheck: start paprsku posunut z +0.05 na +0.25 nad pozicí hráče
+ *   → paprsek nezačíná pod geometrií při drobném průniku.
+ * - update(): swept fallback — pokud groundCheck na nové pozici vrátí null
+ *   a hráč padá, zkontrolujeme předchozí pozici; pokud tam byla podlaha
+ *   a hráč ji přeskočil (tenký brush), přichytíme ho na ni.
+ *   Eliminuje propadání rovnými brushy při vysoké rychlosti pádu.
  *
- * v1.3 — noclip podpora:
- *   Meshe s userData.noclip = true jsou ignorovány při buildování collidables.
+ * v1.4 — optimalizace collidables (CULL_DIST, refreshCollidables veřejná)
+ * v1.3 — noclip podpora
  */
 
 import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.165.0/build/three.module.js';
@@ -127,10 +129,16 @@ export function createPhysics(scene, userCFG = {}) {
     ];
 
     let highestHit = null;
-    const checkDist = CFG.PLAYER_HEIGHT + CFG.GROUND_CHECK;
+
+    // FIX v1.5: checkDist zvýšen — paprsek musí dosáhnout podlahy i při
+    // rychlém pádu (terminal velocity −30 * dt 0.05 = 1.5 j/frame).
+    // Původní hodnota PLAYER_HEIGHT + GROUND_CHECK = ~1.78 nestačila.
+    const checkDist = CFG.PLAYER_HEIGHT + 2.0;
 
     for (const [ox, oz] of offsets) {
-      _origin.set(position.x + ox, position.y + 0.05, position.z + oz);
+      // FIX v1.5: start paprsku posunut z +0.05 na +0.25 — při drobném
+      // průniku do geometrie paprsek nezačínal uvnitř meshe a míjel ho.
+      _origin.set(position.x + ox, position.y + 0.25, position.z + oz);
       raycaster.set(_origin, new THREE.Vector3(0, -1, 0));
       raycaster.far = checkDist;
 
@@ -297,9 +305,28 @@ export function createPhysics(scene, userCFG = {}) {
 
     camera.position.x += resolvedXZ.x;
     camera.position.z += resolvedXZ.z;
+
+    // FIX v1.5: Swept ground check — zachytí průchod skrz tenký brush.
+    // Uložíme Y před pohybem, posuneme, pak zkontrolujeme obě pozice.
+    const prevY = camera.position.y;
     camera.position.y += velocity.y * dt;
 
-    const groundY = groundCheck(camera.position);
+    let groundY = groundCheck(camera.position);
+
+    // Swept fallback: hráč padal, groundCheck na nové pozici vrátil null,
+    // ale na předchozí pozici podlaha byla → přeskočili jsme tenký brush.
+    if (groundY === null && velocity.y < 0) {
+      const prevPos = camera.position.clone();
+      prevPos.y = prevY;
+      const prevGroundY = groundCheck(prevPos);
+      if (
+        prevGroundY !== null &&
+        prevGroundY <= prevY &&
+        prevGroundY >= camera.position.y
+      ) {
+        groundY = prevGroundY;
+      }
+    }
 
     if (groundY !== null) {
       if (camera.position.y <= groundY + CFG.SKIN_WIDTH * 2) {
