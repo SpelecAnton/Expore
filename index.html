@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="cs">
+<html lang="en">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
@@ -66,34 +66,41 @@
     textureBase: 'textures/',
     mapName:     'MAP',
 
+    // ── Physics ────────────────────────────────────────────────────────────
     physicsConfig: {
       // Movement
-      MOVE_SPEED:      280 * 0.02,  // units/s
-      TURN_SPEED:      2.5,         // rad/s
-      LOOK_SPEED:      2.5,         // head tilt speed via Q/E
-      RETURN_SPEED:    5.0,         // smooth return speed of head to level
+      MOVE_SPEED:      280 * 0.02,  // units/s — horizontal movement speed
+      TURN_SPEED:      2.5,         // rad/s   — left/right turn speed (A/D keys)
+      LOOK_SPEED:      2.5,         // rad/s   — head tilt speed (Q/E keys)
+      RETURN_SPEED:    5.0,         // rad/s   — how fast head returns to level after releasing Q/E
 
       // Gravity
       GRAVITY:        -28.0,        // units/s² — increase for faster fall
-      JUMP_SPEED:      3.0,         // initial vertical velocity on jump
-      TERMINAL_VEL:  -30.0,         // terminal fall velocity
+      JUMP_SPEED:      3.0,         // units/s  — initial vertical velocity on jump (Space)
+      TERMINAL_VEL:  -30.0,         // units/s  — maximum fall speed (terminal velocity)
 
       // Player
-      PLAYER_HEIGHT:  80 * 0.02,    // camera height above the floor
-      PLAYER_RADIUS:   0.28,        // player capsule radius (XZ)
+      PLAYER_HEIGHT:  80 * 0.02,    // units — camera height above the floor
+      PLAYER_RADIUS:   0.28,        // units — player capsule radius (XZ collision)
       PLAYER_MASS:     1.0,         // (reserved for future use)
 
       // Collision
-      STEP_HEIGHT:     0.45,        // max stair/slope step height
-      SLOPE_MAX_ANGLE: 50,          // max stair angle (°) — above this = wall
-      SKIN_WIDTH:      0.02,        // small offset to prevent player from sinking into walls
-      GROUND_CHECK:    0.18,        // ground raycast length below player
+      STEP_HEIGHT:     0.45,        // units — max stair/slope step the player can climb
+      SLOPE_MAX_ANGLE: 50,          // degrees — steeper than this is treated as a wall
+      SKIN_WIDTH:      0.02,        // units — small offset to prevent sinking into surfaces
+      GROUND_CHECK:    0.18,        // units — ground raycast length below the player
 
-      // Raycast
-      NUM_SIDE_RAYS:   8,           // number of side collision rays
-      NUM_SLOPE_RAYS:  4,           // rays for slope detection below player
+      // Raycasting
+      NUM_SIDE_RAYS:   8,           // number of horizontal collision rays around the player
+      NUM_SLOPE_RAYS:  4,           // number of rays used for slope/stair detection below player
     },
 
+    // ── Bloom ──────────────────────────────────────────────────────────────
+    bloomStrength:  0.9,   // overall bloom intensity — higher = stronger glow
+    bloomRadius:    0.4,   // bloom spread radius — higher = wider halo
+    bloomThreshold: 0.2,   // brightness threshold — lower = more surfaces bloom
+
+    // ── Callbacks ──────────────────────────────────────────────────────────
     onProgress(pct) {
       document.getElementById('progress-fill').style.width = pct + '%';
     },

@@ -1,15 +1,18 @@
 /**
- * SPELEC EXPLORE ENGINE v6.8 — OPTIMIZED LOADING
+ * SPELEC EXPLORE ENGINE v6.9 — BLOOM + LIGHT SPRITES
  *
- * Změny oproti v6.7:
- * - findBackgroundMusic: paralelní HEAD proby místo sériových → -200–500 ms
- * - Worker kód cachován v paměti → -100–300 ms při opakovaném načtení
- * - physics.refreshCollidables() zavolán ihned po loadBSP() místo lazy initu
- *   v prvním framu → eliminuje sekání při startu hry
- * - lmTex build a albedo textury probíhají paralelně v bsp_loader.js
+ * Změny oproti v6.8:
+ * - UnrealBloomPass přidán přes EffectComposer → globální bloom efekt
+ * - addLightSprites(): pro light entity s _sprite 1 se vytvoří procedurálně
+ *   generovaný sprite (canvas textura, glow halo) viditelný ve scéně
+ * - Světla bez _sprite 1 fungují jako dřív — pouze PointLight, žádný sprite
+ * - bloomPass parametry jsou doladěny pro tmavé mapy (strength 0.9, radius 0.4)
  */
 
 import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.165.0/build/three.module.js';
+import { EffectComposer }  from 'https://cdn.jsdelivr.net/npm/three@0.165.0/examples/jsm/postprocessing/EffectComposer.js';
+import { RenderPass }      from 'https://cdn.jsdelivr.net/npm/three@0.165.0/examples/jsm/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'https://cdn.jsdelivr.net/npm/three@0.165.0/examples/jsm/postprocessing/UnrealBloomPass.js';
 import { loadBSP, tickAnimatedTextures } from 'https://spelecanton.github.io/Expore/javascript/bsp_loader.js';
 import { createPhysics } from 'https://spelecanton.github.io/Expore/javascript/physics.js';
 
@@ -69,8 +72,6 @@ function playPortalAudio(url) {
 }
 
 // ── Background music ──────────────────────────────────────────────────────────
-// OPTIMALIZACE: Paralelní HEAD proby místo sériových.
-// Všechny kandidáty se zkouší najednou → vybere se první úspěšný.
 
 const BG_CANDIDATES = ['background.mp3', 'background.ogg', 'background.wav'];
 
@@ -183,6 +184,109 @@ function buildPortal(props, scene, portals) {
   portals.push({ x, y, z, url, label, col, mesh, ptLight, opacity });
 }
 
+// ── Light sprite — procedurálně generovaný bloom sprite ──────────────────────
+// Vytvoří canvas texturu s radial gradient (glow efekt) bez nutnosti
+// externího souboru. Sprite je vždy natočen ke kameře (Billboard).
+//
+// Volá se jen pro světla s _sprite 1 — ostatní světla dostanou jen PointLight.
+
+function makeSpriteTexture(r, g, b) {
+  const size = 128;
+  const canvas = document.createElement('canvas');
+  canvas.width  = size;
+  canvas.height = size;
+  const ctx = canvas.getContext('2d');
+
+  const cx = size / 2;
+  const cy = size / 2;
+
+  // Vnější měkký glow
+  const outerGrad = ctx.createRadialGradient(cx, cy, 0, cx, cy, size / 2);
+  outerGrad.addColorStop(0,    `rgba(${Math.round(r*255)}, ${Math.round(g*255)}, ${Math.round(b*255)}, 0.9)`);
+  outerGrad.addColorStop(0.25, `rgba(${Math.round(r*255)}, ${Math.round(g*255)}, ${Math.round(b*255)}, 0.5)`);
+  outerGrad.addColorStop(0.6,  `rgba(${Math.round(r*255)}, ${Math.round(g*255)}, ${Math.round(b*255)}, 0.12)`);
+  outerGrad.addColorStop(1,    `rgba(${Math.round(r*255)}, ${Math.round(g*255)}, ${Math.round(b*255)}, 0)`);
+
+  ctx.fillStyle = outerGrad;
+  ctx.fillRect(0, 0, size, size);
+
+  // Jasné jádro uprostřed
+  const coreGrad = ctx.createRadialGradient(cx, cy, 0, cx, cy, size * 0.12);
+  coreGrad.addColorStop(0, '#ffffff');
+  coreGrad.addColorStop(0.5, `rgba(${Math.round(r*255)}, ${Math.round(g*255)}, ${Math.round(b*255)}, 0.9)`);
+  coreGrad.addColorStop(1,   `rgba(${Math.round(r*255)}, ${Math.round(g*255)}, ${Math.round(b*255)}, 0)`);
+
+  ctx.fillStyle = coreGrad;
+  ctx.fillRect(0, 0, size, size);
+
+  const tex = new THREE.CanvasTexture(canvas);
+  tex.colorSpace  = THREE.SRGBColorSpace;
+  tex.needsUpdate = true;
+  return tex;
+}
+
+// Cache textur podle barvy — světla stejné barvy sdílejí texturu.
+const _spriteTexCache = new Map();
+
+function getSpriteTex(r, g, b) {
+  // Klíč s rozlišením ~4 bity — podobné barvy sdílejí texturu
+  const key = `${(r * 15) | 0}:${(g * 15) | 0}:${(b * 15) | 0}`;
+  if (!_spriteTexCache.has(key)) {
+    _spriteTexCache.set(key, makeSpriteTexture(r, g, b));
+  }
+  return _spriteTexCache.get(key);
+}
+
+/**
+ * addLightSprites — přidá do scény viditelné bloom sprite pro každé světlo
+ * které má sprite = true (tj. _sprite "1" v BSP entitě).
+ *
+ * Světla bez sprite = true dostanou pouze PointLight (jako dřív).
+ *
+ * @param {THREE.Scene} scene
+ * @param {Array}       lights  — pole z result.lights (parsováno workerem)
+ */
+function addLightSprites(scene, lights) {
+  if (!lights || !lights.length) return;
+
+  let spriteCount = 0;
+
+  for (const light of lights) {
+    const col = new THREE.Color(light.r, light.g, light.b);
+
+    // PointLight vždy — svítí na okolní geometrii
+    const range     = Math.min(20, Math.max(2, light.intensity * 0.05));
+    const ptIntens  = Math.min(5, Math.max(0.2, light.intensity * 0.015));
+    const ptLight   = new THREE.PointLight(col, ptIntens, range);
+    ptLight.position.set(light.x, light.y, light.z);
+    scene.add(ptLight);
+
+    // Sprite — jen pokud má _sprite 1
+    if (!light.sprite) continue;
+
+    const tex = getSpriteTex(light.r, light.g, light.b);
+
+    // THREE.Sprite je vždy otočen ke kameře (billboard) automaticky
+    const spriteMat = new THREE.SpriteMaterial({
+      map:         tex,
+      transparent: true,
+      depthWrite:  false,
+      blending:    THREE.AdditiveBlending,  // additivní → přirozenější glow
+      color:       col,
+    });
+
+    const sprite = new THREE.Sprite(spriteMat);
+    sprite.position.set(light.x, light.y, light.z);
+    sprite.scale.setScalar(0.5);   // velikost v world units; doladit dle mapy
+    sprite.userData.noclip = true;
+    scene.add(sprite);
+
+    spriteCount++;
+  }
+
+  console.log(`[Engine] Světla: ${lights.length} celkem, ${spriteCount} se spritem`);
+}
+
 // ── Fallback room ─────────────────────────────────────────────────────────────
 
 function _fallbackRoom(scene) {
@@ -222,6 +326,10 @@ export async function initEngine({
   onReady         = null,
   onProgress      = null,
   physicsConfig   = {},
+  // Bloom nastavení — lze přepsat z index.html
+  bloomStrength   = 0.9,   // intenzita bloom efektu
+  bloomRadius     = 0.4,   // rozmazání bloom halo
+  bloomThreshold  = 0.2,   // práh — jak světlá musí být barva aby bloomovala
 }) {
   const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
   renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
@@ -239,11 +347,22 @@ export async function initEngine({
   const ambient = new THREE.AmbientLight(0xffffff, 1.0);
   scene.add(ambient);
 
+  // ── EffectComposer + UnrealBloomPass ──────────────────────────────────────
+  const composer = new EffectComposer(renderer);
+  composer.addPass(new RenderPass(scene, camera));
+
+  const bloomPass = new UnrealBloomPass(
+    new THREE.Vector2(window.innerWidth, window.innerHeight),
+    bloomStrength,
+    bloomRadius,
+    bloomThreshold,
+  );
+  composer.addPass(bloomPass);
+
   const portals    = [];
   let   yaw        = 0;
   let   worldMeshes = [];
 
-  // OPTIMALIZACE: BG music probe a načítání BSP probíhají paralelně.
   const mapBase        = mapBaseFromUrl(mapUrl);
   const bgMusicPromise = findBackgroundMusic(mapBase);
 
@@ -260,6 +379,9 @@ export async function initEngine({
     if (result.ambientIntensity !== undefined) ambient.intensity = result.ambientIntensity;
 
     for (const props of result.portals) buildPortal(props, scene, portals);
+
+    // ── Přidej světla + bloom sprite ────────────────────────────────────────
+    addLightSprites(scene, result.lights ?? []);
 
     const hashState = readHashState();
 
@@ -298,15 +420,12 @@ export async function initEngine({
 
   // ── Fyzika ────────────────────────────────────────────────────────────────
   const physics = createPhysics(scene, physicsConfig);
-
-  // OPTIMALIZACE: Inicializuj collidables hned po načtení scény,
-  // ne lazy až při prvním framu (eliminuje sekání na začátku hry).
   physics.refreshCollidables();
 
   window._cam     = camera;
   window._physics = physics;
 
-  // ── Background music — spustí se při prvním stisku klávesy ───────────────
+  // ── Background music ──────────────────────────────────────────────────────
   const bgMusic = await bgMusicPromise;
   let   bgMusicStarted = false;
 
@@ -382,6 +501,7 @@ export async function initEngine({
     camera.aspect = window.innerWidth / window.innerHeight;
     camera.updateProjectionMatrix();
     renderer.setSize(window.innerWidth, window.innerHeight);
+    composer.setSize(window.innerWidth, window.innerHeight);
   });
 
   if (onReady) onReady();
@@ -415,6 +535,8 @@ export async function initEngine({
     }
 
     canvas.style.cursor = getHoveredPortal() ? 'pointer' : 'default';
-    renderer.render(scene, camera);
+
+    // Bloom composer místo přímého renderer.render()
+    composer.render();
   })();
 }

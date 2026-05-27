@@ -16,6 +16,12 @@
  *   Submodel N v LUMP_MODELS definuje firstFace + numFaces.
  *   Tyto face indexy jsou předány do buildBatches → batch.noclip = true.
  *   Loader pak nastaví material.depthWrite = false → physics je ignoruje.
+ *
+ * v3 — light entity + bloom sprite:
+ *   Light entity (light, light_spot, light_point) jsou parsovány a předány
+ *   do engine.js jako result.lights[].
+ *   Pokud má entita vlastnost _sprite 1, engine vytvoří viditelný bloom sprite
+ *   na pozici světla (procedurálně generovaný, žádný soubor).
  */
 
 'use strict';
@@ -44,6 +50,13 @@ const NOCLIP_CLASSNAMES = new Set([
   'func_illusionary',
   'func_detail',
   'func_fog',
+]);
+
+// ── Light entity classnames ───────────────────────────────────────────────────
+const LIGHT_CLASSNAMES = new Set([
+  'light',
+  'light_spot',
+  'light_point',
 ]);
 
 // ── Entity parser ─────────────────────────────────────────────────────────────
@@ -83,14 +96,11 @@ function parseEntityLump(text) {
 }
 
 // ── Zjisti noclip face indexy z entity + model lump ──────────────────────────
-// Vrátí Set<number> — absolutní indexy faces které patří noclip entitám.
 function buildNoclipFaceSet(entities, buffer, modelLump) {
   const noclipFaces = new Set();
   const modelCount  = (modelLump.length / MODEL_RECORD_SIZE) | 0;
   const view        = new DataView(buffer);
 
-  // Submodel 0 = worldspawn — přeskočíme
-  // Submodely 1..N odpovídají entitám s model="*1", "*2", ...
   for (const e of entities) {
     if (!NOCLIP_CLASSNAMES.has(e.classname)) continue;
 
@@ -106,7 +116,6 @@ function buildNoclipFaceSet(entities, buffer, modelLump) {
 
     console.log(`[BSP Worker] ${e.classname} model=*${subIdx}: firstFace=${firstFace}, numFaces=${numFaces}`);
 
-    // Sanity check — garbage hodnoty způsobují overflow dál
     if (firstFace < 0 || numFaces < 0 || numFaces > 100000) {
       console.warn(`[BSP Worker] Přeskakuji ${e.classname} — neplatné face hodnoty`);
       continue;
@@ -120,7 +129,67 @@ function buildNoclipFaceSet(entities, buffer, modelLump) {
   return noclipFaces;
 }
 
-// ── Lightmap atlas — kopírování po řádcích místo po pixelech ─────────────────
+// ── Parsuj light entity ───────────────────────────────────────────────────────
+// Vrátí pole světel:
+//   { x, y, z, r, g, b, intensity, sprite }
+//   sprite = true jen pokud má entita _sprite "1"
+function parseLights(entities) {
+  const lights = [];
+
+  for (const e of entities) {
+    if (!LIGHT_CLASSNAMES.has(e.classname)) continue;
+
+    const [ox, oy, oz] = (e.origin || '0 0 0').split(' ').map(Number);
+
+    // Barva: _color "R G B" (0–1) nebo _light "R G B I" (0–255 + intenzita)
+    let r = 1, g = 1, b = 1, intensity = 200;
+
+    if (e._light) {
+      // Formát: "R G B intensity" kde R/G/B jsou 0–255
+      const parts = e._light.trim().split(/\s+/).map(Number);
+      if (parts.length >= 4) {
+        r = parts[0] / 255;
+        g = parts[1] / 255;
+        b = parts[2] / 255;
+        intensity = parts[3];
+      } else if (parts.length === 1) {
+        intensity = parts[0];
+      }
+    } else if (e._color) {
+      const parts = e._color.trim().split(/\s+/).map(Number);
+      if (parts.length >= 3) { r = parts[0]; g = parts[1]; b = parts[2]; }
+    } else if (e.color) {
+      const parts = e.color.trim().split(/\s+/).map(Number);
+      if (parts.length >= 3) { r = parts[0]; g = parts[1]; b = parts[2]; }
+    }
+
+    // Clamp barvy na 0–1
+    r = Math.max(0, Math.min(1, r));
+    g = Math.max(0, Math.min(1, g));
+    b = Math.max(0, Math.min(1, b));
+
+    // Sprite je dobrovolný — jen pokud _sprite "1"
+    const sprite = e._sprite === '1';
+
+    lights.push({
+      x: ox * UNIT,
+      y: oz * UNIT,
+      z: -oy * UNIT,
+      r, g, b,
+      intensity,
+      sprite,
+    });
+  }
+
+  if (lights.length > 0) {
+    const withSprite = lights.filter(l => l.sprite).length;
+    console.log(`[BSP Worker] Světla: ${lights.length} celkem, ${withSprite} se spritem`);
+  }
+
+  return lights;
+}
+
+// ── Lightmap atlas ────────────────────────────────────────────────────────────
 function buildLightmapAtlas(buffer, lmLump, lmCount) {
   if (lmCount === 0) return null;
 
@@ -196,18 +265,13 @@ function parseVertices(buffer, vLump) {
 }
 
 // ── Face batching + mesh building ─────────────────────────────────────────────
-// noclipFaces: Set<number> — face indexy které mají být průchozí
 function buildBatches(buffer, fLump, mvLump, rawPos, rawUV1, rawUV2, rawNorm, lmAtlas, lmCount, noclipFaces) {
   const view      = new DataView(buffer);
   const fCount    = (fLump.length / FACE_RECORD_SIZE) | 0;
   const mvCount   = (mvLump.length / 4) | 0;
   const meshVerts = new Int32Array(buffer, mvLump.offset, mvCount);
 
-  // ── Fáze 1: nasbírej indexy do batchů ────────────────────────────────────
-  // Klíč zahrnuje noclip flag — noclip face nesmí sdílet batch s normálními
-  const batchMap = new Map();
-
-  // Celkový počet vrcholů — pro bounds check
+  const batchMap   = new Map();
   const totalVerts = rawPos.length / 3;
 
   for (let fi = 0; fi < fCount; fi++) {
@@ -220,14 +284,12 @@ function buildBatches(buffer, fLump, mvLump, rawPos, rawUV1, rawUV2, rawNorm, lm
     const vertCount = view.getInt32(fo + 16, true);
     if (vertCount < 3) continue;
 
-    // Bounds check — poškozená data v BSP způsobují overflow
     if (vertStart < 0 || vertStart >= totalVerts) continue;
 
     const mvStart  = view.getInt32(fo + 20, true);
     const mvCount2 = view.getInt32(fo + 24, true);
     const lmIdx    = view.getInt32(fo + 28, true);
 
-    // Noclip flag — oddělí batch od normálních
     const isNoclip = noclipFaces.has(fi);
     const key      = `${texIdx}:${lmIdx}:${isNoclip ? 'n' : 's'}`;
 
@@ -255,7 +317,6 @@ function buildBatches(buffer, fLump, mvLump, rawPos, rawUV1, rawUV2, rawNorm, lm
     }
   }
 
-  // ── Fáze 2: build geometry buffers ───────────────────────────────────────
   const lmCols = lmAtlas ? lmAtlas.cols : 1;
   const lmW    = lmAtlas ? lmAtlas.W    : 1;
   const lmH    = lmAtlas ? lmAtlas.H    : 1;
@@ -266,7 +327,6 @@ function buildBatches(buffer, fLump, mvLump, rawPos, rawUV1, rawUV2, rawNorm, lm
     const absIdx = batch.absIndices;
     if (!absIdx.length) continue;
 
-    // Map místo flat Int32Array — vyhne se allocation overflow při extrémních indexech
     const g2l = new Map();
 
     const maxVerts = absIdx.length;
@@ -317,7 +377,7 @@ function buildBatches(buffer, fLump, mvLump, rawPos, rawUV1, rawUV2, rawNorm, lm
     builtBatches.push({
       texIdx:  batch.texIdx,
       lmIdx:   batch.lmIdx,
-      noclip:  batch.noclip,  // ← předáme loaderu
+      noclip:  batch.noclip,
       hasLM:   lmAtlas !== null && batch.lmIdx >= 0 && batch.lmIdx < lmCount,
       pos:     posArr.subarray(0, vertCount * 3),
       nrm:     nrmArr.subarray(0, vertCount * 3),
@@ -352,6 +412,7 @@ self.onmessage = function ({ data }) {
     const entities = parseEntityLump(entText);
 
     const portals = [];
+    const lights  = [];
     let playerStart = null;
     let ambientIntensity, ambientColorArr;
 
@@ -371,9 +432,13 @@ self.onmessage = function ({ data }) {
       }
     }
 
+    // Parsuj světla (light, light_spot, light_point)
+    const parsedLights = parseLights(entities);
+    lights.push(...parsedLights);
+
     self.postMessage({ type: 'progress', pct: 10 });
 
-    // ── Noclip face set (func_wall atd.) ────────────────────────────────────
+    // ── Noclip face set ──────────────────────────────────────────────────────
     const modelLump   = lump(LUMP_MODELS);
     const noclipFaces = buildNoclipFaceSet(entities, buffer, modelLump);
     if (noclipFaces.size > 0) {
@@ -417,7 +482,7 @@ self.onmessage = function ({ data }) {
       lump(LUMP_MESH_VERTS),
       rawPos, rawUV1, rawUV2, rawNorm,
       lmAtlas, lmCount,
-      noclipFaces,  // ← nové
+      noclipFaces,
     );
 
     self.postMessage({ type: 'progress', pct: 85 });
@@ -440,6 +505,7 @@ self.onmessage = function ({ data }) {
     self.postMessage({
       type: 'done',
       portals,
+      lights,   // ← nové: pole světel
       playerStart,
       ambientIntensity,
       ambientColorArr,
