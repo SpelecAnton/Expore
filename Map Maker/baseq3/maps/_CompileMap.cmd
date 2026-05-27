@@ -2,10 +2,8 @@
 chcp 65001 >nul
 setlocal enabledelayedexpansion
 
-:: Dynamically generate a foolproof ANSI escape character
 for /f %%A in ('echo prompt $E ^| cmd') do set "ESC=%%A"
 
-:: ANSI colors configuration
 set "RED=%ESC%[91m"
 set "GRN=%ESC%[92m"
 set "YLW=%ESC%[93m"
@@ -16,18 +14,11 @@ set "DIM=%ESC%[90m"
 set "RST=%ESC%[0m"
 set "BLD=%ESC%[1m"
 
-:: -----------------------------------------------------------------
-:: Resolve absolute BASEPATH via pushd (handles unicode + spaces)
-:: Expected structure: <basepath>\baseq3\maps\CompileMap.cmd
-:: -----------------------------------------------------------------
 pushd "%~dp0"
 cd ..\..
 set "BASEPATH=%CD%"
 popd
 
-:: -----------------------------------------------------------------
-:: Scan for .map files in this folder
-:: -----------------------------------------------------------------
 echo.
 echo %BLD%%CYN% ===================================================%RST%
 echo %BLD%%CYN%   Universal Quake 3 Compiler  ^(q3map2^)%RST%
@@ -66,25 +57,29 @@ if "!MAPNAME!"=="" (
     exit /b 1
 )
 
-:: -----------------------------------------------------------------
-:: Select compile mode (Medium / Final only)
-:: -----------------------------------------------------------------
 echo.
 echo %BLD%%CYN% ===================================================%RST%
 echo %BLD%%WHT%   Select compile mode:%RST%
 echo %CYN% ---------------------------------------------------%RST%
-echo  %YLW% [1]%RST% %BLD%MEDIUM%RST%   - quick lightmaps, good for lighting preview
-echo       %DIM%  BSP + VIS (fast) + LIGHT (fast, 4 samples, 2 bounce)%RST%
+echo  %YLW% [1]%RST% %BLD%DRAFT%RST%    - no bounce, fast geometry preview
+echo       %DIM%  BSP + VIS (fast) + LIGHT (fast, no bounce, samplesize 8)%RST%
 echo.
-echo  %YLW% [2]%RST% %BLD%FINAL%RST%    - full lightmaps, slow, for release builds
-echo       %DIM%  BSP + VIS (full) + LIGHT (16 samples, 8 bounce, filter)%RST%
+echo  %YLW% [2]%RST% %BLD%MEDIUM%RST%   - bounced light, good for iteration
+echo       %DIM%  BSP + VIS (fast) + LIGHT (8 samples, 4 bounce, AO, samplesize 4)%RST%
+echo.
+echo  %YLW% [3]%RST% %BLD%FINAL%RST%    - full quality, slow
+echo       %DIM%  BSP + VIS (full) + LIGHT (32 samples, 16 bounce, AO, samplesize 2)%RST%
 echo %CYN% ---------------------------------------------------%RST%
-set /p MODE_CHOICE="  Enter mode [1-2]: "
+echo %DIM%   Note: quality is controlled by samplesize, not lightmapsize.%RST%
+echo %DIM%   Lower samplesize = sharper shadows. lightmapsize is left at%RST%
+echo %DIM%   default (128) to avoid StoreSurfaceLightmaps errors.%RST%
+echo %CYN% ---------------------------------------------------%RST%
+set /p MODE_CHOICE="  Enter mode [1-3]: "
 
-if "!MODE_CHOICE!"=="" set "MODE_CHOICE=1"
-if "!MODE_CHOICE!" NEQ "1" if "!MODE_CHOICE!" NEQ "2" (
-    echo %RED%  Invalid choice, defaulting to MEDIUM mode.%RST%
-    set "MODE_CHOICE=1"
+if "!MODE_CHOICE!"=="" set "MODE_CHOICE=2"
+if "!MODE_CHOICE!" NEQ "1" if "!MODE_CHOICE!" NEQ "2" if "!MODE_CHOICE!" NEQ "3" (
+    echo %RED%  Invalid choice, defaulting to MEDIUM.%RST%
+    set "MODE_CHOICE=2"
 )
 
 set "MAPFILE=%~dp0!MAPNAME!.map"
@@ -95,49 +90,46 @@ echo.
 echo %BLD%%CYN% ===================================================%RST%
 echo %WHT%   Map     :%RST% %YLW%!MAPNAME!.map%RST%
 echo %WHT%   Basepath:%RST% %DIM%!BASEPATH!%RST%
-if "!MODE_CHOICE!"=="1" echo %WHT%   Mode    :%RST% %CYN%MEDIUM ^(fast lightmap, 2 bounce^)%RST%
-if "!MODE_CHOICE!"=="2" echo %WHT%   Mode    :%RST% %GRN%FINAL ^(full lightmap, 8 bounce^)%RST%
+if "!MODE_CHOICE!"=="1" echo %WHT%   Mode    :%RST% %DIM%DRAFT%RST%
+if "!MODE_CHOICE!"=="2" echo %WHT%   Mode    :%RST% %CYN%MEDIUM%RST%
+if "!MODE_CHOICE!"=="3" echo %WHT%   Mode    :%RST% %GRN%FINAL%RST%
 echo %BLD%%CYN% ===================================================%RST%
 echo.
 
-:: -----------------------------------------------------------------
-:: [1/3] BSP -- runs in all modes
-:: -----------------------------------------------------------------
+:: --- [1/3] BSP ---
 echo %BLD%%MAG% --- [1/3] BSP pass -----------------------------------%RST%
 "%~dp0q3map2\q3map2" -meta -fs_basepath "!BASEPATH!" -fs_game baseq3 "!MAPFILE!"
 if errorlevel 1 goto :error
 
-:: -----------------------------------------------------------------
-:: [2/3] VIS
-:: -----------------------------------------------------------------
+:: --- [2/3] VIS ---
 echo.
 echo %BLD%%MAG% --- [2/3] VIS pass -----------------------------------%RST%
 if "!MODE_CHOICE!"=="1" "%~dp0q3map2\q3map2" -vis -fast -fs_basepath "!BASEPATH!" -fs_game baseq3 "!BSPFILE!"
-if "!MODE_CHOICE!"=="2" "%~dp0q3map2\q3map2" -vis -fs_basepath "!BASEPATH!" -fs_game baseq3 "!BSPFILE!"
+if "!MODE_CHOICE!"=="2" "%~dp0q3map2\q3map2" -vis -fast -fs_basepath "!BASEPATH!" -fs_game baseq3 "!BSPFILE!"
+if "!MODE_CHOICE!"=="3" "%~dp0q3map2\q3map2" -vis -fs_basepath "!BASEPATH!" -fs_game baseq3 "!BSPFILE!"
 if errorlevel 1 goto :error
 
-:: -----------------------------------------------------------------
-:: [3/3] LIGHT
-:: -----------------------------------------------------------------
+:: --- [3/3] LIGHT ---
+:: Quality is driven by -samplesize (luxel density in world units):
+::   samplesize 8  = default, coarse (DRAFT)
+::   samplesize 4  = 2x sharper shadows (MEDIUM)
+::   samplesize 2  = 4x sharper shadows (FINAL)
+:: -lightmapsize is intentionally omitted — this version of q3map2
+:: triggers "Storing all lightmaps externally" + exit code 3 when it
+:: is set above 128, regardless of map size.
 echo.
 echo %BLD%%MAG% --- [3/3] LIGHT pass ----------------------------------%RST%
-if "!MODE_CHOICE!"=="1" "%~dp0q3map2\q3map2" -light -fast -samples 4 -bounce 2 -fs_basepath "!BASEPATH!" -fs_game baseq3 "!BSPFILE!"
-if "!MODE_CHOICE!"=="2" "%~dp0q3map2\q3map2" -light -fast -samples 16 -bounce 8 -filter -fs_basepath "!BASEPATH!" -fs_game baseq3 "!BSPFILE!"
+if "!MODE_CHOICE!"=="1" "%~dp0q3map2\q3map2" -light -fast -samplesize 8 -fs_basepath "!BASEPATH!" -fs_game baseq3 "!BSPFILE!"
+if "!MODE_CHOICE!"=="2" "%~dp0q3map2\q3map2" -light -fast -samplesize 4 -samples 8 -bounce 4 -bouncescale 1.2 -patchshadows -dirty -randomsamples -fs_basepath "!BASEPATH!" -fs_game baseq3 "!BSPFILE!"
+if "!MODE_CHOICE!"=="3" "%~dp0q3map2\q3map2" -light -samplesize 2 -samples 32 -bounce 16 -bouncescale 1.2 -patchshadows -dirty -randomsamples -filter -fs_basepath "!BASEPATH!" -fs_game baseq3 "!BSPFILE!"
 if errorlevel 1 goto :error
 
-:: -----------------------------------------------------------------
-:: Clean up unwanted .srf file
-:: -----------------------------------------------------------------
-if exist "!SRFFILE!" (
-    del /q "!SRFFILE!"
-)
+if exist "!SRFFILE!" del /q "!SRFFILE!"
 
-:: -----------------------------------------------------------------
-:: Texture report (alphabetical)
-:: -----------------------------------------------------------------
+:: --- Texture report ---
 echo.
 echo %BLD%%CYN% ===================================================%RST%
-echo %BLD%%WHT%   Textures referenced in !MAPNAME!.map ^(Alphabetical^)%RST%
+echo %BLD%%WHT%   Textures referenced in !MAPNAME!.map%RST%
 echo %CYN% ---------------------------------------------------%RST%
 echo %WHT%   Copy these files to your server texture folder:%RST%
 echo %CYN% ---------------------------------------------------%RST%
@@ -160,7 +152,6 @@ for /f "usebackq tokens=1,5,6,10,11,15,16" %%A in ("!MAPFILE!") do (
 )
 
 set TEXCOUNT=0
-
 if exist "!TEMP_TEX_FILE!" (
     sort "!TEMP_TEX_FILE!" /o "!SORTED_TEX_FILE!"
     for /f "usebackq delims=" %%S in ("!SORTED_TEX_FILE!") do (
@@ -172,9 +163,7 @@ if exist "!TEMP_TEX_FILE!" (
     del "!SORTED_TEX_FILE!"
 )
 
-if !TEXCOUNT!==0 (
-    echo %DIM%   ^(no textures found -- unexpected .map format^)%RST%
-)
+if !TEXCOUNT!==0 echo %DIM%   (no textures found)%RST%
 
 echo.
 echo %CYN% ---------------------------------------------------%RST%
