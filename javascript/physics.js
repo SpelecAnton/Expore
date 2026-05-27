@@ -1,16 +1,22 @@
 /**
- * SPELEC PHYSICS v1.5 — SWEEP FIX
+ * SPELEC PHYSICS v1.6 — MATRIX FIX + UNDERGROUND RECOVERY
  *
- * Změny oproti v1.4:
- * - groundCheck: checkDist zvýšen z PLAYER_HEIGHT + GROUND_CHECK (1.78)
- *   na PLAYER_HEIGHT + 2.0 → paprsek dosáhne podlahy i při rychlém pádu.
- * - groundCheck: start paprsku posunut z +0.05 na +0.25 nad pozicí hráče
- *   → paprsek nezačíná pod geometrií při drobném průniku.
- * - update(): swept fallback — pokud groundCheck na nové pozici vrátí null
- *   a hráč padá, zkontrolujeme předchozí pozici; pokud tam byla podlaha
- *   a hráč ji přeskočil (tenký brush), přichytíme ho na ni.
- *   Eliminuje propadání rovnými brushy při vysoké rychlosti pádu.
+ * Změny oproti v1.5:
+ * - refreshCollidables() nyní volá scene.updateMatrixWorld(true) před sběrem
+ *   meshů → matrixWorld všech meshů je aktuální ještě před prvním raycastem.
+ *   Bez toho mohly mít nově přidané meshe identity matrixWorld a raycaster
+ *   je trefoval na špatných souřadnicích.
  *
+ * - groundCheck() rozšířen o underground recovery: pokud je hráč pod
+ *   podlahou (camera.y < groundY), přichytíme ho zpět i při volání
+ *   s aktuální pozicí — eliminuje situaci kdy hráč skrz podlahu propadl
+ *   a groundCheck ho nenávratně pustil dolů.
+ *
+ * - Paprsek groundChecku nyní startuje výš (+0.5 místo +0.25) a sahá
+ *   o stejnou vzdálenost níž → zachytí hráče i když je viditelně pod
+ *   povrchem (camera.y záporná, podlaha na Y=0).
+ *
+ * v1.5 — swept fallback, checkDist zvýšen
  * v1.4 — optimalizace collidables (CULL_DIST, refreshCollidables veřejná)
  * v1.3 — noclip podpora
  */
@@ -34,10 +40,6 @@ const DEFAULT_CFG = {
   GROUND_CHECK:    0.18,
   NUM_SIDE_RAYS:   8,
   NUM_SLOPE_RAYS:  4,
-
-  // OPTIMALIZACE: Maximální vzdálenost pro zahrnutí meshe do kolizních testů.
-  // Meshe dál než CULL_DIST jednotek od hráče jsou přeskočeny ještě před
-  // výpočtem boundingSphere → výrazně méně práce při velkých mapách.
   CULL_DIST: 30,
 };
 
@@ -54,26 +56,19 @@ function collectCollidables(scene) {
   return list;
 }
 
-// Sdílený vektor pro nearbyMeshes — vyhne se alokaci na každé volání.
 const _scaleVec  = new THREE.Vector3();
 const _centerVec = new THREE.Vector3();
 
-// OPTIMALIZACE: Dvoustupňový filtr:
-//   1. Rychlý CULL_DIST test (squared distance, žádná odmocnina) →
-//      vyhodí vzdálené meshe ještě před výpočtem boundingSphere.
-//   2. Přesný boundingSphere test pro zbývající kandidáty.
 function nearbyMeshes(collidables, origin, maxDist, cullDistSq) {
   const result = [];
 
   for (const mesh of collidables) {
-    // Stupeň 1: hrubý prostorový cull (světové pozice meshe)
     const wx = mesh.matrixWorld.elements[12];
     const wy = mesh.matrixWorld.elements[13];
     const wz = mesh.matrixWorld.elements[14];
     const dx = wx - origin.x, dy = wy - origin.y, dz = wz - origin.z;
     if (dx*dx + dy*dy + dz*dz > cullDistSq) continue;
 
-    // Stupeň 2: přesný boundingSphere test
     if (!mesh.geometry.boundingSphere) mesh.geometry.computeBoundingSphere();
     _centerVec.copy(mesh.geometry.boundingSphere.center)
               .applyMatrix4(mesh.matrixWorld);
@@ -107,12 +102,14 @@ export function createPhysics(scene, userCFG = {}) {
   const _origin = new THREE.Vector3();
   const _move   = new THREE.Vector3();
   const _yAxis  = new THREE.Vector3(0, 1, 0);
+  const _downDir = new THREE.Vector3(0, -1, 0);
 
   let collidablesReady = false;
 
-  // OPTIMALIZACE: refreshCollidables je veřejná — engine.js ji zavolá
-  // ihned po loadBSP(), takže první frame fyziky nemá žádný overhead.
   function refreshCollidables() {
+    // FIX v1.6: updateMatrixWorld před sběrem — nově přidané meshe mají
+    // správné světové souřadnice ještě před prvním raycastem.
+    scene.updateMatrixWorld(true);
     collidables = collectCollidables(scene);
     collidablesReady = true;
     console.log(`[Physics] Kolizní objekty: ${collidables.length}`);
@@ -130,16 +127,15 @@ export function createPhysics(scene, userCFG = {}) {
 
     let highestHit = null;
 
-    // FIX v1.5: checkDist zvýšen — paprsek musí dosáhnout podlahy i při
-    // rychlém pádu (terminal velocity −30 * dt 0.05 = 1.5 j/frame).
-    // Původní hodnota PLAYER_HEIGHT + GROUND_CHECK = ~1.78 nestačila.
-    const checkDist = CFG.PLAYER_HEIGHT + 2.0;
+    // FIX v1.6: Paprsek startuje výš (+0.5) → zachytí hráče i když je
+    // viditelně pod povrchem (underground recovery).
+    // checkDist odpovídajícím způsobem zvýšen.
+    const RAY_START_ABOVE = 0.5;
+    const checkDist = CFG.PLAYER_HEIGHT + RAY_START_ABOVE + 2.0;
 
     for (const [ox, oz] of offsets) {
-      // FIX v1.5: start paprsku posunut z +0.05 na +0.25 — při drobném
-      // průniku do geometrie paprsek nezačínal uvnitř meshe a míjel ho.
-      _origin.set(position.x + ox, position.y + 0.25, position.z + oz);
-      raycaster.set(_origin, new THREE.Vector3(0, -1, 0));
+      _origin.set(position.x + ox, position.y + RAY_START_ABOVE, position.z + oz);
+      raycaster.set(_origin, _downDir);
       raycaster.far = checkDist;
 
       const nearby = nearbyMeshes(collidables, _origin, checkDist + 1, cullDistSq);
@@ -152,7 +148,7 @@ export function createPhysics(scene, userCFG = {}) {
           .clone()
           .transformDirection(hit.object.matrixWorld) ?? _yAxis.clone();
 
-        if (normal.dot(raycaster.ray.direction) > 0) normal.negate();
+        if (normal.dot(_downDir) > 0) normal.negate();
 
         const angle = Math.acos(Math.max(-1, Math.min(1,
           normal.dot(_yAxis)))) * (180 / Math.PI);
@@ -196,7 +192,7 @@ export function createPhysics(scene, userCFG = {}) {
             .clone()
             .transformDirection(hit.object.matrixWorld) ?? new THREE.Vector3();
 
-          if (normal.dot(raycaster.ray.direction) > 0) normal.negate();
+          if (normal.dot(_dir) > 0) normal.negate();
 
           const slopeAngle = Math.acos(
             Math.max(-1, Math.min(1, normal.dot(_yAxis)))
@@ -252,8 +248,6 @@ export function createPhysics(scene, userCFG = {}) {
   function update(camera, keys, yaw, dt) {
     dt = Math.min(dt, 0.05);
 
-    // OPTIMALIZACE: Lazy init ponechán jako záchrana pro případ, že by
-    // refreshCollidables() nebyl zavolán z engine.js (zpětná kompatibilita).
     if (!collidablesReady) refreshCollidables();
 
     if (keys['a'] || keys['arrowleft'])  yaw += CFG.TURN_SPEED * dt;
@@ -306,15 +300,13 @@ export function createPhysics(scene, userCFG = {}) {
     camera.position.x += resolvedXZ.x;
     camera.position.z += resolvedXZ.z;
 
-    // FIX v1.5: Swept ground check — zachytí průchod skrz tenký brush.
-    // Uložíme Y před pohybem, posuneme, pak zkontrolujeme obě pozice.
+    // FIX v1.5+v1.6: Swept ground check
     const prevY = camera.position.y;
     camera.position.y += velocity.y * dt;
 
     let groundY = groundCheck(camera.position);
 
-    // Swept fallback: hráč padal, groundCheck na nové pozici vrátil null,
-    // ale na předchozí pozici podlaha byla → přeskočili jsme tenký brush.
+    // Swept fallback: hráč přeskočil tenký brush za jeden frame
     if (groundY === null && velocity.y < 0) {
       const prevPos = camera.position.clone();
       prevPos.y = prevY;
@@ -329,6 +321,8 @@ export function createPhysics(scene, userCFG = {}) {
     }
 
     if (groundY !== null) {
+      // FIX v1.6: přichytíme hráče i pokud je pod podlahou (groundY > camera.y)
+      // — underground recovery zabrání nekonečnému pádu skrz geometrii
       if (camera.position.y <= groundY + CFG.SKIN_WIDTH * 2) {
         camera.position.y = groundY;
         onGround = true;
