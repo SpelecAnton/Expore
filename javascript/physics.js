@@ -1,21 +1,13 @@
 /**
- * SPELEC PHYSICS v1.6 — MATRIX FIX + UNDERGROUND RECOVERY
+ * SPELEC PHYSICS v1.7 — DYNAMIC CULLING FIX
  *
- * Změny oproti v1.5:
- * - refreshCollidables() nyní volá scene.updateMatrixWorld(true) před sběrem
- *   meshů → matrixWorld všech meshů je aktuální ještě před prvním raycastem.
- *   Bez toho mohly mít nově přidané meshe identity matrixWorld a raycaster
- *   je trefoval na špatných souřadnicích.
+ * Změny oproti v1.6:
+ * - Odstraněn pevný CULL_DIST.
+ * - nearbyMeshes nyní používá výhradně Bounding Sphere, takže
+ * spolehlivě detekuje kolize i na obrovských mapách bez ohledu
+ * na to, kde má mesh svůj pivot (počátek souřadnic).
  *
- * - groundCheck() rozšířen o underground recovery: pokud je hráč pod
- *   podlahou (camera.y < groundY), přichytíme ho zpět i při volání
- *   s aktuální pozicí — eliminuje situaci kdy hráč skrz podlahu propadl
- *   a groundCheck ho nenávratně pustil dolů.
- *
- * - Paprsek groundChecku nyní startuje výš (+0.5 místo +0.25) a sahá
- *   o stejnou vzdálenost níž → zachytí hráče i když je viditelně pod
- *   povrchem (camera.y záporná, podlaha na Y=0).
- *
+ * v1.6 — MATRIX FIX + UNDERGROUND RECOVERY
  * v1.5 — swept fallback, checkDist zvýšen
  * v1.4 — optimalizace collidables (CULL_DIST, refreshCollidables veřejná)
  * v1.3 — noclip podpora
@@ -39,8 +31,7 @@ const DEFAULT_CFG = {
   SKIN_WIDTH:      0.02,
   GROUND_CHECK:    0.18,
   NUM_SIDE_RAYS:   8,
-  NUM_SLOPE_RAYS:  4,
-  CULL_DIST: 30,
+  NUM_SLOPE_RAYS:  4
 };
 
 function collectCollidables(scene) {
@@ -59,17 +50,12 @@ function collectCollidables(scene) {
 const _scaleVec  = new THREE.Vector3();
 const _centerVec = new THREE.Vector3();
 
-function nearbyMeshes(collidables, origin, maxDist, cullDistSq) {
+function nearbyMeshes(collidables, origin, maxDist) {
   const result = [];
 
   for (const mesh of collidables) {
-    const wx = mesh.matrixWorld.elements[12];
-    const wy = mesh.matrixWorld.elements[13];
-    const wz = mesh.matrixWorld.elements[14];
-    const dx = wx - origin.x, dy = wy - origin.y, dz = wz - origin.z;
-    if (dx*dx + dy*dy + dz*dz > cullDistSq) continue;
-
     if (!mesh.geometry.boundingSphere) mesh.geometry.computeBoundingSphere();
+    
     _centerVec.copy(mesh.geometry.boundingSphere.center)
               .applyMatrix4(mesh.matrixWorld);
 
@@ -88,7 +74,6 @@ function nearbyMeshes(collidables, origin, maxDist, cullDistSq) {
 export function createPhysics(scene, userCFG = {}) {
 
   const CFG = { ...DEFAULT_CFG, ...userCFG };
-  const cullDistSq = CFG.CULL_DIST * CFG.CULL_DIST;
 
   const velocity = new THREE.Vector3(0, 0, 0);
   let   onGround = false;
@@ -107,8 +92,6 @@ export function createPhysics(scene, userCFG = {}) {
   let collidablesReady = false;
 
   function refreshCollidables() {
-    // FIX v1.6: updateMatrixWorld před sběrem — nově přidané meshe mají
-    // správné světové souřadnice ještě před prvním raycastem.
     scene.updateMatrixWorld(true);
     collidables = collectCollidables(scene);
     collidablesReady = true;
@@ -127,9 +110,6 @@ export function createPhysics(scene, userCFG = {}) {
 
     let highestHit = null;
 
-    // FIX v1.6: Paprsek startuje výš (+0.5) → zachytí hráče i když je
-    // viditelně pod povrchem (underground recovery).
-    // checkDist odpovídajícím způsobem zvýšen.
     const RAY_START_ABOVE = 0.5;
     const checkDist = CFG.PLAYER_HEIGHT + RAY_START_ABOVE + 2.0;
 
@@ -138,7 +118,7 @@ export function createPhysics(scene, userCFG = {}) {
       raycaster.set(_origin, _downDir);
       raycaster.far = checkDist;
 
-      const nearby = nearbyMeshes(collidables, _origin, checkDist + 1, cullDistSq);
+      const nearby = nearbyMeshes(collidables, _origin, checkDist + 1.0);
       const hits   = raycaster.intersectObjects(nearby, false);
 
       if (hits.length > 0) {
@@ -182,7 +162,7 @@ export function createPhysics(scene, userCFG = {}) {
         raycaster.set(_origin, _dir);
         raycaster.far = CFG.PLAYER_RADIUS + CFG.SKIN_WIDTH;
 
-        const nearby = nearbyMeshes(collidables, _origin, CFG.PLAYER_RADIUS + 1.0, cullDistSq);
+        const nearby = nearbyMeshes(collidables, _origin, CFG.PLAYER_RADIUS + 1.0);
         const hits   = raycaster.intersectObjects(nearby, false);
 
         if (hits.length > 0) {
@@ -225,7 +205,7 @@ export function createPhysics(scene, userCFG = {}) {
     raycaster.set(stepOrigin, _dir);
     raycaster.far = CFG.PLAYER_RADIUS + moveDelta.length() + CFG.SKIN_WIDTH;
 
-    const nearby = nearbyMeshes(collidables, stepOrigin, raycaster.far + 1.0, cullDistSq);
+    const nearby = nearbyMeshes(collidables, stepOrigin, raycaster.far + 1.0);
     const hits   = raycaster.intersectObjects(nearby, false);
 
     _origin.set(position.x, feetY + 0.1, position.z);
@@ -300,13 +280,11 @@ export function createPhysics(scene, userCFG = {}) {
     camera.position.x += resolvedXZ.x;
     camera.position.z += resolvedXZ.z;
 
-    // FIX v1.5+v1.6: Swept ground check
     const prevY = camera.position.y;
     camera.position.y += velocity.y * dt;
 
     let groundY = groundCheck(camera.position);
 
-    // Swept fallback: hráč přeskočil tenký brush za jeden frame
     if (groundY === null && velocity.y < 0) {
       const prevPos = camera.position.clone();
       prevPos.y = prevY;
@@ -321,8 +299,6 @@ export function createPhysics(scene, userCFG = {}) {
     }
 
     if (groundY !== null) {
-      // FIX v1.6: přichytíme hráče i pokud je pod podlahou (groundY > camera.y)
-      // — underground recovery zabrání nekonečnému pádu skrz geometrii
       if (camera.position.y <= groundY + CFG.SKIN_WIDTH * 2) {
         camera.position.y = groundY;
         onGround = true;
