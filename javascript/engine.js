@@ -7,13 +7,16 @@
  *   generovaný sprite (canvas textura, glow halo) viditelný ve scéně
  * - Světla bez _sprite 1 fungují jako dřív — pouze PointLight, žádný sprite
  * - bloomPass parametry jsou doladěny pro tmavé mapy (strength 0.9, radius 0.4)
+ *
+ * FIX: loadBSP nyní předává lights[] do result → addLightSprites() správně
+ *      přijímá parsovaná světla z bsp_worker.js včetně _sprite příznaku.
  */
 
 import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.165.0/build/three.module.js';
 import { EffectComposer }  from 'https://cdn.jsdelivr.net/npm/three@0.165.0/examples/jsm/postprocessing/EffectComposer.js';
 import { RenderPass }      from 'https://cdn.jsdelivr.net/npm/three@0.165.0/examples/jsm/postprocessing/RenderPass.js';
 import { UnrealBloomPass } from 'https://cdn.jsdelivr.net/npm/three@0.165.0/examples/jsm/postprocessing/UnrealBloomPass.js';
-import { loadBSP, tickAnimatedTextures } from 'https://spelecanton.github.io/Expore/javascript/bsp_loader.js';
+import { loadBSP, tickAnimatedTextures, initTexLoader } from 'https://spelecanton.github.io/Expore/javascript/bsp_loader.js';
 import { createPhysics } from 'https://spelecanton.github.io/Expore/javascript/physics.js';
 
 const PLAYER_HEIGHT = 80;
@@ -337,6 +340,9 @@ export async function initEngine({
   renderer.toneMapping         = THREE.ACESFilmicToneMapping;
   renderer.toneMappingExposure = 2.0;
 
+  // Inicializuj anizotropní filtrování hned po vytvoření rendereru
+  initTexLoader(renderer);
+
   const scene  = new THREE.Scene();
   scene.fog        = new THREE.FogExp2(0x000000, 0.016);
   scene.background = new THREE.Color(0x000000);
@@ -381,6 +387,7 @@ export async function initEngine({
     for (const props of result.portals) buildPortal(props, scene, portals);
 
     // ── Přidej světla + bloom sprite ────────────────────────────────────────
+    // FIX: result.lights je nyní správně předáno z loadBSP()
     addLightSprites(scene, result.lights ?? []);
 
     const hashState = readHashState();
