@@ -1,12 +1,11 @@
 /**
- * SPELEC PHYSICS v1.7 — DYNAMIC CULLING FIX
+ * SPELEC PHYSICS v1.8 — DYNAMIC CULLING + CEILING CHECK
  *
- * Změny oproti v1.6:
- * - Odstraněn pevný CULL_DIST.
- * - nearbyMeshes nyní používá výhradně Bounding Sphere, takže
- * spolehlivě detekuje kolize i na obrovských mapách bez ohledu
- * na to, kde má mesh svůj pivot (počátek souřadnic).
+ * Změny oproti v1.7:
+ * - Přidána detekce kolizí pro směr nahoru (Ceiling Check) ve funkci update(), 
+ * která zamezuje hráči proskočit tenkým stropem při skoku.
  *
+ * v1.7 — Odstraněn pevný CULL_DIST, culling nyní závisí na Bounding Sphere.
  * v1.6 — MATRIX FIX + UNDERGROUND RECOVERY
  * v1.5 — swept fallback, checkDist zvýšen
  * v1.4 — optimalizace collidables (CULL_DIST, refreshCollidables veřejná)
@@ -281,10 +280,34 @@ export function createPhysics(scene, userCFG = {}) {
     camera.position.z += resolvedXZ.z;
 
     const prevY = camera.position.y;
-    camera.position.y += velocity.y * dt;
+    const deltaY = velocity.y * dt;
+
+    // --- CEILING CHECK ---
+    if (velocity.y > 0) {
+      const HEAD_CLEARANCE = 0.15; 
+      
+      _origin.set(camera.position.x, camera.position.y, camera.position.z);
+      raycaster.set(_origin, _yAxis); 
+      raycaster.far = deltaY + HEAD_CLEARANCE;
+
+      const nearby = nearbyMeshes(collidables, _origin, raycaster.far + 1.0);
+      const hits = raycaster.intersectObjects(nearby, false);
+
+      if (hits.length > 0) {
+        const hit = hits[0];
+        camera.position.y = hit.point.y - HEAD_CLEARANCE;
+        velocity.y = 0; 
+      } else {
+        camera.position.y += deltaY;
+      }
+    } else {
+      camera.position.y += deltaY;
+    }
+    // ---------------------
 
     let groundY = groundCheck(camera.position);
 
+    // Swept fallback
     if (groundY === null && velocity.y < 0) {
       const prevPos = camera.position.clone();
       prevPos.y = prevY;
