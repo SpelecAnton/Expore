@@ -1,5 +1,5 @@
 /**
- * SPELEC EXPLORE ENGINE v6.9 — BLOOM + LIGHT SPRITES
+ * SPELEC EXPLORE ENGINE v6.9 — BLOOM + LIGHT SPRITES + DEBUG
  *
  * Změny oproti v6.8:
  * - UnrealBloomPass přidán přes EffectComposer → globální bloom efekt
@@ -7,6 +7,11 @@
  *   generovaný sprite (canvas textura, glow halo) viditelný ve scéně
  * - Světla bez _sprite 1 fungují jako dřív — pouze PointLight, žádný sprite
  * - bloomPass parametry jsou doladěny pro tmavé mapy (strength 0.9, radius 0.4)
+ *
+ * v6.10 — DEBUG:
+ * - Stisknutí F vypisuje groundCheck debug do konzole
+ * - Zjišťuje všechny raycaste z aktuální pozice a ukazuje normály, distance, mesh info
+ * - Pomocí identifikace problémů s propadáním (noclip, depthWrite, matrixWorld apod.)
  *
  * FIX: loadBSP nyní předává lights[] do result → addLightSprites() správně
  *      přijímá parsovaná světla z bsp_worker.js včetně _sprite příznaku.
@@ -188,10 +193,6 @@ function buildPortal(props, scene, portals) {
 }
 
 // ── Light sprite — procedurálně generovaný bloom sprite ──────────────────────
-// Vytvoří canvas texturu s radial gradient (glow efekt) bez nutnosti
-// externího souboru. Sprite je vždy natočen ke kameře (Billboard).
-//
-// Volá se jen pro světla s _sprite 1 — ostatní světla dostanou jen PointLight.
 
 function makeSpriteTexture(r, g, b) {
   const size = 128;
@@ -431,6 +432,7 @@ export async function initEngine({
 
   window._cam     = camera;
   window._physics = physics;
+  window._scene   = scene;
 
   // ── Background music ──────────────────────────────────────────────────────
   const bgMusic = await bgMusicPromise;
@@ -476,6 +478,57 @@ export async function initEngine({
 
     return portals.find(p => p.mesh === portalHit.object) ?? null;
   }
+
+  // ── DEBUG: Ground check raycast na F ────────────────────────────────────────
+  window.addEventListener('keydown', e => {
+    if (e.key.toLowerCase() !== 'f') return;
+
+    const pos = camera.position;
+    console.log('=== GROUND DEBUG ===');
+    console.log('Camera pos:', `(${pos.x.toFixed(4)}, ${pos.y.toFixed(4)}, ${pos.z.toFixed(4)})`);
+    console.log('Hash:', `${pos.x.toFixed(1)},${pos.y.toFixed(1)},${pos.z.toFixed(1)},${yaw.toFixed(1)}`);
+
+    // Spusť 5 paprsků z různých offsetů
+    const ray = new THREE.Raycaster();
+    ray.firstHitOnly = true;
+
+    const offsets = [[0,0],[0.2,0],[-0.2,0],[0,0.2],[0,-0.2]];
+    
+    for (const [ox, oz] of offsets) {
+      const origin = new THREE.Vector3(pos.x + ox, pos.y + 0.25, pos.z + oz);
+      ray.set(origin, new THREE.Vector3(0, -1, 0));
+      ray.far = 5.0;
+
+      const meshes = [];
+      scene.traverse(obj => {
+        if (obj.isMesh && obj.geometry &&
+            !obj.userData.noclip &&
+            obj.material?.depthWrite !== false) {
+          meshes.push(obj);
+        }
+      });
+
+      const hits = ray.intersectObjects(meshes, false);
+      if (hits.length > 0) {
+        const h = hits[0];
+        const n = h.face?.normal ? h.face.normal.clone().transformDirection(h.object.matrixWorld) : null;
+        console.log(
+          `  offset[${ox.toFixed(1)},${oz.toFixed(1)}]:`,
+          'dist=' + h.distance.toFixed(3),
+          'hitY=' + h.point.y.toFixed(3),
+          'normal=' + (n ? `(${n.x.toFixed(2)},${n.y.toFixed(2)},${n.z.toFixed(2)})` : 'N/A'),
+          'angle=' + (n ? Math.acos(Math.max(-1, Math.min(1, n.dot(new THREE.Vector3(0,1,0))))) * 180 / Math.PI : 'N/A').toFixed(1) + '°',
+          'mesh=' + (h.object.name || h.object.uuid.slice(0, 8)),
+          'matrixOK=' + (h.object.matrixWorld.elements[0] !== 0)
+        );
+      } else {
+        console.log(`  offset[${ox.toFixed(1)},${oz.toFixed(1)}]: NO HIT`);
+      }
+    }
+    
+    console.log('World meshes:', worldMeshes.length);
+    console.log('====================');
+  }, { passive: true });
 
   // ── Input ─────────────────────────────────────────────────────────────────
   const keys = {};
