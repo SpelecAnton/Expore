@@ -1,14 +1,17 @@
 /**
- * SPELEC PHYSICS v1.8 — DYNAMIC CULLING + CEILING CHECK
+ * SPELEC PHYSICS v1.9 — CEILING TELEPORT FIX
  *
- * Změny oproti v1.7:
- * - Přidána detekce kolizí pro směr nahoru (Ceiling Check) ve funkci update(), 
- * která zamezuje hráči proskočit tenkým stropem při skoku.
+ * Změny oproti v1.8:
+ * - Přidán CEILING CLAMP do funkce groundCheck(). Zabraňuje tomu,
+ * aby počátek raycastu pro detekci podlahy (+0.5 nad kamerou kvůli recovery)
+ * prošel stropem. Tím se vyřešil bug, kdy hráč po výskoku těsně pod
+ * stropem zdetekoval jeho horní stranu jako podlahu a teleportoval se na střechu.
  *
- * v1.7 — Odstraněn pevný CULL_DIST, culling nyní závisí na Bounding Sphere.
+ * v1.8 — DYNAMIC CULLING + CEILING CHECK
+ * v1.7 — Odstraněn pevný CULL_DIST
  * v1.6 — MATRIX FIX + UNDERGROUND RECOVERY
  * v1.5 — swept fallback, checkDist zvýšen
- * v1.4 — optimalizace collidables (CULL_DIST, refreshCollidables veřejná)
+ * v1.4 — optimalizace collidables
  * v1.3 — noclip podpora
  */
 
@@ -109,11 +112,29 @@ export function createPhysics(scene, userCFG = {}) {
 
     let highestHit = null;
 
-    const RAY_START_ABOVE = 0.5;
-    const checkDist = CFG.PLAYER_HEIGHT + RAY_START_ABOVE + 2.0;
+    // --- CEILING CLAMP ---
+    // Původní +0.5 pro underground recovery
+    let maxStartAbove = 0.5; 
+    
+    // Zkontrolujeme vzdálenost k nejbližšímu stropu
+    _origin.set(position.x, position.y, position.z);
+    raycaster.set(_origin, _yAxis);
+    raycaster.far = maxStartAbove + 0.1;
+
+    const roofNearby = nearbyMeshes(collidables, _origin, raycaster.far + 1.0);
+    const roofHits = raycaster.intersectObjects(roofNearby, false);
+
+    if (roofHits.length > 0) {
+      // Pokud je strop blíž, nesmíme paprsek začít nad ním. Necháme 0.05 rezervu.
+      maxStartAbove = Math.min(maxStartAbove, roofHits[0].distance - 0.05);
+    }
+    // ---------------------
+
+    const startY = position.y + maxStartAbove;
+    const checkDist = CFG.PLAYER_HEIGHT + maxStartAbove + 2.0;
 
     for (const [ox, oz] of offsets) {
-      _origin.set(position.x + ox, position.y + RAY_START_ABOVE, position.z + oz);
+      _origin.set(position.x + ox, startY, position.z + oz);
       raycaster.set(_origin, _downDir);
       raycaster.far = checkDist;
 
