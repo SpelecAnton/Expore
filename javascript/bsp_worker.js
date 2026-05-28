@@ -1,37 +1,42 @@
 /**
  * SPELEC BSP Worker — Quake 3 BSP (IBSP v46)
  *
- * Spouští se jako Web Worker. Zpracuje BSP buffer (parsing, vertex building,
- * index building, lightmap atlas) MIMO main thread a vrátí hotová data
- * přes transferable ArrayBuffers — žádné kopírování.
+ * Runs as a Web Worker. Processes BSP buffer (parsing, vertex building,
+ * index building, lightmap atlas) OFF the main thread and returns finished data
+ * via transferable ArrayBuffers — no copying.
  *
- * Komunikace:
+ * Communication:
  *   IN  { buffer: ArrayBuffer, textureBase, fallbackTexBase }
- *   OUT { type: 'done',    ...ParsedBSP }   — úspěch
- *   OUT { type: 'error',   message }         — chyba
- *   OUT { type: 'progress', pct }            — průběh 0–100
+ *   OUT { type: 'done',    ...ParsedBSP }   — success
+ *   OUT { type: 'error',   message }         — error
+ *   OUT { type: 'progress', pct }            — progress 0–100
  *
- * v2 — func_wall / noclip podpora:
- *   Entity s classname v NOCLIP_CLASSNAMES mají model="*N".
- *   Submodel N v LUMP_MODELS definuje firstFace + numFaces.
- *   Tyto face indexy jsou předány do buildBatches → batch.noclip = true.
- *   Loader pak nastaví material.depthWrite = false → physics je ignoruje.
+ * v2 — func_wall / noclip support:
+ *   Entities with classname in NOCLIP_CLASSNAMES have model="*N".
+ *   Submodel N in LUMP_MODELS defines firstFace + numFaces.
+ *   These face indices are passed to buildBatches → batch.noclip = true.
+ *   Loader then sets material.depthWrite = false → physics ignores them.
  *
  * v3 — light entity + bloom sprite:
- *   Light entity (light, light_spot, light_point) jsou parsovány a předány
- *   do engine.js jako result.lights[].
- *   Pokud má entita vlastnost _sprite 1, engine vytvoří viditelný bloom sprite
- *   na pozici světla (procedurálně generovaný, žádný soubor).
+ *   Light entities (light, light_spot, light_point) are parsed and passed
+ *   to engine.js as result.lights[].
+ *   If entity has _sprite 1, engine creates a visible bloom sprite
+ *   at the light position (procedurally generated, no file needed).
+ *
+ * v4 — invisible clip textures:
+ *   Textures in INVISIBLE_TEXTURES (e.g. common/clip, common/nodraw) get
+ *   batch.invisible = true. Loader hides these meshes (mesh.visible = false)
+ *   while keeping depthWrite = true so physics.js still collides with them.
  */
 
 'use strict';
 
-// ── Konstanty ─────────────────────────────────────────────────────────────────
+// ── Constants ─────────────────────────────────────────────────────────────────
 const MAGIC           = 0x50534249; // 'IBSP'
 const VERSION         = 46;
 const LUMP_ENTITIES   = 0;
 const LUMP_TEXTURES   = 1;
-const LUMP_MODELS     = 7;   // ← submodely (func_* entity)
+const LUMP_MODELS     = 7;   // ← submodels (func_* entities)
 const LUMP_LIGHTMAPS  = 14;
 const LUMP_VERTS      = 10;
 const LUMP_MESH_VERTS = 11;
@@ -44,12 +49,27 @@ const MODEL_RECORD_SIZE = 40;   // mins(12) + maxs(12) + face(4) + nFaces(4) + b
 const LM_SIZE           = 128 * 128 * 3;
 const UNIT              = 0.02;
 
-// ── Entity classnames které mají být průchozí (bez kolize) ───────────────────
+// ── Entity classnames that should be passthrough (no collision) ───────────────
 const NOCLIP_CLASSNAMES = new Set([
   'func_wall',
   'func_illusionary',
   'func_detail',
   'func_fog',
+]);
+
+// ── Texture names that should be invisible but still collide ──────────────────
+// These are Quake 3 / GtkRadiant clip/nodraw shaders that must never be rendered.
+// The mesh stays in the scene so physics raycasts hit it normally.
+const INVISIBLE_TEXTURES = new Set([
+  'common/clip',
+  'common/nodraw',
+  'common/hint',
+  'common/skip',
+  'common/caulk',
+  'common/trigger',
+  'clip',
+  'nodraw',
+  'hint',
 ]);
 
 // ── Light entity classnames ───────────────────────────────────────────────────
@@ -95,7 +115,7 @@ function parseEntityLump(text) {
   return entities;
 }
 
-// ── Zjisti noclip face indexy z entity + model lump ──────────────────────────
+// ── Build noclip face index set from entity + model lump ─────────────────────
 function buildNoclipFaceSet(entities, buffer, modelLump) {
   const noclipFaces = new Set();
   const modelCount  = (modelLump.length / MODEL_RECORD_SIZE) | 0;
@@ -117,7 +137,7 @@ function buildNoclipFaceSet(entities, buffer, modelLump) {
     console.log(`[BSP Worker] ${e.classname} model=*${subIdx}: firstFace=${firstFace}, numFaces=${numFaces}`);
 
     if (firstFace < 0 || numFaces < 0 || numFaces > 100000) {
-      console.warn(`[BSP Worker] Přeskakuji ${e.classname} — neplatné face hodnoty`);
+      console.warn(`[BSP Worker] Skipping ${e.classname} — invalid face values`);
       continue;
     }
 
@@ -129,10 +149,10 @@ function buildNoclipFaceSet(entities, buffer, modelLump) {
   return noclipFaces;
 }
 
-// ── Parsuj light entity ───────────────────────────────────────────────────────
-// Vrátí pole světel:
+// ── Parse light entities ──────────────────────────────────────────────────────
+// Returns array of lights:
 //   { x, y, z, r, g, b, intensity, sprite }
-//   sprite = true jen pokud má entita _sprite "1"
+//   sprite = true only if entity has _sprite "1"
 function parseLights(entities) {
   const lights = [];
 
@@ -141,11 +161,10 @@ function parseLights(entities) {
 
     const [ox, oy, oz] = (e.origin || '0 0 0').split(' ').map(Number);
 
-    // Barva: _color "R G B" (0–1) nebo _light "R G B I" (0–255 + intenzita)
+    // Color: _color "R G B" (0–1) or _light "R G B I" (0–255 + intensity)
     let r = 1, g = 1, b = 1, intensity = 200;
 
     if (e._light) {
-      // Formát: "R G B intensity" kde R/G/B jsou 0–255
       const parts = e._light.trim().split(/\s+/).map(Number);
       if (parts.length >= 4) {
         r = parts[0] / 255;
@@ -163,12 +182,11 @@ function parseLights(entities) {
       if (parts.length >= 3) { r = parts[0]; g = parts[1]; b = parts[2]; }
     }
 
-    // Clamp barvy na 0–1
+    // Clamp color to 0–1
     r = Math.max(0, Math.min(1, r));
     g = Math.max(0, Math.min(1, g));
     b = Math.max(0, Math.min(1, b));
 
-    // Sprite je dobrovolný — jen pokud _sprite "1"
     const sprite = e._sprite === '1';
 
     lights.push({
@@ -183,7 +201,7 @@ function parseLights(entities) {
 
   if (lights.length > 0) {
     const withSprite = lights.filter(l => l.sprite).length;
-    console.log(`[BSP Worker] Světla: ${lights.length} celkem, ${withSprite} se spritem`);
+    console.log(`[BSP Worker] Lights: ${lights.length} total, ${withSprite} with sprite`);
   }
 
   return lights;
@@ -265,7 +283,9 @@ function parseVertices(buffer, vLump) {
 }
 
 // ── Face batching + mesh building ─────────────────────────────────────────────
-function buildBatches(buffer, fLump, mvLump, rawPos, rawUV1, rawUV2, rawNorm, lmAtlas, lmCount, noclipFaces) {
+// texNames is now required to detect invisible clip textures per-batch.
+function buildBatches(buffer, fLump, mvLump, rawPos, rawUV1, rawUV2, rawNorm,
+                      lmAtlas, lmCount, noclipFaces, texNames) {
   const view      = new DataView(buffer);
   const fCount    = (fLump.length / FACE_RECORD_SIZE) | 0;
   const mvCount   = (mvLump.length / 4) | 0;
@@ -290,12 +310,18 @@ function buildBatches(buffer, fLump, mvLump, rawPos, rawUV1, rawUV2, rawNorm, lm
     const mvCount2 = view.getInt32(fo + 24, true);
     const lmIdx    = view.getInt32(fo + 28, true);
 
-    const isNoclip = noclipFaces.has(fi);
-    const key      = `${texIdx}:${lmIdx}:${isNoclip ? 'n' : 's'}`;
+    const isNoclip    = noclipFaces.has(fi);
+
+    // Check if this face's texture should be invisible (clip brush etc.)
+    const texName     = (texNames[texIdx] || '').toLowerCase();
+    const isInvisible = INVISIBLE_TEXTURES.has(texName);
+
+    // Separate batch keys for noclip, invisible, and normal faces
+    const key = `${texIdx}:${lmIdx}:${isNoclip ? 'n' : 's'}:${isInvisible ? 'i' : 'v'}`;
 
     let b = batchMap.get(key);
     if (!b) {
-      b = { texIdx, lmIdx, noclip: isNoclip, absIndices: [] };
+      b = { texIdx, lmIdx, noclip: isNoclip, invisible: isInvisible, absIndices: [] };
       batchMap.set(key, b);
     }
 
@@ -375,15 +401,16 @@ function buildBatches(buffer, fLump, mvLump, rawPos, rawUV1, rawUV2, rawNorm, lm
     }
 
     builtBatches.push({
-      texIdx:  batch.texIdx,
-      lmIdx:   batch.lmIdx,
-      noclip:  batch.noclip,
-      hasLM:   lmAtlas !== null && batch.lmIdx >= 0 && batch.lmIdx < lmCount,
-      pos:     posArr.subarray(0, vertCount * 3),
-      nrm:     nrmArr.subarray(0, vertCount * 3),
-      uv1:     uv1Arr.subarray(0, vertCount * 2),
-      uv2:     uv2Arr.subarray(0, vertCount * 2),
-      idx:     idxArr,
+      texIdx:   batch.texIdx,
+      lmIdx:    batch.lmIdx,
+      noclip:   batch.noclip,
+      invisible: batch.invisible,   // true → mesh.visible = false in loader, but still collides
+      hasLM:    lmAtlas !== null && batch.lmIdx >= 0 && batch.lmIdx < lmCount,
+      pos:      posArr.subarray(0, vertCount * 3),
+      nrm:      nrmArr.subarray(0, vertCount * 3),
+      uv1:      uv1Arr.subarray(0, vertCount * 2),
+      uv2:      uv2Arr.subarray(0, vertCount * 2),
+      idx:      idxArr,
     });
   }
 
@@ -396,8 +423,8 @@ self.onmessage = function ({ data }) {
     const { buffer, textureBase, fallbackTexBase } = data;
     const view = new DataView(buffer);
 
-    if (view.getUint32(0, true) !== MAGIC)   throw new Error('Soubor není IBSP');
-    if (view.getInt32(4, true)  !== VERSION) throw new Error(`BSP verze ${view.getInt32(4,true)} není podporována`);
+    if (view.getUint32(0, true) !== MAGIC)   throw new Error('File is not IBSP');
+    if (view.getInt32(4, true)  !== VERSION) throw new Error(`BSP version ${view.getInt32(4,true)} is not supported`);
 
     const lump = id => ({
       offset: view.getInt32(8 + id * 8,     true),
@@ -432,7 +459,6 @@ self.onmessage = function ({ data }) {
       }
     }
 
-    // Parsuj světla (light, light_spot, light_point)
     const parsedLights = parseLights(entities);
     lights.push(...parsedLights);
 
@@ -442,7 +468,7 @@ self.onmessage = function ({ data }) {
     const modelLump   = lump(LUMP_MODELS);
     const noclipFaces = buildNoclipFaceSet(entities, buffer, modelLump);
     if (noclipFaces.size > 0) {
-      console.log(`[BSP Worker] Noclip faces: ${noclipFaces.size} (func_wall apod.)`);
+      console.log(`[BSP Worker] Noclip faces: ${noclipFaces.size} (func_wall etc.)`);
     }
 
     // ── Texture names ────────────────────────────────────────────────────────
@@ -476,6 +502,7 @@ self.onmessage = function ({ data }) {
     self.postMessage({ type: 'progress', pct: 55 });
 
     // ── Batches + geometry buffers ───────────────────────────────────────────
+    // texNames is passed so buildBatches can detect invisible clip textures.
     const batches = buildBatches(
       buffer,
       lump(LUMP_FACES),
@@ -483,6 +510,7 @@ self.onmessage = function ({ data }) {
       rawPos, rawUV1, rawUV2, rawNorm,
       lmAtlas, lmCount,
       noclipFaces,
+      texNames,     // ← required for invisible texture detection
     );
 
     self.postMessage({ type: 'progress', pct: 85 });
@@ -505,7 +533,7 @@ self.onmessage = function ({ data }) {
     self.postMessage({
       type: 'done',
       portals,
-      lights,   // ← nové: pole světel
+      lights,
       playerStart,
       ambientIntensity,
       ambientColorArr,
