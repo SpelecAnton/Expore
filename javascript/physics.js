@@ -1,21 +1,38 @@
 /**
- * SPELEC PHYSICS v2.1
+ * SPELEC PHYSICS v2.2 — ARCHITECTURAL REWRITE OF MOVEMENT PIPELINE
  *
- * Fixes vs v2.0:
+ * Root cause of both bugs in v2.1:
  *
- * STEP CLIMBING:
- *   tryStepUp no longer validates via groundCheck on the projected position.
- *   That check fired before the player was actually above the step surface and
- *   returned null, blocking the climb. Now: if there is a low obstacle but no
- *   obstacle at step-height, the step is accepted unconditionally. The normal
- *   groundCheck in the main loop will land the player correctly anyway.
+ *   resolveWalls() returned a modified *delta*, not a corrected *position*.
+ *   tryStepUp() ran BEFORE wall resolution and saw the raw input vector.
  *
- * CORNER VIBRATION:
- *   resolveWalls no longer adds the extra SKIN_WIDTH push on top of penetration.
- *   The extra push caused oscillation: wall A pushed +x, wall B pushed -x next
- *   frame, camera shook. Now the push is exactly (penetration depth) with a
- *   small epsilon to clear the surface, and accumulated normals are deduplicated
- *   per frame so two nearly-parallel walls only push once.
+ *   This caused two symptoms:
+ *   1. Diagonal stairs: wall resolution clipped one axis, step logic had already
+ *      approved the full diagonal → player teleported into the wall face.
+ *   2. Wall jitter: push-out moved player by (pen + epsilon) → next frame
+ *      player is epsilon outside radius → ray hits again → another push →
+ *      oscillation at ~60 Hz (visible as camera vibration).
+ *
+ * Fix — new movement pipeline:
+ *
+ *   1. pushOutOfWalls(position)
+ *      Moves camera.position directly. Fires rays from current position,
+ *      collects unique wall normals (dedup dot>0.85), pushes position OUT of
+ *      penetration by exactly (PLAYER_RADIUS - hit.distance), no epsilon.
+ *      Called BEFORE and AFTER horizontal movement so the player is never
+ *      inside a wall at the start of a frame.
+ *
+ *   2. slideMove(position, delta)
+ *      Projects the movement delta onto wall planes (removes the into-wall
+ *      component) WITHOUT adding any positional push. Pure velocity clipping.
+ *      This is the standard Quake-style slide move.
+ *
+ *   3. tryStepUp(position, delta)
+ *      Runs AFTER slideMove sees the clipped delta, so it knows the actual
+ *      intended direction after wall sliding.
+ *
+ *   Result: no push epsilon → no jitter. Step logic sees post-slide direction
+ *   → diagonal stairs work.
  */
 
 import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.165.0/build/three.module.js';
@@ -93,8 +110,81 @@ export function createPhysics(scene, userCFG = {}) {
     console.log(`[Physics] Collidables: ${collidables.length}`);
   }
 
+  // ── Collect wall normals at current position ──────────────────────────────
+  // Returns array of { flat: Vector3 (Y=0, normalized), pen: number }
+  // Deduplicates normals that are nearly parallel (dot > 0.85).
+  function collectWalls(position) {
+    const walls = [];
+
+    const checkHeights = [
+      CFG.PLAYER_HEIGHT * 0.08,
+      CFG.PLAYER_HEIGHT * 0.45,
+      CFG.PLAYER_HEIGHT * 0.82,
+    ];
+
+    for (const yOff of checkHeights) {
+      _orig.set(position.x, position.y - yOff, position.z);
+
+      for (let i = 0; i < CFG.NUM_SIDE_RAYS; i++) {
+        const angle = (i / CFG.NUM_SIDE_RAYS) * Math.PI * 2;
+        _dir.set(Math.cos(angle), 0, Math.sin(angle));
+
+        ray.set(_orig, _dir);
+        ray.far = CFG.PLAYER_RADIUS + CFG.SKIN_WIDTH;
+
+        const nearby = nearbyMeshes(collidables, _orig, CFG.PLAYER_RADIUS + 0.5);
+        const hits   = ray.intersectObjects(nearby, false);
+        if (!hits.length) continue;
+
+        const hit = hits[0];
+        let normal = hit.face?.normal
+          .clone()
+          .transformDirection(hit.object.matrixWorld)
+          ?? new THREE.Vector3();
+        if (normal.dot(_dir) > 0) normal.negate();
+
+        const slopeAngle = Math.acos(
+          Math.max(-1, Math.min(1, normal.dot(_up)))
+        ) * (180 / Math.PI);
+        if (slopeAngle <= CFG.SLOPE_MAX_ANGLE) continue; // floor, not wall
+
+        const flat = new THREE.Vector3(normal.x, 0, normal.z).normalize();
+        if (flat.lengthSq() < 0.001) continue;
+
+        // Deduplicate nearly-parallel normals
+        if (walls.some(w => w.flat.dot(flat) > 0.85)) continue;
+
+        const pen = CFG.PLAYER_RADIUS - hit.distance; // positive = inside wall
+        walls.push({ flat, pen });
+      }
+    }
+
+    return walls;
+  }
+
+  // ── Push position OUT of walls ────────────────────────────────────────────
+  // Modifies position directly. No epsilon — exact penetration depth only.
+  // Call this before and after horizontal movement.
+  function pushOutOfWalls(position) {
+    const walls = collectWalls(position);
+    for (const { flat, pen } of walls) {
+      if (pen > 0) position.addScaledVector(flat, pen);
+    }
+  }
+
+  // ── Slide move: clip delta against wall planes ────────────────────────────
+  // Does NOT touch position. Pure velocity projection — Quake-style.
+  function slideMove(position, delta) {
+    const walls = collectWalls(position);
+    const out   = delta.clone();
+    for (const { flat } of walls) {
+      const d = out.dot(flat);
+      if (d < 0) out.addScaledVector(flat, -d);
+    }
+    return out;
+  }
+
   // ── Ground detection ──────────────────────────────────────────────────────
-  // Fires DOWN from camera eye. Returns eye-level Y of floor, or null.
   function groundCheck(position) {
     const offsets = [[0, 0]];
     for (let i = 0; i < CFG.NUM_SLOPE_RAYS; i++) {
@@ -174,80 +264,39 @@ export function createPhysics(scene, userCFG = {}) {
     return hits.length ? hits[0].distance : Infinity;
   }
 
-  // ── Wall resolution ───────────────────────────────────────────────────────
-  // Collects unique wall normals across 3 body rings, then applies each push
-  // exactly once. This prevents the corner oscillation that happened when two
-  // walls pushed in opposite directions on alternate frames.
-  function resolveWalls(position, moveDelta) {
-    const resolved = moveDelta.clone();
+  // ── Step climbing ─────────────────────────────────────────────────────────
+  // Runs AFTER slideMove so it sees the post-slide direction.
+  // Is there an obstacle at foot level but clear at step height? Accept step.
+  function tryStepUp(position, delta) {
+    if (!onGround) return delta;
+    if (delta.lengthSq() < 0.00001) return delta;
 
-    const checkHeights = [
-      CFG.PLAYER_HEIGHT * 0.08,
-      CFG.PLAYER_HEIGHT * 0.45,
-      CFG.PLAYER_HEIGHT * 0.82,
-    ];
+    const feetY = position.y - CFG.PLAYER_HEIGHT;
 
-    // Collect (normal, penetration) pairs; deduplicate normals that are nearly
-    // parallel (dot > 0.9) to avoid double-pushing on rounded brush corners.
-    const walls = [];
+    _dir.copy(delta).setY(0).normalize();
 
-    for (const yOff of checkHeights) {
-      _orig.set(position.x, position.y - yOff, position.z);
+    // Low ray (just above feet)
+    _orig.set(position.x, feetY + 0.05, position.z);
+    ray.set(_orig, _dir);
+    ray.far = CFG.PLAYER_RADIUS + delta.length() + CFG.SKIN_WIDTH;
 
-      for (let i = 0; i < CFG.NUM_SIDE_RAYS; i++) {
-        const angle = (i / CFG.NUM_SIDE_RAYS) * Math.PI * 2;
-        _dir.set(Math.cos(angle), 0, Math.sin(angle));
+    const nearby  = nearbyMeshes(collidables, _orig, ray.far + 0.5);
+    const hitsLow = ray.intersectObjects(nearby, false);
+    if (!hitsLow.length) return delta; // no obstacle, normal move
 
-        ray.set(_orig, _dir);
-        ray.far = CFG.PLAYER_RADIUS + CFG.SKIN_WIDTH;
+    // High ray (step height clearance)
+    _orig.set(position.x, feetY + CFG.STEP_HEIGHT + 0.05, position.z);
+    ray.set(_orig, _dir);
+    ray.far = CFG.PLAYER_RADIUS + delta.length() + CFG.SKIN_WIDTH;
+    const hitsHigh = ray.intersectObjects(nearby, false);
 
-        const nearby = nearbyMeshes(collidables, _orig, CFG.PLAYER_RADIUS + 0.5);
-        const hits   = ray.intersectObjects(nearby, false);
-        if (!hits.length) continue;
-
-        const hit = hits[0];
-        let normal = hit.face?.normal
-          .clone()
-          .transformDirection(hit.object.matrixWorld)
-          ?? new THREE.Vector3();
-        if (normal.dot(_dir) > 0) normal.negate();
-
-        const slopeAngle = Math.acos(
-          Math.max(-1, Math.min(1, normal.dot(_up)))
-        ) * (180 / Math.PI);
-
-        if (slopeAngle <= CFG.SLOPE_MAX_ANGLE) continue; // it's a floor, not a wall
-
-        const flat = new THREE.Vector3(normal.x, 0, normal.z).normalize();
-        if (flat.lengthSq() < 0.001) continue;
-
-        // Deduplicate: skip if we already have a nearly-identical normal
-        const duplicate = walls.some(w => w.flat.dot(flat) > 0.9);
-        if (duplicate) continue;
-
-        const pen = CFG.PLAYER_RADIUS + CFG.SKIN_WIDTH - hit.distance;
-        walls.push({ flat, pen });
-      }
-    }
-
-    // Apply each unique wall push once
-    for (const { flat, pen } of walls) {
-      // Cancel movement into the wall
-      const dot = resolved.dot(flat);
-      if (dot < 0) resolved.addScaledVector(flat, -dot);
-
-      // Push out of penetration — exactly pen depth, tiny epsilon, NO extra SKIN_WIDTH
-      // (the extra push was what caused oscillation in corners)
-      if (pen > 0) resolved.addScaledVector(flat, pen + 0.001);
-    }
-
-    return resolved;
+    // Clear above step height → climbable
+    return hitsHigh.length === 0 ? delta : delta;
   }
 
   // ── Brush escape ──────────────────────────────────────────────────────────
   function escapeBrush(position) {
     const escapeR = CFG.PLAYER_RADIUS * 1.5;
-
     for (const mesh of collidables) {
       if (!mesh.geometry.boundingSphere) continue;
       _sc.copy(mesh.geometry.boundingSphere.center).applyMatrix4(mesh.matrixWorld);
@@ -263,49 +312,15 @@ export function createPhysics(scene, userCFG = {}) {
           .setY(0)
           .normalize();
         if (out.lengthSq() > 0.001) {
-          position.addScaledVector(out, (escapeR - dist) + 0.001);
+          position.addScaledVector(out, escapeR - dist);
         }
       }
     }
   }
 
-  // ── Step climbing ─────────────────────────────────────────────────────────
-  // Logic: is there an obstacle at foot level but NOT at step-height level?
-  // If yes, accept the move — groundCheck in the main loop will snap Y correctly.
-  // No longer validates via groundCheck here (that was blocking high steps).
-  function tryStepUp(position, moveDelta) {
-    if (!onGround) return moveDelta;
-    if (moveDelta.lengthSq() < 0.00001) return moveDelta;
-
-    const feetY = position.y - CFG.PLAYER_HEIGHT;
-
-    // Ray at foot level
-    _orig.set(position.x, feetY + 0.05, position.z);
-    _dir.copy(moveDelta).setY(0).normalize();
-    ray.set(_orig, _dir);
-    ray.far = CFG.PLAYER_RADIUS + moveDelta.length() + CFG.SKIN_WIDTH;
-
-    const nearby  = nearbyMeshes(collidables, _orig, ray.far + 0.5);
-    const hitsLow = ray.intersectObjects(nearby, false);
-    if (!hitsLow.length) return moveDelta; // no obstacle at all, normal move
-
-    // Ray at step-height clearance
-    _orig.set(position.x, feetY + CFG.STEP_HEIGHT + 0.05, position.z);
-    ray.set(_orig, _dir);
-    ray.far = CFG.PLAYER_RADIUS + moveDelta.length() + CFG.SKIN_WIDTH;
-    const hitsHigh = ray.intersectObjects(nearby, false);
-
-    // Obstacle low but clear above step height → step is possible
-    if (hitsHigh.length === 0) return moveDelta;
-
-    // Obstacle at both levels → wall, not a step
-    return moveDelta;
-  }
-
   // ── Main update ───────────────────────────────────────────────────────────
   function update(camera, keys, yaw, dt) {
     dt = Math.min(dt, 0.05);
-
     if (!collidablesReady) refreshCollidables();
 
     // Turning
@@ -323,7 +338,6 @@ export function createPhysics(scene, userCFG = {}) {
       currentPitch -= sign * CFG.RETURN_SPEED * dt;
       if (Math.sign(currentPitch) !== sign) currentPitch = 0;
     }
-
     camera.rotation.set(currentPitch, yaw, 0, 'YXZ');
 
     // Horizontal input
@@ -350,13 +364,24 @@ export function createPhysics(scene, userCFG = {}) {
       velocity.y = Math.min(velocity.y, 0);
     }
 
-    // Horizontal movement
-    const stepped   = tryStepUp(camera.position, _move);
-    const resolvedH = resolveWalls(camera.position, stepped);
-    camera.position.x += resolvedH.x;
-    camera.position.z += resolvedH.z;
+    // ── Horizontal movement pipeline ──────────────────────────────────────
+    // 1. Push out of any walls we're already touching (no epsilon, exact depth)
+    pushOutOfWalls(camera.position);
 
-    // Vertical movement — ceiling clamp first
+    // 2. Clip movement delta against wall planes (no positional change)
+    const slid = slideMove(camera.position, _move);
+
+    // 3. Step climbing check on the post-slide delta
+    tryStepUp(camera.position, slid); // modifies nothing, snapping done by groundCheck
+
+    // 4. Apply the slid delta
+    camera.position.x += slid.x;
+    camera.position.z += slid.z;
+
+    // 5. Push out again after moving (handles new penetrations from this frame)
+    pushOutOfWalls(camera.position);
+
+    // ── Vertical movement ─────────────────────────────────────────────────
     const deltaY = velocity.y * dt;
     if (velocity.y > 0) {
       const HEAD_GAP  = 0.1;
@@ -371,10 +396,10 @@ export function createPhysics(scene, userCFG = {}) {
       camera.position.y += deltaY;
     }
 
-    // Ground snap
+    // ── Ground snap ───────────────────────────────────────────────────────
     let floorY = groundCheck(camera.position);
 
-    // Swept fallback: fell through a thin floor this frame
+    // Swept fallback
     if (floorY === null && velocity.y <= 0) {
       const prevPos = camera.position.clone();
       prevPos.y -= deltaY;
