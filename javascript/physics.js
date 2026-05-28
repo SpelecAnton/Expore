@@ -1,10 +1,10 @@
 /**
- * SPELEC PHYSICS v2.7 — QUAKE-STYLE STEP SIMULATION + OBLIQUE PENETRATION FIX
+ * SPELEC PHYSICS v2.8 — MULTI-PLANE FIX & CORNER TUNNELING PROTECTION
  *
- * Plně implementovaná detekce schodů ve stylu id Tech 3 (Quake 3).
- * Verze 2.7 opravuje chybu šikmého paprsku (Oblique Ray Error), která způsobovala
- * nedostatečné vytlačení hráče ze stěn a následné zasekávání "ducha" v algoritmu
- * step-slide uvnitř geometrie schodů.
+ * Plně implementovaná detekce schodů a stěn ve stylu id Tech 3 (Quake 3).
+ * Verze 2.8 řeší třesení a propadávání skrze spoje více brushů (vnitřní rohy):
+ * 1. pushOutOfWalls nyní používá iterativní greedy přístup (řeší nejprve nejhlubší zásek).
+ * 2. slideMove detekuje skřípnutí mezi dvěma rovinami a uzamyká pohyb do jejich průsečíku.
  */
 
 import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.165.0/build/three.module.js';
@@ -24,7 +24,7 @@ const DEFAULT_CFG = {
   SLOPE_MAX_ANGLE: 50,
   SKIN_WIDTH:      0.02,
   GROUND_CHECK:    0.18,
-  NUM_SIDE_RAYS:   16,  // Zvýšeno z 10 na 16 pro dokonalejší pokrytí hran kvádrů
+  NUM_SIDE_RAYS:   16,
   NUM_SLOPE_RAYS:  4,
 };
 
@@ -122,8 +122,6 @@ export function createPhysics(scene, userCFG = {}) {
         if (flat.lengthSq() < 0.001) continue;
         if (walls.some(w => w.flat.dot(flat) > 0.85)) continue;
 
-        // FIX v2.7: Korekce šikmého dopadu paprsku. Skalární součin nám dá cosinus 
-        // úhlu mezi paprskem a normálou stěny, čímž spočítáme reálnou kolmou vzdálenost.
         const cosAngle = -_dir.dot(normal);
         const perpDist = hit.distance * cosAngle;
         const pen = CFG.PLAYER_RADIUS - perpDist;
@@ -137,9 +135,27 @@ export function createPhysics(scene, userCFG = {}) {
 
   // ── Push position directly out of wall penetrations ───────────────────────
   function pushOutOfWalls(position) {
-    const walls = collectWalls(position);
-    for (const { flat, pen } of walls) {
-      if (pen > 0) position.addScaledVector(flat, pen);
+    // FIX v2.8: Iterativní Greedy vytlačování (max 3 průchody).
+    // Místo vytlačení ze všech stěn naráz vyřešíme v každém kroku pouze tu NEJHLUBŠÍ kolizi.
+    // Tím zabráníme tomu, aby nás vytlačení z jedné zdi hodilo nekontrolovaně hluboko do druhé.
+    for (let iter = 0; iter < 3; iter++) {
+      const walls = collectWalls(position);
+      let maxPen = 0;
+      let bestFlat = null;
+
+      for (const { flat, pen } of walls) {
+        if (pen > maxPen) {
+          maxPen = pen;
+          bestFlat = flat;
+        }
+      }
+
+      // Pokud najdeme průnik, vytlačíme hráče ven s nepatrným bonusem (odlepení od stěny)
+      if (maxPen > 0.001 && bestFlat) {
+        position.addScaledVector(bestFlat, maxPen * 1.005);
+      } else {
+        break; // Žádné další kolize, jsme bezpečně venku
+      }
     }
   }
 
@@ -147,9 +163,32 @@ export function createPhysics(scene, userCFG = {}) {
   function slideMove(position, delta) {
     const walls = collectWalls(position);
     const out   = delta.clone();
+    const clippedPlanes = [];
+
     for (const { flat } of walls) {
       const d = out.dot(flat);
-      if (d < 0) out.addScaledVector(flat, -d);
+      if (d < 0) {
+        // Standardní oříznutí pohybu podél stěny
+        out.addScaledVector(flat, -d);
+
+        // FIX v2.8: Quake 3 Multi-plane crease clipping
+        // Pokud nově oříznutý směr začne směřovat PROTI některé z rovin, 
+        // kterými jsme už v tomto framu prošli, jsme skřípnutí v koutě.
+        for (const prevFlat of clippedPlanes) {
+          if (out.dot(prevFlat) < -0.001) {
+            // Vypočítáme osu průsečíku obou stěn (křížový součin normál)
+            const crease = new THREE.Vector3().crossVectors(flat, prevFlat).normalize();
+            
+            // Projektujeme původní zamýšlený pohyb do této linie průsečíku.
+            // U čistě vertikálních stěn bude výsledek (0,0,0), což pohyb bezpečně zastaví
+            // a zabrání proklouznutí skrze šev geometrie.
+            const speed = delta.dot(crease);
+            out.copy(crease).multiplyScalar(speed);
+            break; 
+          }
+        }
+        clippedPlanes.push(flat);
+      }
     }
     return out;
   }
@@ -240,15 +279,12 @@ export function createPhysics(scene, userCFG = {}) {
       return slideMove(position, intentMove); 
     }
 
-    // 1. Spodní cesta: Pohyb po zemi v této snímkové frekvenci
     const slidDown = slideMove(position, intentMove);
 
-    // Pokud projdeme čistě, netřeba simulovat schody
     if (slidDown.lengthSq() >= intentMove.lengthSq() * 0.99) {
       return slidDown;
     }
 
-    // 2. Horní cesta: Zkontrolujeme strop před zvednutím
     if (ceilingClearance(position) < CFG.STEP_HEIGHT + 0.1) {
       return slidDown;
     }
@@ -256,19 +292,16 @@ export function createPhysics(scene, userCFG = {}) {
     const posUp = position.clone();
     posUp.y += CFG.STEP_HEIGHT;
 
-    // Slide ve zvednuté výšce (díky fixu z v2.7 už neuvízne uvnitř schodu)
     const slidUp = slideMove(posUp, intentMove);
     posUp.x += slidUp.x;
     posUp.z += slidUp.z;
 
     const landY = groundCheck(posUp);
 
-    // 3. Vyhodnocení obou cest
     if (landY !== null) {
       const lift = landY - position.y;
 
       if (lift > 0.001 && lift <= CFG.STEP_HEIGHT + 0.05) {
-        // Porovnání zachované dopředné hybnosti (přesně jako v id Tech)
         if (slidUp.lengthSq() > slidDown.lengthSq() + 0.0001) {
           position.y = landY; 
           return slidUp;      
