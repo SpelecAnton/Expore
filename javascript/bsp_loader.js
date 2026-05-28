@@ -382,14 +382,9 @@ export async function loadBSP({
     const mesh = new THREE.Mesh(geo, mat);
 
     if (b.invisible) {
-      // Do NOT set mesh.visible = false — that removes the mesh from raycasting too.
-      // Instead use a fully write-disabled material: nothing is written to color or
-      // depth buffer, so the mesh is completely invisible and causes no z-fighting.
-      // Physics raycasts still hit it because the mesh stays in the scene graph.
-      mat.colorWrite  = false;
-      mat.depthWrite  = false;
-      mat.depthTest   = false;   // skip depth test entirely — no z-fighting possible
-      mesh.renderOrder = -1;     // render before everything else (depth buffer empty)
+      // Hide from renderer but keep in scene graph so raycasts (physics) hit it.
+      // depthWrite = true (default) is intentional — do NOT set it to false here.
+      mesh.visible = false;
       mesh.userData.invisible = true;
       invisibleMeshes++;
     }
