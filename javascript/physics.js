@@ -1,18 +1,15 @@
 /**
- * SPELEC PHYSICS v2.3 — STEP CLIMBING ACTUALLY WORKS NOW
+ * SPELEC PHYSICS v2.4 — SMOOTH STEP CLIMBING
  *
- * Fix vs v2.2:
- *   tryStepUp() in v2.2 detected a climbable step but returned delta unchanged
- *   in BOTH branches — it never modified camera.position.y. So STEP_HEIGHT had
- *   zero effect regardless of its value.
+ * Fix vs v2.3:
+ *   tryStepUp lifted by full CFG.STEP_HEIGHT unconditionally, causing a visible
+ *   jump even on tiny steps and overshooting on large STEP_HEIGHT values.
  *
- *   Fix: when a climbable step is detected, immediately lift camera.position.y
- *   by STEP_HEIGHT before the horizontal delta is applied. groundCheck() in the
- *   main loop then snaps the player down to the exact surface. This is the
- *   standard Quake-style step implementation.
- *
- *   Also: step detection now fires rays in the actual movement direction (post-
- *   slide), not a fixed forward direction — so diagonal approaches work.
+ *   Fix: cast a downward ray from (currentPos + moveDir * smallOffset) at
+ *   STEP_HEIGHT above feet to find the ACTUAL top surface of the step.
+ *   Lift by exactly (stepSurfaceY - feetY), not by CFG.STEP_HEIGHT.
+ *   CFG.STEP_HEIGHT becomes a maximum limit, not the lift amount.
+ *   Result: camera rises only as much as the step is tall — smooth, no pop.
  */
 
 import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.165.0/build/three.module.js';
@@ -138,7 +135,6 @@ export function createPhysics(scene, userCFG = {}) {
     return walls;
   }
 
-  // ── Push position directly out of wall penetrations ───────────────────────
   function pushOutOfWalls(position) {
     const walls = collectWalls(position);
     for (const { flat, pen } of walls) {
@@ -146,7 +142,6 @@ export function createPhysics(scene, userCFG = {}) {
     }
   }
 
-  // ── Clip movement delta against wall planes (no positional change) ────────
   function slideMove(position, delta) {
     const walls = collectWalls(position);
     const out   = delta.clone();
@@ -238,20 +233,21 @@ export function createPhysics(scene, userCFG = {}) {
   }
 
   // ── Step climbing ─────────────────────────────────────────────────────────
-  // Must be called AFTER slideMove so delta reflects post-slide direction.
-  // When a climbable step is detected, lifts camera.position.y immediately.
-  // groundCheck() in the main loop then snaps down to exact surface.
+  // 1. Forward ray at foot level — is there an obstacle?
+  // 2. Forward ray at STEP_HEIGHT — is it clear above the obstacle?
+  // 3. Downward ray from (pos + moveDir * probe) at STEP_HEIGHT above feet
+  //    → finds the ACTUAL surface top of the step.
+  // 4. Lift by exactly (stepSurfaceY - feetY) — never more than STEP_HEIGHT.
   function tryStepUp(position, delta) {
     if (!onGround) return;
     if (delta.lengthSq() < 0.00001) return;
 
-    const feetY     = position.y - CFG.PLAYER_HEIGHT;
-    const moveLen   = delta.length();
+    const feetY   = position.y - CFG.PLAYER_HEIGHT;
+    const moveLen = delta.length();
 
-    // Use actual movement direction (post-slide)
     _dir.copy(delta).setY(0).normalize();
 
-    // Ray at foot level — is there anything blocking forward movement?
+    // Low ray — obstacle at foot level?
     _orig.set(position.x, feetY + 0.05, position.z);
     ray.set(_orig, _dir);
     ray.far = CFG.PLAYER_RADIUS + moveLen + CFG.SKIN_WIDTH;
@@ -260,15 +256,31 @@ export function createPhysics(scene, userCFG = {}) {
     const hitsLow = ray.intersectObjects(nearby, false);
     if (!hitsLow.length) return; // nothing to step over
 
-    // Ray at step-height clearance — is it clear above the obstacle?
+    // High ray — clear at step height?
     _orig.set(position.x, feetY + CFG.STEP_HEIGHT + 0.05, position.z);
     ray.set(_orig, _dir);
     ray.far = CFG.PLAYER_RADIUS + moveLen + CFG.SKIN_WIDTH;
     const hitsHigh = ray.intersectObjects(nearby, false);
     if (hitsHigh.length > 0) return; // wall, not a step
 
-    // Climbable step — lift player up so groundCheck lands on top of it
-    position.y += CFG.STEP_HEIGHT;
+    // Find actual surface top: shoot DOWN from just past the obstacle face,
+    // starting at STEP_HEIGHT above feet.
+    const probeX = position.x + _dir.x * (CFG.PLAYER_RADIUS + 0.05);
+    const probeZ = position.z + _dir.z * (CFG.PLAYER_RADIUS + 0.05);
+    _orig.set(probeX, feetY + CFG.STEP_HEIGHT + 0.05, probeZ);
+    ray.set(_orig, _down);
+    ray.far = CFG.STEP_HEIGHT + 0.1;
+
+    const hitsDown = ray.intersectObjects(nearby, false);
+    if (!hitsDown.length) return; // no surface found above
+
+    const stepSurfaceY = hitsDown[0].point.y;
+    const liftNeeded   = stepSurfaceY - feetY;
+
+    // Sanity: only lift if surface is actually above current feet and within limit
+    if (liftNeeded <= 0.001 || liftNeeded > CFG.STEP_HEIGHT + 0.01) return;
+
+    position.y += liftNeeded;
   }
 
   // ── Brush escape ──────────────────────────────────────────────────────────
@@ -342,20 +354,16 @@ export function createPhysics(scene, userCFG = {}) {
     }
 
     // ── Horizontal movement pipeline ──────────────────────────────────────
-    // 1. Push out of walls we're already inside
     pushOutOfWalls(camera.position);
 
-    // 2. Clip movement delta against wall planes
     const slid = slideMove(camera.position, _move);
 
-    // 3. Step climb — lifts camera.position.y if applicable (AFTER slide)
+    // Step climbing: lifts position.y by exact step height (not CFG.STEP_HEIGHT)
     tryStepUp(camera.position, slid);
 
-    // 4. Apply horizontal delta
     camera.position.x += slid.x;
     camera.position.z += slid.z;
 
-    // 5. Push out of any new penetrations after moving
     pushOutOfWalls(camera.position);
 
     // ── Vertical movement ─────────────────────────────────────────────────
@@ -376,7 +384,6 @@ export function createPhysics(scene, userCFG = {}) {
     // ── Ground snap ───────────────────────────────────────────────────────
     let floorY = groundCheck(camera.position);
 
-    // Swept fallback
     if (floorY === null && velocity.y <= 0) {
       const prevPos = camera.position.clone();
       prevPos.y -= deltaY;
@@ -390,7 +397,6 @@ export function createPhysics(scene, userCFG = {}) {
       }
     }
 
-    // Underground recovery
     if (floorY === null) {
       const recovered = recoverFromUnderground(camera.position);
       if (recovered !== null) {
