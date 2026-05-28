@@ -1,10 +1,10 @@
 /**
- * SPELEC PHYSICS v2.8 — MULTI-PLANE FIX & CORNER TUNNELING PROTECTION
+ * SPELEC PHYSICS v2.9 — ULTIMATE STEP FIX
  *
- * Plně implementovaná detekce schodů a stěn ve stylu id Tech 3 (Quake 3).
- * Verze 2.8 řeší třesení a propadávání skrze spoje více brushů (vnitřní rohy):
- * 1. pushOutOfWalls nyní používá iterativní greedy přístup (řeší nejprve nejhlubší zásek).
- * 2. slideMove detekuje skřípnutí mezi dvěma rovinami a uzamyká pohyb do jejich průsečíku.
+ * Verze 2.9 řeší problém s nutností "rozeběhnout se" na schody:
+ * 1. Zvýšen rádius a počet paprsků v groundCheck (zajišťuje, že duch vždy vidí vršek schodu).
+ * 2. Přidán kolizní prstenec těsně u nohou (0.95 H), aby malé překážky neprokluzovaly.
+ * 3. Zmenšena epsilon tolerance při porovnávání tras, takže pomalý pohyb nedeaktivuje step.
  */
 
 import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.165.0/build/three.module.js';
@@ -25,7 +25,7 @@ const DEFAULT_CFG = {
   SKIN_WIDTH:      0.02,
   GROUND_CHECK:    0.18,
   NUM_SIDE_RAYS:   16,
-  NUM_SLOPE_RAYS:  4,
+  NUM_SLOPE_RAYS:  8,   // Zvýšeno pro dokonalé pokrytí plochy pod hráčem
 };
 
 function collectCollidables(scene) {
@@ -79,17 +79,18 @@ export function createPhysics(scene, userCFG = {}) {
     scene.updateMatrixWorld(true);
     collidables = collectCollidables(scene);
     collidablesReady = true;
-    console.log(`[Physics] Collidables: ${collidables.length}`);
   }
 
   // ── Collect unique wall normals at a given position ───────────────────────
   function collectWalls(position) {
     const walls = [];
 
+    // Vylepšeno: 4 prstence, nejnižší je těsně u nohou, aby zachytil i drobné překážky
     const checkHeights = [
-      CFG.PLAYER_HEIGHT * 0.08,
+      CFG.PLAYER_HEIGHT * 0.15,
       CFG.PLAYER_HEIGHT * 0.45,
-      CFG.PLAYER_HEIGHT * 0.82,
+      CFG.PLAYER_HEIGHT * 0.75,
+      CFG.PLAYER_HEIGHT * 0.95, 
     ];
 
     for (const yOff of checkHeights) {
@@ -135,9 +136,6 @@ export function createPhysics(scene, userCFG = {}) {
 
   // ── Push position directly out of wall penetrations ───────────────────────
   function pushOutOfWalls(position) {
-    // FIX v2.8: Iterativní Greedy vytlačování (max 3 průchody).
-    // Místo vytlačení ze všech stěn naráz vyřešíme v každém kroku pouze tu NEJHLUBŠÍ kolizi.
-    // Tím zabráníme tomu, aby nás vytlačení z jedné zdi hodilo nekontrolovaně hluboko do druhé.
     for (let iter = 0; iter < 3; iter++) {
       const walls = collectWalls(position);
       let maxPen = 0;
@@ -150,11 +148,10 @@ export function createPhysics(scene, userCFG = {}) {
         }
       }
 
-      // Pokud najdeme průnik, vytlačíme hráče ven s nepatrným bonusem (odlepení od stěny)
       if (maxPen > 0.001 && bestFlat) {
         position.addScaledVector(bestFlat, maxPen * 1.005);
       } else {
-        break; // Žádné další kolize, jsme bezpečně venku
+        break; 
       }
     }
   }
@@ -168,20 +165,11 @@ export function createPhysics(scene, userCFG = {}) {
     for (const { flat } of walls) {
       const d = out.dot(flat);
       if (d < 0) {
-        // Standardní oříznutí pohybu podél stěny
         out.addScaledVector(flat, -d);
 
-        // FIX v2.8: Quake 3 Multi-plane crease clipping
-        // Pokud nově oříznutý směr začne směřovat PROTI některé z rovin, 
-        // kterými jsme už v tomto framu prošli, jsme skřípnutí v koutě.
         for (const prevFlat of clippedPlanes) {
           if (out.dot(prevFlat) < -0.001) {
-            // Vypočítáme osu průsečíku obou stěn (křížový součin normál)
             const crease = new THREE.Vector3().crossVectors(flat, prevFlat).normalize();
-            
-            // Projektujeme původní zamýšlený pohyb do této linie průsečíku.
-            // U čistě vertikálních stěn bude výsledek (0,0,0), což pohyb bezpečně zastaví
-            // a zabrání proklouznutí skrze šev geometrie.
             const speed = delta.dot(crease);
             out.copy(crease).multiplyScalar(speed);
             break; 
@@ -198,9 +186,10 @@ export function createPhysics(scene, userCFG = {}) {
     const offsets = [[0, 0]];
     for (let i = 0; i < CFG.NUM_SLOPE_RAYS; i++) {
       const a = (i / CFG.NUM_SLOPE_RAYS) * Math.PI * 2;
+      // Vylepšeno: Rozšířeno na 95 % poloměru hráče, aby paprsky "našly" okraj schodu
       offsets.push([
-        Math.cos(a) * CFG.PLAYER_RADIUS * 0.7,
-        Math.sin(a) * CFG.PLAYER_RADIUS * 0.7,
+        Math.cos(a) * CFG.PLAYER_RADIUS * 0.95, 
+        Math.sin(a) * CFG.PLAYER_RADIUS * 0.95,
       ]);
     }
 
@@ -302,7 +291,9 @@ export function createPhysics(scene, userCFG = {}) {
       const lift = landY - position.y;
 
       if (lift > 0.001 && lift <= CFG.STEP_HEIGHT + 0.05) {
-        if (slidUp.lengthSq() > slidDown.lengthSq() + 0.0001) {
+        // Vylepšeno: Epsilon je zmenšeno na absolutní minimum, 
+        // takže projde i mikroskopický pomalý pohyb vpřed
+        if (slidUp.lengthSq() > slidDown.lengthSq() + 0.000001) {
           position.y = landY; 
           return slidUp;      
         }
