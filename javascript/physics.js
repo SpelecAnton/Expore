@@ -1,15 +1,33 @@
 /**
- * SPELEC PHYSICS v2.4 — SMOOTH STEP CLIMBING
+ * SPELEC PHYSICS v2.5 — QUAKE-STYLE STEP SIMULATION
  *
- * Fix vs v2.3:
- *   tryStepUp lifted by full CFG.STEP_HEIGHT unconditionally, causing a visible
- *   jump even on tiny steps and overshooting on large STEP_HEIGHT values.
+ * Root cause of v2.4 issues:
  *
- *   Fix: cast a downward ray from (currentPos + moveDir * smallOffset) at
- *   STEP_HEIGHT above feet to find the ACTUAL top surface of the step.
- *   Lift by exactly (stepSurfaceY - feetY), not by CFG.STEP_HEIGHT.
- *   CFG.STEP_HEIGHT becomes a maximum limit, not the lift amount.
- *   Result: camera rises only as much as the step is tall — smooth, no pop.
+ *   1. CEILING BUG: the downward probe ray started from (feetY + STEP_HEIGHT),
+ *      which is above the ceiling when stairs are inside a room. The ray origin
+ *      crossed the ceiling, hit its back face, and lifted the player up there.
+ *
+ *   2. INCONSISTENCY: the probe point (pos + dir * PLAYER_RADIUS) often landed
+ *      on the vertical face of the step, not its top surface. groundCheck then
+ *      found nothing or the wrong surface.
+ *
+ * Fix — Quake-style step simulation:
+ *
+ *   Instead of a probe ray, we simulate the full step move in a temporary
+ *   position WITHOUT touching camera.position:
+ *
+ *     a) testPos = camera.position, lifted by STEP_HEIGHT
+ *     b) Check ceiling clearance at testPos — abort if ceiling too low
+ *     c) Move testPos forward by delta (horizontal only)
+ *     d) Call groundCheck(testPos) — fires downward from elevated position,
+ *        returns exact eye-level Y of whatever surface is below
+ *     e) Compute liftNeeded = landY - camera.position.y
+ *        Accept only if 0 < liftNeeded <= STEP_HEIGHT
+ *     f) Apply liftNeeded to camera.position.y
+ *
+ *   This eliminates the probe point problem (groundCheck uses multiple rays
+ *   in a ring, not one point) and the ceiling problem (step b aborts early
+ *   if the elevated testPos is already inside a ceiling).
  */
 
 import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.165.0/build/three.module.js';
@@ -87,7 +105,7 @@ export function createPhysics(scene, userCFG = {}) {
     console.log(`[Physics] Collidables: ${collidables.length}`);
   }
 
-  // ── Collect unique wall normals at current position ───────────────────────
+  // ── Collect unique wall normals at a given position ───────────────────────
   function collectWalls(position) {
     const walls = [];
 
@@ -135,6 +153,7 @@ export function createPhysics(scene, userCFG = {}) {
     return walls;
   }
 
+  // ── Push position directly out of wall penetrations ───────────────────────
   function pushOutOfWalls(position) {
     const walls = collectWalls(position);
     for (const { flat, pen } of walls) {
@@ -142,6 +161,7 @@ export function createPhysics(scene, userCFG = {}) {
     }
   }
 
+  // ── Clip movement delta against wall planes ───────────────────────────────
   function slideMove(position, delta) {
     const walls = collectWalls(position);
     const out   = delta.clone();
@@ -153,6 +173,7 @@ export function createPhysics(scene, userCFG = {}) {
   }
 
   // ── Ground detection ──────────────────────────────────────────────────────
+  // Fires downward from position (eye level). Returns eye-level Y or null.
   function groundCheck(position) {
     const offsets = [[0, 0]];
     for (let i = 0; i < CFG.NUM_SLOPE_RAYS; i++) {
@@ -195,6 +216,17 @@ export function createPhysics(scene, userCFG = {}) {
     return highestFloor;
   }
 
+  // ── Ceiling clearance at a given position ─────────────────────────────────
+  function ceilingClearance(position) {
+    _orig.set(position.x, position.y, position.z);
+    ray.set(_orig, _up);
+    ray.far = 4.0;
+
+    const nearby = nearbyMeshes(collidables, _orig, ray.far);
+    const hits   = ray.intersectObjects(nearby, false);
+    return hits.length ? hits[0].distance : Infinity;
+  }
+
   // ── Underground recovery ──────────────────────────────────────────────────
   function recoverFromUnderground(position) {
     _orig.set(position.x, position.y - CFG.PLAYER_HEIGHT - 0.05, position.z);
@@ -221,65 +253,64 @@ export function createPhysics(scene, userCFG = {}) {
       : null;
   }
 
-  // ── Ceiling clearance ─────────────────────────────────────────────────────
-  function ceilingClearance(position) {
-    _orig.set(position.x, position.y, position.z);
-    ray.set(_orig, _up);
-    ray.far = 4.0;
-
-    const nearby = nearbyMeshes(collidables, _orig, ray.far);
-    const hits   = ray.intersectObjects(nearby, false);
-    return hits.length ? hits[0].distance : Infinity;
-  }
-
-  // ── Step climbing ─────────────────────────────────────────────────────────
-  // 1. Forward ray at foot level — is there an obstacle?
-  // 2. Forward ray at STEP_HEIGHT — is it clear above the obstacle?
-  // 3. Downward ray from (pos + moveDir * probe) at STEP_HEIGHT above feet
-  //    → finds the ACTUAL surface top of the step.
-  // 4. Lift by exactly (stepSurfaceY - feetY) — never more than STEP_HEIGHT.
+  // ── Step climbing — Quake-style simulation ────────────────────────────────
+  // Does NOT touch position unless a valid step is confirmed.
+  // Simulates the move in a temporary position to find the exact surface Y.
   function tryStepUp(position, delta) {
     if (!onGround) return;
     if (delta.lengthSq() < 0.00001) return;
 
     const feetY   = position.y - CFG.PLAYER_HEIGHT;
     const moveLen = delta.length();
-
     _dir.copy(delta).setY(0).normalize();
 
-    // Low ray — obstacle at foot level?
+    // Quick check: is there any obstacle at foot level in move direction?
+    // If not, no stepping needed at all.
     _orig.set(position.x, feetY + 0.05, position.z);
     ray.set(_orig, _dir);
     ray.far = CFG.PLAYER_RADIUS + moveLen + CFG.SKIN_WIDTH;
-
     const nearby  = nearbyMeshes(collidables, _orig, ray.far + 0.5);
     const hitsLow = ray.intersectObjects(nearby, false);
-    if (!hitsLow.length) return; // nothing to step over
+    if (!hitsLow.length) return;
 
-    // High ray — clear at step height?
+    // Is it clear at step height? If not, it's a wall we can't step over.
     _orig.set(position.x, feetY + CFG.STEP_HEIGHT + 0.05, position.z);
     ray.set(_orig, _dir);
     ray.far = CFG.PLAYER_RADIUS + moveLen + CFG.SKIN_WIDTH;
     const hitsHigh = ray.intersectObjects(nearby, false);
-    if (hitsHigh.length > 0) return; // wall, not a step
+    if (hitsHigh.length > 0) return;
 
-    // Find actual surface top: shoot DOWN from just past the obstacle face,
-    // starting at STEP_HEIGHT above feet.
-    const probeX = position.x + _dir.x * (CFG.PLAYER_RADIUS + 0.05);
-    const probeZ = position.z + _dir.z * (CFG.PLAYER_RADIUS + 0.05);
-    _orig.set(probeX, feetY + CFG.STEP_HEIGHT + 0.05, probeZ);
-    ray.set(_orig, _down);
-    ray.far = CFG.STEP_HEIGHT + 0.1;
+    // ── Simulate the step ──────────────────────────────────────────────────
+    // Build a test position elevated by STEP_HEIGHT.
+    const testPos = new THREE.Vector3(
+      position.x,
+      position.y + CFG.STEP_HEIGHT,
+      position.z,
+    );
 
-    const hitsDown = ray.intersectObjects(nearby, false);
-    if (!hitsDown.length) return; // no surface found above
+    // Abort if the elevated position is inside or too close to a ceiling.
+    // ceilingClearance fires upward — if we're already above the ceiling after
+    // lifting, clearance will be near zero (ray hits ceiling immediately).
+    const clearAtElevated = ceilingClearance(testPos);
+    if (clearAtElevated < 0.05) return;
 
-    const stepSurfaceY = hitsDown[0].point.y;
-    const liftNeeded   = stepSurfaceY - feetY;
+    // Move the test position forward horizontally.
+    testPos.x += delta.x;
+    testPos.z += delta.z;
 
-    // Sanity: only lift if surface is actually above current feet and within limit
+    // Find the actual floor surface below the elevated + moved test position.
+    // groundCheck fires DOWN from testPos.y (elevated eye level), so it sees
+    // the top of the step without being confused by ceilings.
+    const landY = groundCheck(testPos);
+    if (landY === null) return;
+
+    // How much do we actually need to lift?
+    const liftNeeded = landY - position.y;
+
+    // Accept only genuine upward steps within the configured limit.
     if (liftNeeded <= 0.001 || liftNeeded > CFG.STEP_HEIGHT + 0.01) return;
 
+    // Apply exact lift — camera rises only as tall as the step, not STEP_HEIGHT.
     position.y += liftNeeded;
   }
 
@@ -354,16 +385,21 @@ export function createPhysics(scene, userCFG = {}) {
     }
 
     // ── Horizontal movement pipeline ──────────────────────────────────────
+    // 1. Push out of walls we're already touching
     pushOutOfWalls(camera.position);
 
+    // 2. Clip movement delta against wall planes
     const slid = slideMove(camera.position, _move);
 
-    // Step climbing: lifts position.y by exact step height (not CFG.STEP_HEIGHT)
+    // 3. Simulate step — lifts camera.position.y by exact step surface height
+    //    Uses elevated test position so ceilings cannot be misidentified as floors
     tryStepUp(camera.position, slid);
 
+    // 4. Apply horizontal delta
     camera.position.x += slid.x;
     camera.position.z += slid.z;
 
+    // 5. Push out of any new penetrations created by this frame's movement
     pushOutOfWalls(camera.position);
 
     // ── Vertical movement ─────────────────────────────────────────────────
@@ -384,6 +420,7 @@ export function createPhysics(scene, userCFG = {}) {
     // ── Ground snap ───────────────────────────────────────────────────────
     let floorY = groundCheck(camera.position);
 
+    // Swept fallback: re-check from previous Y if we fell through thin floor
     if (floorY === null && velocity.y <= 0) {
       const prevPos = camera.position.clone();
       prevPos.y -= deltaY;
@@ -397,6 +434,7 @@ export function createPhysics(scene, userCFG = {}) {
       }
     }
 
+    // Underground recovery
     if (floorY === null) {
       const recovered = recoverFromUnderground(camera.position);
       if (recovered !== null) {
