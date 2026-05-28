@@ -1,10 +1,10 @@
 /**
- * SPELEC PHYSICS v2.6 — QUAKE-STYLE STEP SIMULATION (PM_StepSlideMove)
+ * SPELEC PHYSICS v2.7 — QUAKE-STYLE STEP SIMULATION + OBLIQUE PENETRATION FIX
  *
  * Plně implementovaná detekce schodů ve stylu id Tech 3 (Quake 3).
- * Odstraňuje problémy se zasekáváním o hrany a skákáním na stropy
- * tím, že paralelně simuluje pohyb po zemi a pohyb ve zvednuté výšce,
- * a porovnává, která cesta zachová více hybnosti.
+ * Verze 2.7 opravuje chybu šikmého paprsku (Oblique Ray Error), která způsobovala
+ * nedostatečné vytlačení hráče ze stěn a následné zasekávání "ducha" v algoritmu
+ * step-slide uvnitř geometrie schodů.
  */
 
 import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.165.0/build/three.module.js';
@@ -24,7 +24,7 @@ const DEFAULT_CFG = {
   SLOPE_MAX_ANGLE: 50,
   SKIN_WIDTH:      0.02,
   GROUND_CHECK:    0.18,
-  NUM_SIDE_RAYS:   10,
+  NUM_SIDE_RAYS:   16,  // Zvýšeno z 10 na 16 pro dokonalejší pokrytí hran kvádrů
   NUM_SLOPE_RAYS:  4,
 };
 
@@ -122,7 +122,12 @@ export function createPhysics(scene, userCFG = {}) {
         if (flat.lengthSq() < 0.001) continue;
         if (walls.some(w => w.flat.dot(flat) > 0.85)) continue;
 
-        const pen = CFG.PLAYER_RADIUS - hit.distance;
+        // FIX v2.7: Korekce šikmého dopadu paprsku. Skalární součin nám dá cosinus 
+        // úhlu mezi paprskem a normálou stěny, čímž spočítáme reálnou kolmou vzdálenost.
+        const cosAngle = -_dir.dot(normal);
+        const perpDist = hit.distance * cosAngle;
+        const pen = CFG.PLAYER_RADIUS - perpDist;
+
         walls.push({ flat, pen });
       }
     }
@@ -231,52 +236,46 @@ export function createPhysics(scene, userCFG = {}) {
 
   // ── Quake-style PM_StepSlideMove ──────────────────────────────────────────
   function quakeStepSlideMove(position, intentMove) {
-    // Ve vzduchu aplikujeme pouze obyčejný slide
     if (!onGround || intentMove.lengthSq() < 0.00001) {
       return slideMove(position, intentMove); 
     }
 
-    // 1. Spodní cesta: Zkusíme pohyb po zemi
+    // 1. Spodní cesta: Pohyb po zemi v této snímkové frekvenci
     const slidDown = slideMove(position, intentMove);
 
-    // Pokud jsme prošli bez jakéhokoliv zaseknutí, není co řešit
+    // Pokud projdeme čistě, netřeba simulovat schody
     if (slidDown.lengthSq() >= intentMove.lengthSq() * 0.99) {
       return slidDown;
     }
 
-    // 2. Horní cesta: Zkontrolujeme strop JEŠTĚ PŘEDTÍM, než se zvedneme
+    // 2. Horní cesta: Zkontrolujeme strop před zvednutím
     if (ceilingClearance(position) < CFG.STEP_HEIGHT + 0.1) {
-      return slidDown; // Strop je moc nízko, raději zůstaneme dole
+      return slidDown;
     }
 
     const posUp = position.clone();
     posUp.y += CFG.STEP_HEIGHT;
 
-    // Slide ve zvednuté pozici (spodní paprsky z collectWalls teď projdou NAD schodem)
+    // Slide ve zvednuté výšce (díky fixu z v2.7 už neuvízne uvnitř schodu)
     const slidUp = slideMove(posUp, intentMove);
     posUp.x += slidUp.x;
     posUp.z += slidUp.z;
 
-    // Najdeme reálnou výšku podlahy pod novou pozicí (groundCheck střílí z vrchu)
     const landY = groundCheck(posUp);
 
-    // 3. Rozhodnutí
+    // 3. Vyhodnocení obou cest
     if (landY !== null) {
       const lift = landY - position.y;
 
-      // Je to validní schod? (Nesmí to být propast dolů, nesmí přesáhnout limity)
       if (lift > 0.001 && lift <= CFG.STEP_HEIGHT + 0.05) {
-
-        // Quake 3 magie: Porovnáme ujetou vzdálenost
-        // Pokud horní pohyb zachoval více hybnosti než spodní náraz do hrany:
+        // Porovnání zachované dopředné hybnosti (přesně jako v id Tech)
         if (slidUp.lengthSq() > slidDown.lengthSq() + 0.0001) {
-          position.y = landY; // Aplikujeme výšku schodu
-          return slidUp;      // Vracíme vektor nezkráceného pohybu
+          position.y = landY; 
+          return slidUp;      
         }
       }
     }
 
-    // Fallback - pokud schod nevyšel, vrátíme klasický kolizní posun
     return slidDown;
   }
 
@@ -351,17 +350,13 @@ export function createPhysics(scene, userCFG = {}) {
     }
 
     // ── Horizontal movement pipeline ──────────────────────────────────────
-    // 1. Push out of walls we're already touching
     pushOutOfWalls(camera.position);
 
-    // 2. + 3. Quake Step Slide Move logic (řeší kolize stěn i případné schody)
     const finalSlid = quakeStepSlideMove(camera.position, _move);
 
-    // 4. Aplikujeme vypočítaný horizontální delta pohyb
     camera.position.x += finalSlid.x;
     camera.position.z += finalSlid.z;
 
-    // 5. Push out of any new penetrations created by this frame's movement
     pushOutOfWalls(camera.position);
 
     // ── Vertical movement ─────────────────────────────────────────────────
@@ -382,7 +377,7 @@ export function createPhysics(scene, userCFG = {}) {
     // ── Ground snap ───────────────────────────────────────────────────────
     let floorY = groundCheck(camera.position);
 
-    // Swept fallback: re-check from previous Y if we fell through thin floor
+    // Swept fallback
     if (floorY === null && velocity.y <= 0) {
       const prevPos = camera.position.clone();
       prevPos.y -= deltaY;
