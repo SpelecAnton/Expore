@@ -1,33 +1,10 @@
 /**
- * SPELEC PHYSICS v2.5 — QUAKE-STYLE STEP SIMULATION
+ * SPELEC PHYSICS v2.6 — QUAKE-STYLE STEP SIMULATION (PM_StepSlideMove)
  *
- * Root cause of v2.4 issues:
- *
- *   1. CEILING BUG: the downward probe ray started from (feetY + STEP_HEIGHT),
- *      which is above the ceiling when stairs are inside a room. The ray origin
- *      crossed the ceiling, hit its back face, and lifted the player up there.
- *
- *   2. INCONSISTENCY: the probe point (pos + dir * PLAYER_RADIUS) often landed
- *      on the vertical face of the step, not its top surface. groundCheck then
- *      found nothing or the wrong surface.
- *
- * Fix — Quake-style step simulation:
- *
- *   Instead of a probe ray, we simulate the full step move in a temporary
- *   position WITHOUT touching camera.position:
- *
- *     a) testPos = camera.position, lifted by STEP_HEIGHT
- *     b) Check ceiling clearance at testPos — abort if ceiling too low
- *     c) Move testPos forward by delta (horizontal only)
- *     d) Call groundCheck(testPos) — fires downward from elevated position,
- *        returns exact eye-level Y of whatever surface is below
- *     e) Compute liftNeeded = landY - camera.position.y
- *        Accept only if 0 < liftNeeded <= STEP_HEIGHT
- *     f) Apply liftNeeded to camera.position.y
- *
- *   This eliminates the probe point problem (groundCheck uses multiple rays
- *   in a ring, not one point) and the ceiling problem (step b aborts early
- *   if the elevated testPos is already inside a ceiling).
+ * Plně implementovaná detekce schodů ve stylu id Tech 3 (Quake 3).
+ * Odstraňuje problémy se zasekáváním o hrany a skákáním na stropy
+ * tím, že paralelně simuluje pohyb po zemi a pohyb ve zvednuté výšce,
+ * a porovnává, která cesta zachová více hybnosti.
  */
 
 import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.165.0/build/three.module.js';
@@ -173,7 +150,6 @@ export function createPhysics(scene, userCFG = {}) {
   }
 
   // ── Ground detection ──────────────────────────────────────────────────────
-  // Fires downward from position (eye level). Returns eye-level Y or null.
   function groundCheck(position) {
     const offsets = [[0, 0]];
     for (let i = 0; i < CFG.NUM_SLOPE_RAYS; i++) {
@@ -253,65 +229,55 @@ export function createPhysics(scene, userCFG = {}) {
       : null;
   }
 
-  // ── Step climbing — Quake-style simulation ────────────────────────────────
-  // Does NOT touch position unless a valid step is confirmed.
-  // Simulates the move in a temporary position to find the exact surface Y.
-  function tryStepUp(position, delta) {
-    if (!onGround) return;
-    if (delta.lengthSq() < 0.00001) return;
+  // ── Quake-style PM_StepSlideMove ──────────────────────────────────────────
+  function quakeStepSlideMove(position, intentMove) {
+    // Ve vzduchu aplikujeme pouze obyčejný slide
+    if (!onGround || intentMove.lengthSq() < 0.00001) {
+      return slideMove(position, intentMove); 
+    }
 
-    const feetY   = position.y - CFG.PLAYER_HEIGHT;
-    const moveLen = delta.length();
-    _dir.copy(delta).setY(0).normalize();
+    // 1. Spodní cesta: Zkusíme pohyb po zemi
+    const slidDown = slideMove(position, intentMove);
 
-    // Quick check: is there any obstacle at foot level in move direction?
-    // If not, no stepping needed at all.
-    _orig.set(position.x, feetY + 0.05, position.z);
-    ray.set(_orig, _dir);
-    ray.far = CFG.PLAYER_RADIUS + moveLen + CFG.SKIN_WIDTH;
-    const nearby  = nearbyMeshes(collidables, _orig, ray.far + 0.5);
-    const hitsLow = ray.intersectObjects(nearby, false);
-    if (!hitsLow.length) return;
+    // Pokud jsme prošli bez jakéhokoliv zaseknutí, není co řešit
+    if (slidDown.lengthSq() >= intentMove.lengthSq() * 0.99) {
+      return slidDown;
+    }
 
-    // Is it clear at step height? If not, it's a wall we can't step over.
-    _orig.set(position.x, feetY + CFG.STEP_HEIGHT + 0.05, position.z);
-    ray.set(_orig, _dir);
-    ray.far = CFG.PLAYER_RADIUS + moveLen + CFG.SKIN_WIDTH;
-    const hitsHigh = ray.intersectObjects(nearby, false);
-    if (hitsHigh.length > 0) return;
+    // 2. Horní cesta: Zkontrolujeme strop JEŠTĚ PŘEDTÍM, než se zvedneme
+    if (ceilingClearance(position) < CFG.STEP_HEIGHT + 0.1) {
+      return slidDown; // Strop je moc nízko, raději zůstaneme dole
+    }
 
-    // ── Simulate the step ──────────────────────────────────────────────────
-    // Build a test position elevated by STEP_HEIGHT.
-    const testPos = new THREE.Vector3(
-      position.x,
-      position.y + CFG.STEP_HEIGHT,
-      position.z,
-    );
+    const posUp = position.clone();
+    posUp.y += CFG.STEP_HEIGHT;
 
-    // Abort if the elevated position is inside or too close to a ceiling.
-    // ceilingClearance fires upward — if we're already above the ceiling after
-    // lifting, clearance will be near zero (ray hits ceiling immediately).
-    const clearAtElevated = ceilingClearance(testPos);
-    if (clearAtElevated < 0.05) return;
+    // Slide ve zvednuté pozici (spodní paprsky z collectWalls teď projdou NAD schodem)
+    const slidUp = slideMove(posUp, intentMove);
+    posUp.x += slidUp.x;
+    posUp.z += slidUp.z;
 
-    // Move the test position forward horizontally.
-    testPos.x += delta.x;
-    testPos.z += delta.z;
+    // Najdeme reálnou výšku podlahy pod novou pozicí (groundCheck střílí z vrchu)
+    const landY = groundCheck(posUp);
 
-    // Find the actual floor surface below the elevated + moved test position.
-    // groundCheck fires DOWN from testPos.y (elevated eye level), so it sees
-    // the top of the step without being confused by ceilings.
-    const landY = groundCheck(testPos);
-    if (landY === null) return;
+    // 3. Rozhodnutí
+    if (landY !== null) {
+      const lift = landY - position.y;
 
-    // How much do we actually need to lift?
-    const liftNeeded = landY - position.y;
+      // Je to validní schod? (Nesmí to být propast dolů, nesmí přesáhnout limity)
+      if (lift > 0.001 && lift <= CFG.STEP_HEIGHT + 0.05) {
 
-    // Accept only genuine upward steps within the configured limit.
-    if (liftNeeded <= 0.001 || liftNeeded > CFG.STEP_HEIGHT + 0.01) return;
+        // Quake 3 magie: Porovnáme ujetou vzdálenost
+        // Pokud horní pohyb zachoval více hybnosti než spodní náraz do hrany:
+        if (slidUp.lengthSq() > slidDown.lengthSq() + 0.0001) {
+          position.y = landY; // Aplikujeme výšku schodu
+          return slidUp;      // Vracíme vektor nezkráceného pohybu
+        }
+      }
+    }
 
-    // Apply exact lift — camera rises only as tall as the step, not STEP_HEIGHT.
-    position.y += liftNeeded;
+    // Fallback - pokud schod nevyšel, vrátíme klasický kolizní posun
+    return slidDown;
   }
 
   // ── Brush escape ──────────────────────────────────────────────────────────
@@ -388,16 +354,12 @@ export function createPhysics(scene, userCFG = {}) {
     // 1. Push out of walls we're already touching
     pushOutOfWalls(camera.position);
 
-    // 2. Clip movement delta against wall planes
-    const slid = slideMove(camera.position, _move);
+    // 2. + 3. Quake Step Slide Move logic (řeší kolize stěn i případné schody)
+    const finalSlid = quakeStepSlideMove(camera.position, _move);
 
-    // 3. Simulate step — lifts camera.position.y by exact step surface height
-    //    Uses elevated test position so ceilings cannot be misidentified as floors
-    tryStepUp(camera.position, slid);
-
-    // 4. Apply horizontal delta
-    camera.position.x += slid.x;
-    camera.position.z += slid.z;
+    // 4. Aplikujeme vypočítaný horizontální delta pohyb
+    camera.position.x += finalSlid.x;
+    camera.position.z += finalSlid.z;
 
     // 5. Push out of any new penetrations created by this frame's movement
     pushOutOfWalls(camera.position);
