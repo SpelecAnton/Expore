@@ -4,7 +4,7 @@
  * Změny oproti v6.8:
  * - UnrealBloomPass přidán přes EffectComposer → globální bloom efekt
  * - addLightSprites(): pro light entity s _sprite 1 se vytvoří procedurálně
- *   generovaný sprite (canvas textura, glow halo) viditelný ve scéně
+ * generovaný sprite (canvas textura, glow halo) viditelný ve scéně
  * - Světla bez _sprite 1 fungují jako dřív — pouze PointLight, žádný sprite
  * - bloomPass parametry jsou doladěny pro tmavé mapy (strength 0.9, radius 0.4)
  *
@@ -14,7 +14,7 @@
  * - Pomocí identifikace problémů s propadáním (noclip, depthWrite, matrixWorld apod.)
  *
  * FIX: loadBSP nyní předává lights[] do result → addLightSprites() správně
- *      přijímá parsovaná světla z bsp_worker.js včetně _sprite příznaku.
+ * přijímá parsovaná světla z bsp_worker.js včetně _sprite příznaku.
  */
 
 import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.165.0/build/three.module.js';
@@ -204,7 +204,6 @@ function makeSpriteTexture(r, g, b) {
   const cx = size / 2;
   const cy = size / 2;
 
-  // Vnější měkký glow
   const outerGrad = ctx.createRadialGradient(cx, cy, 0, cx, cy, size / 2);
   outerGrad.addColorStop(0,    `rgba(${Math.round(r*255)}, ${Math.round(g*255)}, ${Math.round(b*255)}, 0.9)`);
   outerGrad.addColorStop(0.25, `rgba(${Math.round(r*255)}, ${Math.round(g*255)}, ${Math.round(b*255)}, 0.5)`);
@@ -214,7 +213,6 @@ function makeSpriteTexture(r, g, b) {
   ctx.fillStyle = outerGrad;
   ctx.fillRect(0, 0, size, size);
 
-  // Jasné jádro uprostřed
   const coreGrad = ctx.createRadialGradient(cx, cy, 0, cx, cy, size * 0.12);
   coreGrad.addColorStop(0, '#ffffff');
   coreGrad.addColorStop(0.5, `rgba(${Math.round(r*255)}, ${Math.round(g*255)}, ${Math.round(b*255)}, 0.9)`);
@@ -229,11 +227,9 @@ function makeSpriteTexture(r, g, b) {
   return tex;
 }
 
-// Cache textur podle barvy — světla stejné barvy sdílejí texturu.
 const _spriteTexCache = new Map();
 
 function getSpriteTex(r, g, b) {
-  // Klíč s rozlišením ~4 bity — podobné barvy sdílejí texturu
   const key = `${(r * 15) | 0}:${(g * 15) | 0}:${(b * 15) | 0}`;
   if (!_spriteTexCache.has(key)) {
     _spriteTexCache.set(key, makeSpriteTexture(r, g, b));
@@ -241,15 +237,6 @@ function getSpriteTex(r, g, b) {
   return _spriteTexCache.get(key);
 }
 
-/**
- * addLightSprites — přidá do scény viditelné bloom sprite pro každé světlo
- * které má sprite = true (tj. _sprite "1" v BSP entitě).
- *
- * Světla bez sprite = true dostanou pouze PointLight (jako dřív).
- *
- * @param {THREE.Scene} scene
- * @param {Array}       lights  — pole z result.lights (parsováno workerem)
- */
 function addLightSprites(scene, lights) {
   if (!lights || !lights.length) return;
 
@@ -258,30 +245,27 @@ function addLightSprites(scene, lights) {
   for (const light of lights) {
     const col = new THREE.Color(light.r, light.g, light.b);
 
-    // PointLight vždy — svítí na okolní geometrii
     const range     = Math.min(20, Math.max(2, light.intensity * 0.05));
     const ptIntens  = Math.min(5, Math.max(0.2, light.intensity * 0.015));
     const ptLight   = new THREE.PointLight(col, ptIntens, range);
     ptLight.position.set(light.x, light.y, light.z);
     scene.add(ptLight);
 
-    // Sprite — jen pokud má _sprite 1
     if (!light.sprite) continue;
 
     const tex = getSpriteTex(light.r, light.g, light.b);
 
-    // THREE.Sprite je vždy otočen ke kameře (billboard) automaticky
     const spriteMat = new THREE.SpriteMaterial({
       map:         tex,
       transparent: true,
       depthWrite:  false,
-      blending:    THREE.AdditiveBlending,  // additivní → přirozenější glow
+      blending:    THREE.AdditiveBlending,
       color:       col,
     });
 
     const sprite = new THREE.Sprite(spriteMat);
     sprite.position.set(light.x, light.y, light.z);
-    sprite.scale.setScalar(0.5);   // velikost v world units; doladit dle mapy
+    sprite.scale.setScalar(0.5);
     sprite.userData.noclip = true;
     scene.add(sprite);
 
@@ -330,10 +314,9 @@ export async function initEngine({
   onReady         = null,
   onProgress      = null,
   physicsConfig   = {},
-  // Bloom nastavení — lze přepsat z index.html
-  bloomStrength   = 0.9,   // intenzita bloom efektu
-  bloomRadius     = 0.4,   // rozmazání bloom halo
-  bloomThreshold  = 0.2,   // práh — jak světlá musí být barva aby bloomovala
+  bloomStrength   = 0.9,
+  bloomRadius     = 0.4,
+  bloomThreshold  = 0.2,
 }) {
   const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
   renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
@@ -341,7 +324,6 @@ export async function initEngine({
   renderer.toneMapping         = THREE.ACESFilmicToneMapping;
   renderer.toneMappingExposure = 2.0;
 
-  // Inicializuj anizotropní filtrování hned po vytvoření rendereru
   initTexLoader(renderer);
 
   const scene  = new THREE.Scene();
@@ -354,7 +336,6 @@ export async function initEngine({
   const ambient = new THREE.AmbientLight(0xffffff, 1.0);
   scene.add(ambient);
 
-  // ── EffectComposer + UnrealBloomPass ──────────────────────────────────────
   const composer = new EffectComposer(renderer);
   composer.addPass(new RenderPass(scene, camera));
 
@@ -387,8 +368,6 @@ export async function initEngine({
 
     for (const props of result.portals) buildPortal(props, scene, portals);
 
-    // ── Přidej světla + bloom sprite ────────────────────────────────────────
-    // FIX: result.lights je nyní správně předáno z loadBSP()
     addLightSprites(scene, result.lights ?? []);
 
     const hashState = readHashState();
@@ -404,10 +383,11 @@ export async function initEngine({
 
     const portalMeshSet = new Set(portals.map(p => p.mesh));
     scene.traverse(obj => {
+      // OPRAVA: Povolení průchodu objektům, které jsou skryté clip stěny
       if (
         obj.isMesh &&
         obj.geometry &&
-        obj.material?.depthWrite !== false &&
+        (obj.material?.depthWrite !== false || obj.userData.invisible) &&
         !portalMeshSet.has(obj)
       ) {
         worldMeshes.push(obj);
@@ -420,13 +400,12 @@ export async function initEngine({
     ambient.intensity = 3;
 
     scene.traverse(obj => {
-      if (obj.isMesh && obj.geometry && obj.material?.depthWrite !== false) {
+      if (obj.isMesh && obj.geometry && (obj.material?.depthWrite !== false || obj.userData.invisible)) {
         worldMeshes.push(obj);
       }
     });
   }
 
-  // ── Fyzika ────────────────────────────────────────────────────────────────
   const physics = createPhysics(scene, physicsConfig);
   physics.refreshCollidables();
 
@@ -434,7 +413,6 @@ export async function initEngine({
   window._physics = physics;
   window._scene   = scene;
 
-  // ── Background music ──────────────────────────────────────────────────────
   const bgMusic = await bgMusicPromise;
   let   bgMusicStarted = false;
 
@@ -444,11 +422,9 @@ export async function initEngine({
     bgMusic.play().catch(err => console.warn('[Engine] BG music play failed:', err));
   }
 
-  // ── URL hash sync ─────────────────────────────────────────────────────────
   let _lastHashWrite = 0;
   const HASH_WRITE_INTERVAL = 1000;
 
-  // ── Portálový raycaster ───────────────────────────────────────────────────
   const portalRaycaster = new THREE.Raycaster();
   const wallRaycaster   = new THREE.Raycaster();
   const mouseNDC        = new THREE.Vector2(0, 0);
@@ -488,7 +464,6 @@ export async function initEngine({
     console.log('Camera pos:', `(${pos.x.toFixed(4)}, ${pos.y.toFixed(4)}, ${pos.z.toFixed(4)})`);
     console.log('Hash:', `${pos.x.toFixed(1)},${pos.y.toFixed(1)},${pos.z.toFixed(1)},${yaw.toFixed(1)}`);
 
-    // Spusť 5 paprsků z různých offsetů
     const ray = new THREE.Raycaster();
     ray.firstHitOnly = true;
 
@@ -501,9 +476,10 @@ export async function initEngine({
 
       const meshes = [];
       scene.traverse(obj => {
+        // OPRAVA: Povolení průchodu pro userData.invisible objekty
         if (obj.isMesh && obj.geometry &&
             !obj.userData.noclip &&
-            obj.material?.depthWrite !== false) {
+            (obj.material?.depthWrite !== false || obj.userData.invisible)) {
           meshes.push(obj);
         }
       });
@@ -530,7 +506,6 @@ export async function initEngine({
     console.log('====================');
   }, { passive: true });
 
-  // ── Input ─────────────────────────────────────────────────────────────────
   const keys = {};
 
   window.addEventListener('keydown', e => {
@@ -566,7 +541,6 @@ export async function initEngine({
 
   if (onReady) onReady();
 
-  // ── Render loop ────────────────────────────────────────────────────────────
   const clock = new THREE.Clock();
 
   (function tick() {
@@ -596,7 +570,6 @@ export async function initEngine({
 
     canvas.style.cursor = getHoveredPortal() ? 'pointer' : 'default';
 
-    // Bloom composer místo přímého renderer.render()
     composer.render();
   })();
 }

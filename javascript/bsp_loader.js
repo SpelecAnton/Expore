@@ -247,9 +247,6 @@ const _whiteTex = (() => {
 })();
 
 // ── Worker runner ─────────────────────────────────────────────────────────────
-// Tries to load the worker in this order:
-//   1. Relative path next to the loader (local dev)
-//   2. GitHub CDN (production)
 async function fetchWorkerCode() {
   const loaderUrl  = import.meta.url;
   const loaderBase = loaderUrl.substring(0, loaderUrl.lastIndexOf('/') + 1);
@@ -321,7 +318,6 @@ export async function loadBSP({
     lmTex = new THREE.DataTexture(atlasArr, lmAtlas.W, lmAtlas.H, THREE.RGBAFormat);
     lmTex.colorSpace = THREE.SRGBColorSpace;
     lmTex.channel    = 1;
-    // Lightmap: LinearMipmap + Linear mag → no pixel-art style, we want smooth lighting
     lmTex.minFilter  = THREE.LinearMipmapLinearFilter;
     lmTex.magFilter  = THREE.LinearFilter;
     lmTex.anisotropy = _maxAniso;
@@ -331,13 +327,11 @@ export async function loadBSP({
   }
 
   // ── Albedo textures ───────────────────────────────────────────────────────
-  // Skip texture loading entirely for invisible batches — saves HTTP requests
-  // and ensures common/clip never renders even if a texture file exists on disk.
   const texBases = [textureBase, fallbackTexBase];
 
   const uniqueNames = [...new Set(
     batches
-      .filter(b => !b.invisible)   // invisible batches need no texture
+      .filter(b => !b.invisible)
       .map(b => texNames[b.texIdx] || 'default')
   )];
 
@@ -368,33 +362,35 @@ export async function loadBSP({
     geo.setIndex(new THREE.BufferAttribute(idx, 1));
     geo.computeBoundingSphere();
 
-    const name   = texNames[b.texIdx] || 'default';
+    const name = texNames[b.texIdx] || 'default';
+    let mat;
 
-    // Invisible clip meshes: no texture, no lightmap, not rendered.
-    // depthWrite defaults to true → physics.js will include them in collisions.
-    // mesh.visible = false → renderer skips them entirely.
-    const mat = new THREE.MeshLambertMaterial({
-      map:       b.invisible ? null : (albedoMap.get(name) ?? _whiteTex),
-      side:      THREE.DoubleSide,
-      alphaTest: b.invisible ? 0 : 0.5,
-    });
+    if (b.invisible) {
+      // OPRAVA: Nahrazen hack přes vrstvy. Neviditelný materiál nic nevykresluje,
+      // ale díky visible = true ho Raycaster bez problémů najde.
+      mat = new THREE.MeshBasicMaterial({
+        colorWrite: false,
+        depthWrite: false,
+        transparent: true,
+        opacity: 0,
+        side: THREE.DoubleSide
+      });
+    } else {
+      mat = new THREE.MeshLambertMaterial({
+        map:       albedoMap.get(name) ?? _whiteTex,
+        side:      THREE.DoubleSide,
+        alphaTest: 0.5,
+      });
+    }
 
     const mesh = new THREE.Mesh(geo, mat);
 
     if (b.invisible) {
-      // OPRAVA: Three.js Raycaster ignoruje mesh.visible = false.
-      // Nastavíme visible = true, ale přesuneme mesh do speciální vrstvy 1.
-      // Kamera vidí jen vrstvu 0, takže objekt bude vizuálně skrytý,
-      // ale raycaster ho bez problémů zaměří.
-      mesh.visible = true;
-      mesh.layers.set(1);
       mesh.userData.invisible = true;
       invisibleMeshes++;
     }
 
     if (b.noclip) {
-      // Noclip: visible but no collision (func_wall etc.)
-      // physics.js skips meshes with userData.noclip = true.
       mesh.userData.noclip = true;
       noclipMeshes++;
     }
@@ -418,8 +414,6 @@ export async function loadBSP({
   const result = { portals, playerStart };
   if (ambientIntensity !== undefined) result.ambientIntensity = ambientIntensity;
   if (ambientColorArr)  result.ambientColor = new THREE.Color(...ambientColorArr);
-
-  // Forward lights from the worker so engine.js can call addLightSprites()
   result.lights = parsed.lights ?? [];
 
   return result;
