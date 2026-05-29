@@ -33,7 +33,12 @@ function collectCollidables(scene) {
   scene.traverse(obj => {
     if (!obj.isMesh || !obj.geometry) return;
     if (obj.userData.noclip) return;
-    if (obj.material && obj.material.depthWrite === false) return;
+    
+    // OPRAVA: Povolíme kolize pro invisible objekty (CLIP) i v případě problémů s depthWrite
+    if (obj.material && obj.material.depthWrite === false && !obj.userData.invisible) {
+      return;
+    }
+    
     if (!obj.geometry.attributes.position) return;
     list.push(obj);
   });
@@ -74,6 +79,7 @@ export function createPhysics(scene, userCFG = {}) {
 
   const ray = new THREE.Raycaster();
   ray.firstHitOnly = true;
+  ray.layers.enableAll(); // OPRAVA: Raycaster nyní vidí všechny vrstvy (včetně skryté kolizní vrstvy 1)
 
   function refreshCollidables() {
     scene.updateMatrixWorld(true);
