@@ -69,15 +69,18 @@ echo       %DIM%  BSP + VIS (fast) + LIGHT (8 samples, 4 bounce, AO, samplesize 
 echo.
 echo  %YLW% [3]%RST% %BLD%FINAL%RST%    - full quality, slow
 echo       %DIM%  BSP + VIS (full) + LIGHT (32 samples, 16 bounce, AO, samplesize 2)%RST%
+echo.
+echo  %YLW% [4]%RST% %RED%EXPERIMENTAL%RST%    - I have no idea if it's going to work
+echo       %DIM% Highest quality%RST%
 echo %CYN% ---------------------------------------------------%RST%
 echo %DIM%   Note: quality is controlled by samplesize, not lightmapsize.%RST%
 echo %DIM%   Lower samplesize = sharper shadows. lightmapsize is left at%RST%
 echo %DIM%   default (128) to avoid StoreSurfaceLightmaps errors.%RST%
 echo %CYN% ---------------------------------------------------%RST%
-set /p MODE_CHOICE="  Enter mode [1-3]: "
+set /p MODE_CHOICE="  Enter mode [1-4]: "
 
 if "!MODE_CHOICE!"=="" set "MODE_CHOICE=2"
-if "!MODE_CHOICE!" NEQ "1" if "!MODE_CHOICE!" NEQ "2" if "!MODE_CHOICE!" NEQ "3" (
+if "!MODE_CHOICE!" NEQ "1" if "!MODE_CHOICE!" NEQ "2" if "!MODE_CHOICE!" NEQ "3" if "!MODE_CHOICE!" NEQ "4" (
     echo %RED%  Invalid choice, defaulting to MEDIUM.%RST%
     set "MODE_CHOICE=2"
 )
@@ -93,6 +96,7 @@ echo %WHT%   Basepath:%RST% %DIM%!BASEPATH!%RST%
 if "!MODE_CHOICE!"=="1" echo %WHT%   Mode    :%RST% %DIM%DRAFT%RST%
 if "!MODE_CHOICE!"=="2" echo %WHT%   Mode    :%RST% %CYN%MEDIUM%RST%
 if "!MODE_CHOICE!"=="3" echo %WHT%   Mode    :%RST% %GRN%FINAL%RST%
+if "!MODE_CHOICE!"=="4" echo %WHT%   Mode    :%RST% %RED%EXPERIMENT%RST%
 echo %BLD%%CYN% ===================================================%RST%
 echo.
 
@@ -107,6 +111,7 @@ echo %BLD%%MAG% --- [2/3] VIS pass -----------------------------------%RST%
 if "!MODE_CHOICE!"=="1" "%~dp0q3map2\q3map2" -vis -fast -fs_basepath "!BASEPATH!" -fs_game baseq3 "!BSPFILE!"
 if "!MODE_CHOICE!"=="2" "%~dp0q3map2\q3map2" -vis -fast -fs_basepath "!BASEPATH!" -fs_game baseq3 "!BSPFILE!"
 if "!MODE_CHOICE!"=="3" "%~dp0q3map2\q3map2" -vis -fs_basepath "!BASEPATH!" -fs_game baseq3 "!BSPFILE!"
+if "!MODE_CHOICE!"=="4" "%~dp0q3map2\q3map2" -vis -fs_basepath "!BASEPATH!" -fs_game baseq3 "!BSPFILE!"
 if errorlevel 1 goto :error
 
 :: --- [3/3] LIGHT ---
@@ -122,6 +127,7 @@ echo %BLD%%MAG% --- [3/3] LIGHT pass ----------------------------------%RST%
 if "!MODE_CHOICE!"=="1" "%~dp0q3map2\q3map2" -light -fast -samplesize 8 -fs_basepath "!BASEPATH!" -fs_game baseq3 "!BSPFILE!"
 if "!MODE_CHOICE!"=="2" "%~dp0q3map2\q3map2" -light -fast -samplesize 4 -samples 8 -bounce 4 -bouncescale 1.2 -patchshadows -dirty -randomsamples -fs_basepath "!BASEPATH!" -fs_game baseq3 "!BSPFILE!"
 if "!MODE_CHOICE!"=="3" "%~dp0q3map2\q3map2" -light -samplesize 2 -samples 32 -bounce 16 -bouncescale 1.2 -patchshadows -dirty -randomsamples -filter -fs_basepath "!BASEPATH!" -fs_game baseq3 "!BSPFILE!"
+if "!MODE_CHOICE!"=="4" "%~dp0q3map2\q3map2" -light -samplesize 1 -samples 64 -bounce 32 -bouncescale 2.0 -patchshadows -dirty -randomsamples -filter -fs_basepath "!BASEPATH!" -fs_game baseq3 "!BSPFILE!"
 if errorlevel 1 goto :error
 
 if exist "!SRFFILE!" del /q "!SRFFILE!"
