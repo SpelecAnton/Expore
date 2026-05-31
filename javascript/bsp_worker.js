@@ -11,43 +11,50 @@
  *   OUT { type: 'error',   message }         — error
  *   OUT { type: 'progress', pct }            — progress 0–100
  *
- * v2 — func_wall / noclip support:
- *   Entities with classname in NOCLIP_CLASSNAMES have model="*N".
- *   Submodel N in LUMP_MODELS defines firstFace + numFaces.
- *   These face indices are passed to buildBatches → batch.noclip = true.
- *   Loader then sets material.depthWrite = false → physics ignores them.
- *
- * v3 — light entity + bloom sprite:
- *   Light entities (light, light_spot, light_point) are parsed and passed
- *   to engine.js as result.lights[].
- *   If entity has _sprite 1, engine creates a visible bloom sprite
- *   at the light position (procedurally generated, no file needed).
- *
- * v4 — invisible clip textures:
- *   Textures in INVISIBLE_TEXTURES (e.g. common/clip, common/nodraw) get
- *   batch.invisible = true. Loader hides these meshes (mesh.visible = false)
- *   while keeping depthWrite = true so physics.js still collides with them.
+ * v5 — Q3 BSP brush collision:
+ *   parseBSPCollision() extracts planes, nodes, leafs, leafBrushes, brushes,
+ *   brushSides from the BSP lumps.  Planes are re-oriented to Three.js space
+ *   (Q3 Y↑Z → Three.js Y↑-Z) and scaled by UNIT.  Content flags are read from
+ *   the shader/texture lump so physics.js can filter SOLID / PLAYERCLIP brushes.
+ *   The BSP tree walk in physics.js uses these to do sphere sweep tests instead
+ *   of mesh raycasting — fixing fall-through on angled brush junctions.
  */
 
 'use strict';
 
-// ── Constants ─────────────────────────────────────────────────────────────────
-const MAGIC           = 0x50534249; // 'IBSP'
-const VERSION         = 46;
-const LUMP_ENTITIES   = 0;
-const LUMP_TEXTURES   = 1;
-const LUMP_MODELS     = 7;   // ← submodels (func_* entities)
-const LUMP_LIGHTMAPS  = 14;
-const LUMP_VERTS      = 10;
-const LUMP_MESH_VERTS = 11;
-const LUMP_FACES      = 13;
+// ── Lump indices ──────────────────────────────────────────────────────────────
+const MAGIC             = 0x50534249; // 'IBSP'
+const VERSION           = 46;
+const LUMP_ENTITIES     = 0;
+const LUMP_TEXTURES     = 1;
+const LUMP_PLANES       = 2;
+const LUMP_NODES        = 3;
+const LUMP_LEAFS        = 4;
+const LUMP_LEAF_BRUSHES = 6;
+const LUMP_MODELS       = 7;
+const LUMP_BRUSHES      = 8;
+const LUMP_BRUSH_SIDES  = 9;
+const LUMP_VERTS        = 10;
+const LUMP_MESH_VERTS   = 11;
+const LUMP_FACES        = 13;
+const LUMP_LIGHTMAPS    = 14;
 
-const TEX_RECORD_SIZE   = 72;
-const VERT_RECORD_SIZE  = 44;
-const FACE_RECORD_SIZE  = 104;
-const MODEL_RECORD_SIZE = 40;   // mins(12) + maxs(12) + face(4) + nFaces(4) + brush(4) + nBrushes(4)
-const LM_SIZE           = 128 * 128 * 3;
-const UNIT              = 0.02;
+// ── Record sizes (bytes) ──────────────────────────────────────────────────────
+const TEX_RECORD_SIZE        = 72;  // char[64] + int flags + int contents
+const VERT_RECORD_SIZE       = 44;
+const FACE_RECORD_SIZE       = 104;
+const MODEL_RECORD_SIZE      = 40;  // float[3]mins + float[3]maxs + int firstFace + numFaces + firstBrush + numBrushes
+const PLANE_RECORD_SIZE      = 16;  // float[3] normal + float dist
+const NODE_RECORD_SIZE       = 36;  // int plane + int[2] children + int[3] mins + int[3] maxs
+const LEAF_RECORD_SIZE       = 48;  // int cluster + area + int[3] mins + int[3] maxs + int firstFace + numFaces + firstBrush + numBrushes
+const BRUSH_RECORD_SIZE      = 12;  // int firstSide + numSides + shaderIdx
+const BRUSH_SIDE_RECORD_SIZE = 8;   // int planeIdx + shaderIdx
+const LM_SIZE                = 128 * 128 * 3;
+const UNIT                   = 0.02;
+
+// ── Content flags ─────────────────────────────────────────────────────────────
+const CONTENTS_SOLID      = 1;
+const CONTENTS_PLAYERCLIP = 0x10000;
 
 // ── Entity classnames that should be passthrough (no collision) ───────────────
 const NOCLIP_CLASSNAMES = new Set([
@@ -58,8 +65,6 @@ const NOCLIP_CLASSNAMES = new Set([
 ]);
 
 // ── Texture names that should be invisible but still collide ──────────────────
-// These are Quake 3 / GtkRadiant clip/nodraw shaders that must never be rendered.
-// The mesh stays in the scene so physics raycasts hit it normally.
 const INVISIBLE_TEXTURES = new Set([
   'common/clip',
   'common/nodraw',
@@ -134,8 +139,6 @@ function buildNoclipFaceSet(entities, buffer, modelLump) {
     const firstFace = view.getInt32(mOff + 24, true);
     const numFaces  = view.getInt32(mOff + 28, true);
 
-    console.log(`[BSP Worker] ${e.classname} model=*${subIdx}: firstFace=${firstFace}, numFaces=${numFaces}`);
-
     if (firstFace < 0 || numFaces < 0 || numFaces > 100000) {
       console.warn(`[BSP Worker] Skipping ${e.classname} — invalid face values`);
       continue;
@@ -150,9 +153,6 @@ function buildNoclipFaceSet(entities, buffer, modelLump) {
 }
 
 // ── Parse light entities ──────────────────────────────────────────────────────
-// Returns array of lights:
-//   { x, y, z, r, g, b, intensity, sprite }
-//   sprite = true only if entity has _sprite "1"
 function parseLights(entities) {
   const lights = [];
 
@@ -161,15 +161,12 @@ function parseLights(entities) {
 
     const [ox, oy, oz] = (e.origin || '0 0 0').split(' ').map(Number);
 
-    // Color: _color "R G B" (0–1) or _light "R G B I" (0–255 + intensity)
     let r = 1, g = 1, b = 1, intensity = 200;
 
     if (e._light) {
       const parts = e._light.trim().split(/\s+/).map(Number);
       if (parts.length >= 4) {
-        r = parts[0] / 255;
-        g = parts[1] / 255;
-        b = parts[2] / 255;
+        r = parts[0] / 255; g = parts[1] / 255; b = parts[2] / 255;
         intensity = parts[3];
       } else if (parts.length === 1) {
         intensity = parts[0];
@@ -182,26 +179,15 @@ function parseLights(entities) {
       if (parts.length >= 3) { r = parts[0]; g = parts[1]; b = parts[2]; }
     }
 
-    // Clamp color to 0–1
     r = Math.max(0, Math.min(1, r));
     g = Math.max(0, Math.min(1, g));
     b = Math.max(0, Math.min(1, b));
 
-    const sprite = e._sprite === '1';
-
     lights.push({
-      x: ox * UNIT,
-      y: oz * UNIT,
-      z: -oy * UNIT,
-      r, g, b,
-      intensity,
-      sprite,
+      x: ox * UNIT, y: oz * UNIT, z: -oy * UNIT,
+      r, g, b, intensity,
+      sprite: e._sprite === '1',
     });
-  }
-
-  if (lights.length > 0) {
-    const withSprite = lights.filter(l => l.sprite).length;
-    console.log(`[BSP Worker] Lights: ${lights.length} total, ${withSprite} with sprite`);
   }
 
   return lights;
@@ -282,8 +268,103 @@ function parseVertices(buffer, vLump) {
   return { rawPos, rawUV1, rawUV2, rawNorm };
 }
 
+// ── BSP Collision Data ────────────────────────────────────────────────────────
+// Extracts planes, nodes, leafs, leafBrushes, brushes, brushSides.
+// Planes are transformed to Three.js coordinate space and scaled to UNIT.
+//
+// Q3 coord → Three.js coord:
+//   tx = qx * UNIT,  ty = qz * UNIT,  tz = -qy * UNIT
+// Plane in Q3: nx*qx + ny*qy + nz*qz = dist
+// Substituting: (nx)*tx + (nz)*ty + (-ny)*tz = dist * UNIT
+// → Three.js plane normal = (nx, nz, -ny), dist_t = dist * UNIT
+//
+// Brush content flags come from the shader/texture record at offset 68.
+// Only CONTENTS_SOLID (1) and CONTENTS_PLAYERCLIP (0x10000) brushes collide.
+// All other brushes (triggers, fog, water…) are ignored by the physics.
+//
+// NOTE: The BSP tree references ONLY world-model brushes (model 0).
+//       Sub-model brushes (func_wall etc.) are never in the leafBrushes list,
+//       so they are automatically skipped — no special noclip handling needed.
+function parseBSPCollision(buffer, view, lumpFn, texContents) {
+  // ── Planes ────────────────────────────────────────────────────────────────
+  const planeLump  = lumpFn(LUMP_PLANES);
+  const planeCount = (planeLump.length / PLANE_RECORD_SIZE) | 0;
+  const planes     = new Float32Array(planeCount * 4); // [nx, ny, nz, dist] × N
+
+  for (let i = 0; i < planeCount; i++) {
+    const off  = planeLump.offset + i * PLANE_RECORD_SIZE;
+    const qnx  = view.getFloat32(off,      true);
+    const qny  = view.getFloat32(off + 4,  true);
+    const qnz  = view.getFloat32(off + 8,  true);
+    const qdst = view.getFloat32(off + 12, true);
+    // Transform: Q3(qx,qy,qz) → Three.js(qx, qz, -qy)
+    planes[i * 4]     =  qnx;
+    planes[i * 4 + 1] =  qnz;
+    planes[i * 4 + 2] = -qny;
+    planes[i * 4 + 3] =  qdst * UNIT;
+  }
+
+  // ── Brush sides — only planeIdx needed ───────────────────────────────────
+  const bsLump  = lumpFn(LUMP_BRUSH_SIDES);
+  const bsCount = (bsLump.length / BRUSH_SIDE_RECORD_SIZE) | 0;
+  const brushSides = new Int32Array(bsCount);
+  for (let i = 0; i < bsCount; i++) {
+    brushSides[i] = view.getInt32(bsLump.offset + i * BRUSH_SIDE_RECORD_SIZE, true);
+  }
+
+  // ── Brushes: [firstSide, numSides, contentFlags] ─────────────────────────
+  const bLump  = lumpFn(LUMP_BRUSHES);
+  const bCount = (bLump.length / BRUSH_RECORD_SIZE) | 0;
+  const brushes = new Int32Array(bCount * 3);
+  for (let i = 0; i < bCount; i++) {
+    const off       = bLump.offset + i * BRUSH_RECORD_SIZE;
+    const firstSide = view.getInt32(off,     true);
+    const numSides  = view.getInt32(off + 4,  true);
+    const shaderIdx = view.getInt32(off + 8,  true);
+    const contents  = (shaderIdx >= 0 && shaderIdx < texContents.length)
+      ? texContents[shaderIdx] : 0;
+    brushes[i * 3]     = firstSide;
+    brushes[i * 3 + 1] = numSides;
+    brushes[i * 3 + 2] = contents;
+  }
+
+  // ── Leaf brushes ──────────────────────────────────────────────────────────
+  const lbLump     = lumpFn(LUMP_LEAF_BRUSHES);
+  const lbCount    = (lbLump.length / 4) | 0;
+  // .slice() so we own the buffer and can transfer it
+  const leafBrushes = new Int32Array(buffer, lbLump.offset, lbCount).slice();
+
+  // ── Leafs: [firstLeafBrush, numLeafBrushes] ──────────────────────────────
+  const leafLump  = lumpFn(LUMP_LEAFS);
+  const leafCount = (leafLump.length / LEAF_RECORD_SIZE) | 0;
+  const leafs     = new Int32Array(leafCount * 2);
+  for (let i = 0; i < leafCount; i++) {
+    const off = leafLump.offset + i * LEAF_RECORD_SIZE;
+    leafs[i * 2]     = view.getInt32(off + 40, true); // firstLeafBrush
+    leafs[i * 2 + 1] = view.getInt32(off + 44, true); // numLeafBrushes
+  }
+
+  // ── Nodes: [planeIdx, frontChild, backChild] ─────────────────────────────
+  // Children >= 0 are node indices; children < 0 are leaf indices = -(child+1).
+  const nodeLump  = lumpFn(LUMP_NODES);
+  const nodeCount = (nodeLump.length / NODE_RECORD_SIZE) | 0;
+  const nodes     = new Int32Array(nodeCount * 3);
+  for (let i = 0; i < nodeCount; i++) {
+    const off = nodeLump.offset + i * NODE_RECORD_SIZE;
+    nodes[i * 3]     = view.getInt32(off,     true); // planeIdx
+    nodes[i * 3 + 1] = view.getInt32(off + 4,  true); // front child
+    nodes[i * 3 + 2] = view.getInt32(off + 8,  true); // back child
+  }
+
+  console.log(
+    `[BSP Worker] Collision: ${planeCount} planes, ${nodeCount} nodes,` +
+    ` ${leafCount} leafs, ${bCount} brushes, ${bsCount} brush sides`
+  );
+
+  return { planes, brushSides, brushes, leafBrushes, leafs, nodes };
+}
+
 // ── Face batching + mesh building ─────────────────────────────────────────────
-// texNames is now required to detect invisible clip textures per-batch.
 function buildBatches(buffer, fLump, mvLump, rawPos, rawUV1, rawUV2, rawNorm,
                       lmAtlas, lmCount, noclipFaces, texNames) {
   const view      = new DataView(buffer);
@@ -303,7 +384,6 @@ function buildBatches(buffer, fLump, mvLump, rawPos, rawUV1, rawUV2, rawNorm,
     const vertStart = view.getInt32(fo + 12, true);
     const vertCount = view.getInt32(fo + 16, true);
     if (vertCount < 3) continue;
-
     if (vertStart < 0 || vertStart >= totalVerts) continue;
 
     const mvStart  = view.getInt32(fo + 20, true);
@@ -311,12 +391,9 @@ function buildBatches(buffer, fLump, mvLump, rawPos, rawUV1, rawUV2, rawNorm,
     const lmIdx    = view.getInt32(fo + 28, true);
 
     const isNoclip    = noclipFaces.has(fi);
-
-    // Check if this face's texture should be invisible (clip brush etc.)
     const texName     = (texNames[texIdx] || '').toLowerCase();
     const isInvisible = INVISIBLE_TEXTURES.has(texName);
 
-    // Separate batch keys for noclip, invisible, and normal faces
     const key = `${texIdx}:${lmIdx}:${isNoclip ? 'n' : 's'}:${isInvisible ? 'i' : 'v'}`;
 
     let b = batchMap.get(key);
@@ -346,7 +423,6 @@ function buildBatches(buffer, fLump, mvLump, rawPos, rawUV1, rawUV2, rawNorm,
   const lmCols = lmAtlas ? lmAtlas.cols : 1;
   const lmW    = lmAtlas ? lmAtlas.W    : 1;
   const lmH    = lmAtlas ? lmAtlas.H    : 1;
-
   const builtBatches = [];
 
   for (const [, batch] of batchMap) {
@@ -354,7 +430,6 @@ function buildBatches(buffer, fLump, mvLump, rawPos, rawUV1, rawUV2, rawNorm,
     if (!absIdx.length) continue;
 
     const g2l = new Map();
-
     const maxVerts = absIdx.length;
     const posArr  = new Float32Array(maxVerts * 3);
     const nrmArr  = new Float32Array(maxVerts * 3);
@@ -373,7 +448,6 @@ function buildBatches(buffer, fLump, mvLump, rawPos, rawUV1, rawUV2, rawNorm,
     }
 
     let vertCount = 0;
-
     for (let i = 0; i < absIdx.length; i++) {
       const gi = absIdx[i];
       let li   = g2l.get(gi);
@@ -404,7 +478,7 @@ function buildBatches(buffer, fLump, mvLump, rawPos, rawUV1, rawUV2, rawNorm,
       texIdx:   batch.texIdx,
       lmIdx:    batch.lmIdx,
       noclip:   batch.noclip,
-      invisible: batch.invisible,   // true → mesh.visible = false in loader, but still collides
+      invisible: batch.invisible,
       hasLM:    lmAtlas !== null && batch.lmIdx >= 0 && batch.lmIdx < lmCount,
       pos:      posArr.subarray(0, vertCount * 3),
       nrm:      nrmArr.subarray(0, vertCount * 3),
@@ -459,22 +533,19 @@ self.onmessage = function ({ data }) {
       }
     }
 
-    const parsedLights = parseLights(entities);
-    lights.push(...parsedLights);
+    lights.push(...parseLights(entities));
 
     self.postMessage({ type: 'progress', pct: 10 });
 
-    // ── Noclip face set ──────────────────────────────────────────────────────
+    // ── Noclip face set (for rendering mesh flags only) ──────────────────────
     const modelLump   = lump(LUMP_MODELS);
     const noclipFaces = buildNoclipFaceSet(entities, buffer, modelLump);
-    if (noclipFaces.size > 0) {
-      console.log(`[BSP Worker] Noclip faces: ${noclipFaces.size} (func_wall etc.)`);
-    }
 
-    // ── Texture names ────────────────────────────────────────────────────────
+    // ── Texture names + content flags ────────────────────────────────────────
     const texLump  = lump(LUMP_TEXTURES);
     const texCount = (texLump.length / TEX_RECORD_SIZE) | 0;
-    const texNames = [];
+    const texNames    = [];
+    const texContents = new Int32Array(texCount);
 
     for (let i = 0; i < texCount; i++) {
       const off = texLump.offset + i * TEX_RECORD_SIZE;
@@ -485,24 +556,30 @@ self.onmessage = function ({ data }) {
         name += String.fromCharCode(ch);
       }
       texNames.push(name.toLowerCase().replace(/\\/g, '/').replace(/^textures\//, ''));
+      // Content flags at byte offset 68 within the shader record
+      texContents[i] = view.getInt32(off + 68, true);
     }
 
     self.postMessage({ type: 'progress', pct: 20 });
+
+    // ── BSP Collision (planes / nodes / leafs / brushes) ─────────────────────
+    const bspCollision = parseBSPCollision(buffer, view, lump, texContents);
+
+    self.postMessage({ type: 'progress', pct: 28 });
 
     // ── Lightmaps ────────────────────────────────────────────────────────────
     const lmLump  = lump(LUMP_LIGHTMAPS);
     const lmCount = (lmLump.length / LM_SIZE) | 0;
     const lmAtlas = buildLightmapAtlas(buffer, lmLump, lmCount);
 
-    self.postMessage({ type: 'progress', pct: 40 });
+    self.postMessage({ type: 'progress', pct: 45 });
 
     // ── Vertices ─────────────────────────────────────────────────────────────
     const { rawPos, rawUV1, rawUV2, rawNorm } = parseVertices(buffer, lump(LUMP_VERTS));
 
-    self.postMessage({ type: 'progress', pct: 55 });
+    self.postMessage({ type: 'progress', pct: 58 });
 
-    // ── Batches + geometry buffers ───────────────────────────────────────────
-    // texNames is passed so buildBatches can detect invisible clip textures.
+    // ── Batches ──────────────────────────────────────────────────────────────
     const batches = buildBatches(
       buffer,
       lump(LUMP_FACES),
@@ -510,15 +587,27 @@ self.onmessage = function ({ data }) {
       rawPos, rawUV1, rawUV2, rawNorm,
       lmAtlas, lmCount,
       noclipFaces,
-      texNames,     // ← required for invisible texture detection
+      texNames,
     );
 
     self.postMessage({ type: 'progress', pct: 85 });
 
-    // ── Transferable ─────────────────────────────────────────────────────────
+    // ── Assemble transferable list ────────────────────────────────────────────
     const transferList = [];
+
     if (lmAtlas) transferList.push(lmAtlas.atlasData);
 
+    // BSP collision buffers (transferred, zero-copy)
+    transferList.push(
+      bspCollision.planes.buffer,
+      bspCollision.brushSides.buffer,
+      bspCollision.brushes.buffer,
+      bspCollision.leafBrushes.buffer,
+      bspCollision.leafs.buffer,
+      bspCollision.nodes.buffer,
+    );
+
+    // Batch geometry buffers
     for (const b of batches) {
       b.pos = b.pos.slice().buffer;
       b.nrm = b.nrm.slice().buffer;
@@ -547,6 +636,15 @@ self.onmessage = function ({ data }) {
         nonZero: lmAtlas.nonZero,
       } : null,
       batches,
+      // BSP collision data for physics.js
+      bspCollision: {
+        planes:      bspCollision.planes.buffer,
+        brushSides:  bspCollision.brushSides.buffer,
+        brushes:     bspCollision.brushes.buffer,
+        leafBrushes: bspCollision.leafBrushes.buffer,
+        leafs:       bspCollision.leafs.buffer,
+        nodes:       bspCollision.nodes.buffer,
+      },
     }, transferList);
 
   } catch (err) {
