@@ -1,6 +1,9 @@
 # Expore 🚶‍♂️✨
 
 A 3D "vibe-coded" walking simulator engine made specifically for people who don't know how to make a game.
+I have no idea how to write a single line of code so this $hit is 99% vibecode
+
+It's work in progress so expect a lot of bugs
 
 ---
 
@@ -23,7 +26,5 @@ Ready to build? Follow the official step-by-step guide to configure TrenchBroom 
 ---
 
 ## ✨ Features
-
-* **Vibe-Coded Aesthetics:** I have no idea how to write a single line of code so this $hit is 99% vibecode
 * **No Code Required:** Perfect for artists, writers, and beginners who want to build 3D spaces instantly.
 * **TrenchBroom Integration:** Design levels using a clean, intuitive, and modern brush-based editor.
