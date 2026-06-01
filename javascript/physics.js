@@ -493,6 +493,13 @@ export function createPhysics(bspCollision, userCFG = {}) {
     const pushDown_o = { x: physPos.x, y: physPos.y - stepSize, z: physPos.z };
     const tracePush = traceBox(physPos.x, physPos.y, physPos.z, pushDown_o.x, pushDown_o.y, pushDown_o.z);
 
+    // If we landed on a steep wall (wall climbing), reject the step
+    if (tracePush.fraction < 1.0 && tracePush.ny < SLOPE_MIN_Y) {
+      physPos.x = slide_o.x; physPos.y = slide_o.y; physPos.z = slide_o.z;
+      velocity.x = slide_v.x; velocity.y = slide_v.y; velocity.z = slide_v.z;
+      return;
+    }
+
     if (!tracePush.allSolid) {
       physPos.x = tracePush.ex; physPos.y = tracePush.ey; physPos.z = tracePush.ez;
     }
@@ -575,39 +582,12 @@ export function createPhysics(bspCollision, userCFG = {}) {
     velocity.z += accelSpeed * wdz;
   }
 
-  // ── PM_UnstickIfSolid ────────────────────────────────────────────────────────
-  // Runs EVERY frame.  A zero-distance trace detects if the AABB centre is inside
-  // a brush (allSolid).  If so, nudge physPos upward until clear.
-  // This handles spawn, teleport, and any edge case where PM_GroundTrace would
-  // snap the player into a wall-floor junction.
-  // Cost: one BSP tree walk per frame when clear (negligible); up to ~20 more
-  // when actually stuck (rare, temporary).
-  function PM_UnstickIfSolid() {
-    const tr = traceBox(physPos.x, physPos.y, physPos.z,
-                        physPos.x, physPos.y, physPos.z);
-    if (!tr.allSolid) return;
-
-    for (let i = 1; i <= 20; i++) {
-      const testY = physPos.y + i * 0.05;
-      const tr2   = traceBox(physPos.x, testY, physPos.z,
-                              physPos.x, testY, physPos.z);
-      if (!tr2.allSolid) {
-        physPos.y = testY;
-        onGround  = false;
-        return;
-      }
-    }
-  }
-
   // ── Main update ───────────────────────────────────────────────────────────────
   function update(camera, keys, yaw, dt) {
     dt = Math.min(dt, 0.05);
 
     // Sync physPos from camera (picks up external position changes like portals)
     physPos.set(camera.position.x, camera.position.y - halfH, camera.position.z);
-
-    // ── Unstick if inside solid geometry (runs every frame, cheap when clear) ──
-    PM_UnstickIfSolid();
 
     // ── Turning ──────────────────────────────────────────────────────────────
     if (keys['a'] || keys['arrowleft'])  yaw += CFG.TURN_SPEED * dt;
