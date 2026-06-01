@@ -385,9 +385,9 @@ export function createPhysics(bspCollision, userCFG = {}) {
       let samePlane = false;
       for (let i = 0; i < numPlanes * 3; i += 3) {
         if (pns[i] * tr.nx + pns[i + 1] * tr.ny + pns[i + 2] * tr.nz > 0.99) {
-          velocity.x += tr.nx;
-          velocity.y += tr.ny;
-          velocity.z += tr.nz;
+          velocity.x += tr.nx * 0.02;
+          velocity.y += tr.ny * 0.02;
+          velocity.z += tr.nz * 0.02;
           samePlane = true;
           break;
         }
@@ -521,6 +521,17 @@ export function createPhysics(bspCollision, userCFG = {}) {
     if (downTr.fraction < 1) {
       const cv = clipVel(velocity.x, velocity.y, velocity.z, downTr.nx, downTr.ny, downTr.nz);
       velocity.x = cv.vx; velocity.y = cv.vy; velocity.z = cv.vz;
+    }
+
+    // Compare progress: if the step move didn't make more horizontal progress
+    // than the original slide, revert to the slide result.
+    const slideDistSq = (slX - sx) * (slX - sx) + (slZ - sz) * (slZ - sz);
+    const stepDistSq  = (physPos.x - sx) * (physPos.x - sx) + (physPos.z - sz) * (physPos.z - sz);
+
+    if (stepDistSq <= slideDistSq + 0.001) {
+      // Revert to slide result
+      physPos.x = slX; physPos.y = slY; physPos.z = slZ;
+      velocity.x = slVX; velocity.y = slVY; velocity.z = slVZ;
     }
     // Q3 accepts the step result unconditionally if we reached here
   }
