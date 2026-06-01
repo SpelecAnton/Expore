@@ -312,7 +312,7 @@ export function createPhysics(bspCollision, userCFG = {}) {
     let endVX = velocity.x, endVY = velocity.y, endVZ = velocity.z;
 
     if (gravity) {
-      endVY = velocity.y - CFG.GRAVITY * dt;
+      endVY = velocity.y + CFG.GRAVITY * dt;
       velocity.y = (velocity.y + endVY) * 0.5;
       primalVY = endVY;
       if (onGround) {
