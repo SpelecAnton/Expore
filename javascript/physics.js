@@ -126,7 +126,7 @@ export function createPhysics(bspCollision, userCFG = {}) {
   let   onGround      = false;
   let   groundNX = 0, groundNY = 1, groundNZ = 0; // normal of floor we stand on
   let   currentPitch  = 0;
-  let   _needsEscape  = false; // set true after teleport to trigger solid-escape pass
+
 
   // ── Trace state (reused per call — single-threaded JS) ──────────────────────
   let _sx, _sy, _sz;   // trace start (AABB centre)
@@ -541,6 +541,10 @@ export function createPhysics(bspCollision, userCFG = {}) {
       }
     }
 
+    // Validate snap: don't snap into a brush junction (wall meets floor)
+    const snapTr = traceBox(tr.ex, tr.ey, tr.ez, tr.ex, tr.ey, tr.ez);
+    if (snapTr.allSolid) { onGround = false; return; }
+
     // Snap to floor and record normal
     physPos.x = tr.ex; physPos.y = tr.ey; physPos.z = tr.ez;
     groundNX = tr.nx; groundNY = tr.ny; groundNZ = tr.nz;
@@ -582,23 +586,25 @@ export function createPhysics(bspCollision, userCFG = {}) {
     velocity.z += accelSpeed * wdz;
   }
 
-  // ── PM_EscapeIfSolid ─────────────────────────────────────────────────────────
-  // Run once after teleport / spawn to push physPos out of any solid it landed in.
-  function PM_EscapeIfSolid() {
-    if (!_needsEscape) return;
-    _needsEscape = false;
-
+  // ── PM_UnstickIfSolid ────────────────────────────────────────────────────────
+  // Runs EVERY frame.  A zero-distance trace detects if the AABB centre is inside
+  // a brush (allSolid).  If so, nudge physPos upward until clear.
+  // This handles spawn, teleport, and any edge case where PM_GroundTrace would
+  // snap the player into a wall-floor junction.
+  // Cost: one BSP tree walk per frame when clear (negligible); up to ~20 more
+  // when actually stuck (rare, temporary).
+  function PM_UnstickIfSolid() {
     const tr = traceBox(physPos.x, physPos.y, physPos.z,
                         physPos.x, physPos.y, physPos.z);
-    if (!tr.startSolid) return;
+    if (!tr.allSolid) return;
 
-    for (let i = 1; i <= 16; i++) {
-      const testY = physPos.y + i * 0.1;
+    for (let i = 1; i <= 20; i++) {
+      const testY = physPos.y + i * 0.05;
       const tr2   = traceBox(physPos.x, testY, physPos.z,
                               physPos.x, testY, physPos.z);
-      if (!tr2.startSolid) {
+      if (!tr2.allSolid) {
         physPos.y = testY;
-        console.warn(`[Physics] Escaped solid, pushed up ${(i * 0.1).toFixed(2)} units`);
+        onGround  = false;
         return;
       }
     }
@@ -611,8 +617,8 @@ export function createPhysics(bspCollision, userCFG = {}) {
     // Sync physPos from camera (picks up external position changes like portals)
     physPos.set(camera.position.x, camera.position.y - halfH, camera.position.z);
 
-    // ── Escape solid after teleport ─────────────────────────────────────────
-    PM_EscapeIfSolid();
+    // ── Unstick if inside solid geometry (runs every frame, cheap when clear) ──
+    PM_UnstickIfSolid();
 
     // ── Turning ──────────────────────────────────────────────────────────────
     if (keys['a'] || keys['arrowleft'])  yaw += CFG.TURN_SPEED * dt;
@@ -696,13 +702,12 @@ export function createPhysics(bspCollision, userCFG = {}) {
     refreshCollidables() {},
 
     teleport(camera, x, y, z) {
-      // x, y, z = desired camera (eye) position
       camera.position.set(x, y, z);
       physPos.set(x, y - halfH, z);
       velocity.set(0, 0, 0);
-      onGround      = false;
-      currentPitch  = 0;
-      _needsEscape  = true; // check for solid on next update
+      onGround     = false;
+      currentPitch = 0;
+      // PM_UnstickIfSolid will handle bad spawn positions on the next update()
     },
 
     get isOnGround() { return onGround; },
