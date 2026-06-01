@@ -294,8 +294,6 @@ export function createPhysics(bspCollision, userCFG = {}) {
   }
 
   // ── PM_ClipVelocity ───────────────────────────────────────────────────────────
-  // Exact Q3 version: negative dot → multiply by overbounce (aggressive clip),
-  // positive dot → divide (gentle deflect).
   function clipVel(vx, vy, vz, nx, ny, nz) {
     let backoff = vx * nx + vy * ny + vz * nz;
     if (backoff < 0) backoff *= OVERCLIP;
@@ -305,235 +303,203 @@ export function createPhysics(bspCollision, userCFG = {}) {
 
   // ── PM_SlideMove ─────────────────────────────────────────────────────────────
   // Faithful Q3 bg_pmove.c PM_SlideMove.
-  //
-  // gravity=true: apply gravity averaging (Verlet) during the slide — used in air.
-  // gravity=false: no gravity applied — used on ground (floor keeps you up).
-  //
-  // Returns true if any bump occurred (player was deflected by a surface).
-  //
-  // Plane accumulation with crease and triple-plane stop is what prevents the
-  // "two angled walls → fall through the junction" bug.
   function PM_SlideMove(gravity, dt) {
-    let timeLeft = dt;
-    let bumped   = false;
+    let bumpcount, numbumps = 4;
+    let time_left = dt;
+    let endX, endY, endZ;
 
-    // Gravity Verlet averaging (Q3 style): use average of start/end vertical vel
-    // during the trace; restore the true end velocity afterwards.
-    let endVY = velocity.y;
+    let primalVX = velocity.x, primalVY = velocity.y, primalVZ = velocity.z;
+    let endVX = velocity.x, endVY = velocity.y, endVZ = velocity.z;
+
     if (gravity) {
-      endVY       = velocity.y + CFG.GRAVITY * dt;
-      velocity.y  = (velocity.y + endVY) * 0.5;
-
-      // On slope: clip to ground normal so player follows slope downhill
+      endVY = velocity.y - CFG.GRAVITY * dt;
+      velocity.y = (velocity.y + endVY) * 0.5;
+      primalVY = endVY;
       if (onGround) {
-        const dot = velocity.x * groundNX + velocity.y * groundNY + velocity.z * groundNZ;
-        if (dot < 0) {
-          let b = dot * OVERCLIP;
-          velocity.x -= groundNX * b;
-          velocity.y -= groundNY * b;
-          velocity.z -= groundNZ * b;
-        }
+        const cv = clipVel(velocity.x, velocity.y, velocity.z, groundNX, groundNY, groundNZ);
+        velocity.x = cv.vx; velocity.y = cv.vy; velocity.z = cv.vz;
       }
     }
 
-    // Accumulated plane normals from each bounce
-    // Stored flat: [nx0,ny0,nz0, nx1,ny1,nz1, ...]
-    const pns     = [];
-    let numPlanes = 0;
+    const pns = []; // flat array [nx, ny, nz, ...]
+    let numplanes = 0;
 
-    // Q3: never turn against the ground plane
     if (onGround) {
       pns.push(groundNX, groundNY, groundNZ);
-      numPlanes++;
+      numplanes++;
     }
 
-    // Q3: never turn against original velocity
     const speed = Math.sqrt(velocity.x * velocity.x + velocity.y * velocity.y + velocity.z * velocity.z);
-    if (speed > 0.001) {
+    if (speed > 0) {
       pns.push(velocity.x / speed, velocity.y / speed, velocity.z / speed);
-      numPlanes++;
+      numplanes++;
     }
 
-    for (let bump = 0; bump < 4 && timeLeft > 0.0001; bump++) {
-      const dx = velocity.x * timeLeft;
-      const dy = velocity.y * timeLeft;
-      const dz = velocity.z * timeLeft;
+    for (bumpcount = 0; bumpcount < numbumps; bumpcount++) {
+      endX = physPos.x + time_left * velocity.x;
+      endY = physPos.y + time_left * velocity.y;
+      endZ = physPos.z + time_left * velocity.z;
 
-      const tr = traceBox(physPos.x, physPos.y, physPos.z,
-                          physPos.x + dx, physPos.y + dy, physPos.z + dz);
+      const trace = traceBox(physPos.x, physPos.y, physPos.z, endX, endY, endZ);
 
-      if (tr.allSolid) {
-        // Fully inside solid: stop all movement, zero vertical
+      if (trace.allSolid) {
         velocity.y = 0;
-        if (gravity) velocity.y = endVY;
         return true;
       }
 
-      if (tr.fraction > 0) {
-        // Moved some distance: commit (plane history is NOT reset in Quake 3, allowing crease projection)
-        physPos.x = tr.ex; physPos.y = tr.ey; physPos.z = tr.ez;
+      if (trace.fraction > 0) {
+        physPos.x = trace.ex;
+        physPos.y = trace.ey;
+        physPos.z = trace.ez;
       }
 
-      if (tr.fraction >= 1) break; // Moved the full distance — done
+      if (trace.fraction === 1) {
+        break;
+      }
 
-      bumped   = true;
-      timeLeft -= timeLeft * tr.fraction;
+      time_left -= time_left * trace.fraction;
 
-      // ── Same-plane nudge (Q3 anti-sticking) ─────────────────────────────
-      // If we keep hitting the same surface, nudge velocity out along its
-      // normal rather than trying to re-clip.
-      let samePlane = false;
-      for (let i = 0; i < numPlanes * 3; i += 3) {
-        if (pns[i] * tr.nx + pns[i + 1] * tr.ny + pns[i + 2] * tr.nz > 0.99) {
-          velocity.x += tr.nx * 0.02;
-          velocity.y += tr.ny * 0.02;
-          velocity.z += tr.nz * 0.02;
-          samePlane = true;
+      if (numplanes >= MAX_CLIP_PLANES) {
+        velocity.x = 0; velocity.y = 0; velocity.z = 0;
+        return true;
+      }
+
+      let i;
+      for (i = 0; i < numplanes; i++) {
+        if (trace.nx * pns[i * 3] + trace.ny * pns[i * 3 + 1] + trace.nz * pns[i * 3 + 2] > 0.99) {
+          velocity.x += trace.nx * 0.02; // scaled Q3 epsilon
+          velocity.y += trace.ny * 0.02;
+          velocity.z += trace.nz * 0.02;
           break;
         }
       }
-      if (samePlane) continue;
+      if (i < numplanes) continue;
 
-      // Add current plane
-      if (numPlanes < MAX_CLIP_PLANES) {
-        pns.push(tr.nx, tr.ny, tr.nz);
-        numPlanes++;
-      }
+      pns.push(trace.nx, trace.ny, trace.nz);
+      numplanes++;
 
-      // ── Multi-plane velocity clipping ─────────────────────────────────────
-      // Loop through all accumulated planes and find the right clip.
-      // This handles corners where two (or three) planes converge.
-      for (let i = 0; i < numPlanes; i++) {
-        const pnx = pns[i * 3], pny = pns[i * 3 + 1], pnz = pns[i * 3 + 2];
-        const into = velocity.x * pnx + velocity.y * pny + velocity.z * pnz;
-        if (into >= INTO_THRESH) continue; // not moving into this plane
+      let clipVX = 0, clipVY = 0, clipVZ = 0;
+      let endClipVX = 0, endClipVY = 0, endClipVZ = 0;
 
-        // Single-plane clip
-        let cv = clipVel(velocity.x, velocity.y, velocity.z, pnx, pny, pnz);
+      for (i = 0; i < numplanes; i++) {
+        const p_i_nx = pns[i * 3], p_i_ny = pns[i * 3 + 1], p_i_nz = pns[i * 3 + 2];
+        const into = velocity.x * p_i_nx + velocity.y * p_i_ny + velocity.z * p_i_nz;
+        
+        if (into >= INTO_THRESH) continue;
 
-        // Check every other plane
-        let done = true;
-        for (let j = 0; j < numPlanes; j++) {
+        let cv = clipVel(velocity.x, velocity.y, velocity.z, p_i_nx, p_i_ny, p_i_nz);
+        clipVX = cv.vx; clipVY = cv.vy; clipVZ = cv.vz;
+
+        let ecv = clipVel(endVX, endVY, endVZ, p_i_nx, p_i_ny, p_i_nz);
+        endClipVX = ecv.vx; endClipVY = ecv.vy; endClipVZ = ecv.vz;
+
+        let j;
+        for (j = 0; j < numplanes; j++) {
           if (j === i) continue;
-          const qnx = pns[j * 3], qny = pns[j * 3 + 1], qnz = pns[j * 3 + 2];
-          if (cv.vx * qnx + cv.vy * qny + cv.vz * qnz >= INTO_THRESH) continue;
+          const p_j_nx = pns[j * 3], p_j_ny = pns[j * 3 + 1], p_j_nz = pns[j * 3 + 2];
+          
+          if (clipVX * p_j_nx + clipVY * p_j_ny + clipVZ * p_j_nz >= INTO_THRESH) continue;
 
-          // Two-plane clip
-          cv = clipVel(cv.vx, cv.vy, cv.vz, qnx, qny, qnz);
+          cv = clipVel(clipVX, clipVY, clipVZ, p_j_nx, p_j_ny, p_j_nz);
+          clipVX = cv.vx; clipVY = cv.vy; clipVZ = cv.vz;
 
-          // Make sure two-plane result doesn't re-enter plane i
-          if (cv.vx * pnx + cv.vy * pny + cv.vz * pnz >= INTO_THRESH) continue;
+          ecv = clipVel(endClipVX, endClipVY, endClipVZ, p_j_nx, p_j_ny, p_j_nz);
+          endClipVX = ecv.vx; endClipVY = ecv.vy; endClipVZ = ecv.vz;
 
-          // ── Crease projection ────────────────────────────────────────────
-          // Velocity goes into both planes.  Project onto their intersection
-          // line (the "crease") so the player slides along the corner.
-          const crnx = pny * qnz - pnz * qny;
-          const crny = pnz * qnx - pnx * qnz;
-          const crnz = pnx * qny - pny * qnx;
-          const crLenSq = crnx * crnx + crny * crny + crnz * crnz;
+          if (clipVX * p_i_nx + clipVY * p_i_ny + clipVZ * p_i_nz >= 0) continue;
 
-          if (crLenSq > 0.0001) {
-            // Speed along crease = dot(originalVelocity, crease) / |crease|²
-            const d = (velocity.x * crnx + velocity.y * crny + velocity.z * crnz) / crLenSq;
-            cv = { vx: crnx * d, vy: crny * d, vz: crnz * d };
-          } else {
-            cv = { vx: 0, vy: 0, vz: 0 };
+          let dirX = p_i_ny * p_j_nz - p_i_nz * p_j_ny;
+          let dirY = p_i_nz * p_j_nx - p_i_nx * p_j_nz;
+          let dirZ = p_i_nx * p_j_ny - p_i_ny * p_j_nx;
+          let dirlen = Math.sqrt(dirX * dirX + dirY * dirY + dirZ * dirZ);
+          if (dirlen > 0) {
+            dirX /= dirlen; dirY /= dirlen; dirZ /= dirlen;
           }
+          
+          let d = dirX * velocity.x + dirY * velocity.y + dirZ * velocity.z;
+          clipVX = dirX * d; clipVY = dirY * d; clipVZ = dirZ * d;
 
-          // ── Triple-plane stop ────────────────────────────────────────────
-          // If the crease result enters a THIRD plane: dead corner, stop.
-          for (let k = 0; k < numPlanes; k++) {
+          d = dirX * endVX + dirY * endVY + dirZ * endVZ;
+          endClipVX = dirX * d; endClipVY = dirY * d; endClipVZ = dirZ * d;
+
+          let k;
+          for (k = 0; k < numplanes; k++) {
             if (k === i || k === j) continue;
-            const rnx = pns[k * 3], rny = pns[k * 3 + 1], rnz = pns[k * 3 + 2];
-            if (cv.vx * rnx + cv.vy * rny + cv.vz * rnz < INTO_THRESH) {
-              cv   = { vx: 0, vy: 0, vz: 0 };
-              done = false;
-              break;
-            }
+            const p_k_nx = pns[k * 3], p_k_ny = pns[k * 3 + 1], p_k_nz = pns[k * 3 + 2];
+            
+            if (clipVX * p_k_nx + clipVY * p_k_ny + clipVZ * p_k_nz >= INTO_THRESH) continue;
+
+            velocity.x = 0; velocity.y = 0; velocity.z = 0;
+            return true;
           }
-          done = false;
-          break;
         }
 
-        velocity.x = cv.vx; velocity.y = cv.vy; velocity.z = cv.vz;
-        if (!done) break;
-        break; // Only process first plane we're significantly into
+        velocity.x = clipVX; velocity.y = clipVY; velocity.z = clipVZ;
+        endVX = endClipVX; endVY = endClipVY; endVZ = endClipVZ;
+        break;
       }
     }
 
-    if (gravity) velocity.y = endVY; // restore full end-of-frame vertical vel
-    return bumped;
+    if (gravity) {
+      velocity.x = endVX; velocity.y = endVY; velocity.z = endVZ;
+    } else {
+      velocity.y = primalVY; // Don't change vertical velocity if not in gravity
+    }
+
+    return (bumpcount !== 0);
   }
 
   // ── PM_StepSlideMove ─────────────────────────────────────────────────────────
   // Faithful Q3 PM_StepSlideMove.
-  // 1. Try normal slide.  If no bumps: done.
-  // 2. Don't step if jumping upward with no solid floor below start.
-  // 3. Try lifting physPos by STEPSIZE (box trace up).
-  // 4. Slide from elevated position.
-  // 5. Trace back down by the actual lift amount.
-  // 6. Q3 simply uses the step result if we reached here (no distance compare).
   function PM_StepSlideMove(gravity, dt) {
-    // Save start state
-    const sx = physPos.x, sy = physPos.y, sz = physPos.z;
-    const svx = velocity.x, svy = velocity.y, svz = velocity.z;
+    const start_o = { x: physPos.x, y: physPos.y, z: physPos.z };
+    const start_v = { x: velocity.x, y: velocity.y, z: velocity.z };
 
-    const bumped = PM_SlideMove(gravity, dt);
-    if (!bumped) return; // moved freely
-
-    // Don't step while moving upward unless there's a floor directly below start
-    if (svy > 0) {
-      const downTr = traceBox(sx, sy, sz, sx, sy - STEPSIZE, sz);
-      if (downTr.fraction >= 1 || downTr.ny < 0.7) {
-        return; // in air with upward velocity: keep slide result
-      }
+    if (!PM_SlideMove(gravity, dt)) {
+      return; // we got exactly where we wanted to go first try
     }
 
-    // Save slide result
-    const slX = physPos.x, slY = physPos.y, slZ = physPos.z;
-    const slVX = velocity.x, slVY = velocity.y, slVZ = velocity.z;
+    const down_o = { x: start_o.x, y: start_o.y - STEPSIZE, z: start_o.z };
+    const traceDown = traceBox(start_o.x, start_o.y, start_o.z, down_o.x, down_o.y, down_o.z);
 
-    // Restore start and try stepping up
-    physPos.x = sx; physPos.y = sy; physPos.z = sz;
-    velocity.x = svx; velocity.y = svy; velocity.z = svz;
-
-    const upTr = traceBox(sx, sy, sz, sx, sy + STEPSIZE, sz);
-    if (upTr.allSolid) {
-      // Can't step up at all: restore slide result
-      physPos.x = slX; physPos.y = slY; physPos.z = slZ;
-      velocity.x = slVX; velocity.y = slVY; velocity.z = slVZ;
+    if (velocity.y > 0 && (traceDown.fraction === 1.0 || traceDown.ny < 0.7)) {
       return;
     }
 
-    const stepSize = upTr.ey - sy; // actual lift (may be < STEPSIZE if ceiling close)
-    physPos.x = upTr.ex; physPos.y = upTr.ey; physPos.z = upTr.ez;
-    velocity.x = svx; velocity.y = svy; velocity.z = svz;
+    // save slide result
+    const slide_o = { x: physPos.x, y: physPos.y, z: physPos.z };
+    const slide_v = { x: velocity.x, y: velocity.y, z: velocity.z };
 
-    // Slide from elevated position
+    const up_o = { x: start_o.x, y: start_o.y + STEPSIZE, z: start_o.z };
+    
+    // test step up
+    const traceUp = traceBox(start_o.x, start_o.y, start_o.z, up_o.x, up_o.y, up_o.z);
+    if (traceUp.allSolid) {
+      // restore slide result
+      physPos.x = slide_o.x; physPos.y = slide_o.y; physPos.z = slide_o.z;
+      velocity.x = slide_v.x; velocity.y = slide_v.y; velocity.z = slide_v.z;
+      return;
+    }
+
+    const stepSize = traceUp.ey - start_o.y;
+    
+    // slide from elevated position
+    physPos.x = traceUp.ex; physPos.y = traceUp.ey; physPos.z = traceUp.ez;
+    velocity.x = start_v.x; velocity.y = start_v.y; velocity.z = start_v.z;
+
     PM_SlideMove(gravity, dt);
 
-    // Push back down
-    const downTr = traceBox(physPos.x, physPos.y, physPos.z,
-                             physPos.x, physPos.y - stepSize, physPos.z);
-    if (!downTr.allSolid) {
-      physPos.x = downTr.ex; physPos.y = downTr.ey; physPos.z = downTr.ez;
+    // push down
+    const pushDown_o = { x: physPos.x, y: physPos.y - stepSize, z: physPos.z };
+    const tracePush = traceBox(physPos.x, physPos.y, physPos.z, pushDown_o.x, pushDown_o.y, pushDown_o.z);
+
+    if (!tracePush.allSolid) {
+      physPos.x = tracePush.ex; physPos.y = tracePush.ey; physPos.z = tracePush.ez;
     }
-    if (downTr.fraction < 1) {
-      const cv = clipVel(velocity.x, velocity.y, velocity.z, downTr.nx, downTr.ny, downTr.nz);
+    if (tracePush.fraction < 1.0) {
+      const cv = clipVel(velocity.x, velocity.y, velocity.z, tracePush.nx, tracePush.ny, tracePush.nz);
       velocity.x = cv.vx; velocity.y = cv.vy; velocity.z = cv.vz;
     }
-
-    // Compare progress: if the step move didn't make more horizontal progress
-    // than the original slide, revert to the slide result.
-    const slideDistSq = (slX - sx) * (slX - sx) + (slZ - sz) * (slZ - sz);
-    const stepDistSq  = (physPos.x - sx) * (physPos.x - sx) + (physPos.z - sz) * (physPos.z - sz);
-
-    if (stepDistSq <= slideDistSq + 0.001) {
-      // Revert to slide result
-      physPos.x = slX; physPos.y = slY; physPos.z = slZ;
-      velocity.x = slVX; velocity.y = slVY; velocity.z = slVZ;
-    }
-    // Q3 accepts the step result unconditionally if we reached here
   }
 
   // ── PM_GroundTrace ────────────────────────────────────────────────────────────
