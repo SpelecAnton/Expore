@@ -68,8 +68,9 @@ const OVERCLIP        = 1.001;
 
 // INTO_THRESH: only bother clipping velocity against a plane when the player
 // is moving at least this fast INTO it.  Filters float noise.
-// Q3 uses -10 Q3-units/s → -10 × 0.02 = -0.2 Three.js units/s.
-const INTO_THRESH     = -0.2;
+// Q3 uses 0.1 Q3-units/s → 0.1 × 0.02 = 0.002 Three.js units/s.
+// We use 0.001 to ensure even very slow movement into walls is clipped.
+const INTO_THRESH     = 0.001;
 
 const MAX_CLIP_PLANES = 5;    // max accumulated bounce planes per slide
 const MAX_NODE_DEPTH  = 128;  // BSP recursion guard
@@ -340,6 +341,19 @@ export function createPhysics(bspCollision, userCFG = {}) {
     const pns     = [];
     let numPlanes = 0;
 
+    // Q3: never turn against the ground plane
+    if (onGround) {
+      pns.push(groundNX, groundNY, groundNZ);
+      numPlanes++;
+    }
+
+    // Q3: never turn against original velocity
+    const speed = Math.sqrt(velocity.x * velocity.x + velocity.y * velocity.y + velocity.z * velocity.z);
+    if (speed > 0.001) {
+      pns.push(velocity.x / speed, velocity.y / speed, velocity.z / speed);
+      numPlanes++;
+    }
+
     for (let bump = 0; bump < 4 && timeLeft > 0.0001; bump++) {
       const dx = velocity.x * timeLeft;
       const dy = velocity.y * timeLeft;
@@ -356,10 +370,8 @@ export function createPhysics(bspCollision, userCFG = {}) {
       }
 
       if (tr.fraction > 0) {
-        // Moved some distance: commit and reset plane history
+        // Moved some distance: commit (plane history is NOT reset in Quake 3, allowing crease projection)
         physPos.x = tr.ex; physPos.y = tr.ey; physPos.z = tr.ez;
-        pns.length = 0;
-        numPlanes  = 0;
       }
 
       if (tr.fraction >= 1) break; // Moved the full distance — done

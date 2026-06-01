@@ -23,12 +23,9 @@
       position: fixed; inset: 0;
       display: flex; flex-direction: column;
       align-items: center; justify-content: center;
-      background: #000;
-      color: #fff;
+      background: #000; color: #fff;
       font-family: "Share Tech Mono", monospace;
-      font-size: 14px;
-      gap: 16px;
-      z-index: 100;
+      font-size: 14px; gap: 16px; z-index: 100;
       transition: opacity 0.4s;
     }
     #loading.hidden { opacity: 0; pointer-events: none; }
@@ -36,22 +33,17 @@
     #progress-bar {
       width: 260px; height: 4px;
       background: rgba(255,255,255,0.15);
-      border-radius: 2px;
-      overflow: hidden;
+      border-radius: 2px; overflow: hidden;
     }
     #progress-fill {
       height: 100%; width: 0%;
-      background: #fff;
-      transition: width 0.2s;
+      background: #fff; transition: width 0.2s;
     }
 
     #fade {
-      position: fixed; inset: 0;
-      background: #000;
-      opacity: 0;
-      pointer-events: none;
-      transition: opacity 0.35s;
-      z-index: 50;
+      position: fixed; inset: 0; background: #000;
+      opacity: 0; pointer-events: none;
+      transition: opacity 0.35s; z-index: 50;
     }
     #fade.out { opacity: 1; }
   </style>
@@ -62,9 +54,7 @@
   <div>Loading Map…</div>
   <div id="progress-bar"><div id="progress-fill"></div></div>
 </div>
-
 <div id="fade"></div>
-
 <canvas id="c"></canvas>
 
 <script type="module">
@@ -76,39 +66,34 @@
     textureBase: 'textures/',
     mapName:     'MAP',
 
-    // ── Physics ────────────────────────────────────────────────────────────
+    // ── Physics (BSP brush collision) ──────────────────────────────────────
+    // Units: Three.js (1 unit ≈ 50 Q3 units).
     physicsConfig: {
       // Movement
-      MOVE_SPEED:      280 * 0.02,  // units/s — horizontal movement speed
-      TURN_SPEED:      2.5,         // rad/s   — left/right turn speed (A/D keys)
-      LOOK_SPEED:      2.5,         // rad/s   — head tilt speed (Q/E keys)
-      RETURN_SPEED:    5.0,         // rad/s   — how fast head returns to level after releasing Q/E
+      MOVE_SPEED:      280 * 0.02,   // walk speed  (units/s)
+      TURN_SPEED:      2.5,          // A/D turning (rad/s)
+      LOOK_SPEED:      2.5,          // Q/E tilting (rad/s)
+      RETURN_SPEED:    5.0,          // auto-level speed after Q/E (rad/s)
 
-      // Gravity
-      GRAVITY:        -28.0,        // units/s² — increase for faster fall
-      JUMP_SPEED:      3.0,         // units/s  — initial vertical velocity on jump (Space)
-      TERMINAL_VEL:  -30.0,         // units/s  — maximum fall speed (terminal velocity)
+      // Gravity & jump
+      GRAVITY:        -28.0,         // downward accel (units/s²)
+      JUMP_SPEED:      3.0,          // jump initial velocity (units/s)
+      TERMINAL_VEL:  -30.0,          // max fall speed (units/s)
 
-      // Player
-      PLAYER_HEIGHT:  80 * 0.02,    // units — camera height above the floor
-      PLAYER_RADIUS:   0.28,        // units — player capsule radius (XZ collision)
-      PLAYER_MASS:     1.0,         // (reserved for future use)
+      // Player shape (affects collision box)
+      PLAYER_HEIGHT:  80 * 0.02,     // eye height above floor = 1.6 units
+      PLAYER_RADIUS:   0.28,         // AABB half-width
 
-      // Collision
-      STEP_HEIGHT:     0.45,        // units — max stair/slope step the player can climb
-      SLOPE_MAX_ANGLE: 50,          // degrees — steeper than this is treated as a wall
-      SKIN_WIDTH:      0.02,        // units — small offset to prevent sinking into surfaces
-      GROUND_CHECK:    0.18,        // units — ground raycast length below the player
-
-      // Raycasting
-      NUM_SIDE_RAYS:   10,           // number of horizontal collision rays around the player
-      NUM_SLOPE_RAYS:  4,           // number of rays used for slope/stair detection below player
+      // Collision tuning
+      STEP_HEIGHT:     0.45,         // max stair step height
+      SLOPE_MAX_ANGLE: 50,           // steeper = wall, not floor (degrees)
+      SKIN_WIDTH:      0.02,         // gap kept from surfaces
     },
 
-    // ── Bloom ──────────────────────────────────────────────────────────────
-    bloomStrength:  0.1,   // overall bloom intensity — higher = stronger glow
-    bloomRadius:    0.4,   // bloom spread radius — higher = wider halo
-    bloomThreshold: 0.2,   // brightness threshold — lower = more surfaces bloom
+    // ── Post-processing bloom ───────────────────────────────────────────────
+    bloomStrength:  0.1,   // glow intensity
+    bloomRadius:    0.4,   // glow spread
+    bloomThreshold: 0.2,   // minimum brightness to bloom
 
     // ── Callbacks ──────────────────────────────────────────────────────────
     onProgress(pct) {
