@@ -323,11 +323,15 @@ export async function initEngine({
       yaw = ps.angle * Math.PI / 180;
     }
 
-    // Collect world meshes for portal wall-occlusion test (NOT for physics)
+    // Collect world meshes for portal wall-occlusion test
     scene.traverse(obj => {
       if (obj.isMesh && obj.geometry && !portalMeshSet.has(obj)) {
-        // Only visible, non-transparent geometry can occlude portals
-        if (!obj.userData.invisible && obj.material?.depthWrite !== false) {
+        // Chceme ignorovat 'noclip' objekty (jako jsou světelné sprity nebo iluze),
+        // aby přes ně šlo klikat.
+        if (obj.userData.noclip) return;
+
+        // Do raycastu zahrneme viditelné objekty A TAKÉ neviditelné clip zdi.
+        if (obj.userData.invisible || obj.material?.depthWrite !== false) {
           worldMeshes.push(obj);
         }
       }
