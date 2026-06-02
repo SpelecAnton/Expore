@@ -3,27 +3,27 @@
  *
  * Changes from v4.0:
  *
- *   FIX 1 — MOVE_EPSILON reduced from 0.01 → 0.001.
- *     The old value was 16× larger than Q3's actual DIST_EPSILON (1/32 Q3-unit ≈ 0.000625
- *     Three.js units).  The brush trace computes the entering fraction as:
- *       f = (d1 - MOVE_EPSILON) / (d1 - d2)
- *     After the first wall collision the player is placed so that d1 == MOVE_EPSILON exactly.
- *     On every subsequent frame, ANY velocity component toward the wall makes d2 < d1, and
- *     therefore f = 0 → the player cannot advance even a single step → wall sticking.
- *     Reducing MOVE_EPSILON makes the zero-fraction threshold unreachable in normal play.
+ * FIX 1 — MOVE_EPSILON reduced from 0.01 → 0.001.
+ * The old value was 16× larger than Q3's actual DIST_EPSILON (1/32 Q3-unit ≈ 0.000625
+ * Three.js units).  The brush trace computes the entering fraction as:
+ * f = (d1 - MOVE_EPSILON) / (d1 - d2)
+ * After the first wall collision the player is placed so that d1 == MOVE_EPSILON exactly.
+ * On every subsequent frame, ANY velocity component toward the wall makes d2 < d1, and
+ * therefore f = 0 → the player cannot advance even a single step → wall sticking.
+ * Reducing MOVE_EPSILON makes the zero-fraction threshold unreachable in normal play.
  *
- *   FIX 2 — Removed velocity-direction clip plane from PM_SlideMove initialisation.
- *     Q3's bg_pmove.c PM_SlideMove only pre-loads the ground normal when on ground.
- *     The extra plane (initial velocity direction) is not part of the Q3 algorithm; in
- *     multi-plane crease situations it can cause the k-plane triple-stop to fire when
- *     only two real surfaces are involved, zeroing velocity against flat walls.
+ * FIX 2 — Removed velocity-direction clip plane from PM_SlideMove initialisation.
+ * Q3's bg_pmove.c PM_SlideMove only pre-loads the ground normal when on ground.
+ * The extra plane (initial velocity direction) is not part of the Q3 algorithm; in
+ * multi-plane crease situations it can cause the k-plane triple-stop to fire when
+ * only two real surfaces are involved, zeroing velocity against flat walls.
  *
  * Everything else is identical to v4.0.
  *
  * Public API (unchanged):
- *   createPhysics(bspCollision, userCFG) → { update, refreshCollidables, teleport,
- *                                            isOnGround, velocityY }
- *   update(camera, keys, yaw, dt) → yaw
+ * createPhysics(bspCollision, userCFG) → { update, refreshCollidables, teleport,
+ * isOnGround, velocityY }
+ * update(camera, keys, yaw, dt) → yaw
  */
 
 'use strict';
@@ -358,6 +358,11 @@ export function createPhysics(bspCollision, userCFG = {}) {
           velocity.x += trace.nx * 0.02;
           velocity.y += trace.ny * 0.02;
           velocity.z += trace.nz * 0.02;
+          
+          // FIX: Nudge musíme aplikovat i na endV, jinak se ve vzduchu přepíše
+          endVX += trace.nx * 0.02;
+          endVY += trace.ny * 0.02;
+          endVZ += trace.nz * 0.02;
           break;
         }
       }
@@ -490,176 +495,3 @@ export function createPhysics(bspCollision, userCFG = {}) {
       velocity.x = slide_v.x; velocity.y = slide_v.y; velocity.z = slide_v.z;
       return;
     }
-
-    if (!tracePush.allSolid) {
-      physPos.x = tracePush.ex; physPos.y = tracePush.ey; physPos.z = tracePush.ez;
-    }
-    if (tracePush.fraction < 1.0) {
-      const cv = clipVel(velocity.x, velocity.y, velocity.z,
-                         tracePush.nx, tracePush.ny, tracePush.nz);
-      velocity.x = cv.vx; velocity.y = cv.vy; velocity.z = cv.vz;
-    }
-  }
-
-  // ── PM_GroundTrace ────────────────────────────────────────────────────────────
-  // Short downward trace to detect and snap to the floor.
-  function PM_GroundTrace() {
-    const tr = traceBox(physPos.x, physPos.y, physPos.z,
-                        physPos.x, physPos.y - GROUND_DIST, physPos.z);
-
-    if (tr.fraction >= 1) {
-      onGround = false;
-      return;
-    }
-
-    if (tr.ny < SLOPE_MIN_Y) {
-      onGround = false; // surface too steep to stand on
-      return;
-    }
-
-    // Kickoff check: if moving upward into the ground normal, we are jumping
-    if (velocity.y > 0) {
-      const into = velocity.x * tr.nx + velocity.y * tr.ny + velocity.z * tr.nz;
-      if (into > 0.2) {
-        onGround = false;
-        return;
-      }
-    }
-
-    // Validate snap position: reject points inside solid (brush junction)
-    const snapTr = traceBox(tr.ex, tr.ey, tr.ez, tr.ex, tr.ey, tr.ez);
-    if (snapTr.allSolid) { onGround = false; return; }
-
-    // Snap and record floor normal
-    physPos.x = tr.ex; physPos.y = tr.ey; physPos.z = tr.ez;
-    groundNX = tr.nx; groundNY = tr.ny; groundNZ = tr.nz;
-    onGround = true;
-
-    if (velocity.y < 0) velocity.y = 0;
-  }
-
-  // ── PM_Friction ───────────────────────────────────────────────────────────────
-  // Q3 pm_friction applied to horizontal velocity only.
-  function PM_Friction(dt) {
-    const hSpeedSq = velocity.x * velocity.x + velocity.z * velocity.z;
-    if (hSpeedSq < 0.0001) { velocity.x = 0; velocity.z = 0; return; }
-
-    const speed    = Math.sqrt(hSpeedSq);
-    const control  = Math.max(speed, STOP_SPEED);
-    const drop     = control * FRICTION * dt;
-    const newSpeed = Math.max(0, speed - drop) / speed;
-
-    velocity.x *= newSpeed;
-    velocity.z *= newSpeed;
-  }
-
-  // ── PM_Accelerate ─────────────────────────────────────────────────────────────
-  // Q3 addspeed clamp: only add velocity toward wishdir up to wishSpeed.
-  function PM_Accelerate(wishDX, wishDZ, wishSpeed, accel, dt) {
-    const wlen = Math.sqrt(wishDX * wishDX + wishDZ * wishDZ);
-    if (wlen < 0.001) return;
-    const wdx = wishDX / wlen, wdz = wishDZ / wlen;
-
-    const curSpeed = velocity.x * wdx + velocity.z * wdz;
-    const addSpeed = wishSpeed - curSpeed;
-    if (addSpeed <= 0) return;
-
-    const accelSpeed = Math.min(accel * dt * wishSpeed, addSpeed);
-    velocity.x += accelSpeed * wdx;
-    velocity.z += accelSpeed * wdz;
-  }
-
-  // ── Main update ───────────────────────────────────────────────────────────────
-  function update(camera, keys, yaw, dt) {
-    dt = Math.min(dt, 0.05);
-
-    // Sync physPos from camera (picks up external position changes like portals)
-    physPos.set(camera.position.x, camera.position.y - halfH, camera.position.z);
-
-    // ── Turning ──────────────────────────────────────────────────────────────
-    if (keys['a'] || keys['arrowleft'])  yaw += CFG.TURN_SPEED * dt;
-    if (keys['d'] || keys['arrowright']) yaw -= CFG.TURN_SPEED * dt;
-
-    // ── Head tilt (Q / E) ────────────────────────────────────────────────────
-    const MAX_PITCH = Math.PI / 4;
-    if (keys['q']) {
-      currentPitch = Math.max(currentPitch - CFG.LOOK_SPEED * dt, -MAX_PITCH);
-    } else if (keys['e']) {
-      currentPitch = Math.min(currentPitch + CFG.LOOK_SPEED * dt, MAX_PITCH);
-    } else if (currentPitch !== 0) {
-      const sign = Math.sign(currentPitch);
-      currentPitch -= sign * CFG.RETURN_SPEED * dt;
-      if (Math.sign(currentPitch) !== sign) currentPitch = 0;
-    }
-    camera.rotation.set(currentPitch, yaw, 0, 'YXZ');
-
-    // ── Jump ─────────────────────────────────────────────────────────────────
-    if ((keys[' '] || keys['space']) && onGround) {
-      velocity.y = CFG.JUMP_SPEED;
-      onGround   = false;
-    }
-
-    // ── Wish direction ────────────────────────────────────────────────────────
-    // A/D = turn only (no strafing).  W/S = forward/backward.
-    let mvZ = 0;
-    if (keys['w'] || keys['arrowup'])   mvZ -= 1;
-    if (keys['s'] || keys['arrowdown']) mvZ += 1;
-
-    const cosY  = Math.cos(yaw), sinY = Math.sin(yaw);
-    const wishDX = mvZ * sinY;
-    const wishDZ = mvZ * cosY;
-
-    // ── Ground movement ───────────────────────────────────────────────────────
-    if (onGround) {
-      PM_Friction(dt);
-      PM_Accelerate(wishDX, wishDZ, CFG.MOVE_SPEED, ACCEL_GROUND, dt);
-
-      // Clip velocity to ground plane (player follows slope surface)
-      const gDot = velocity.x * groundNX + velocity.y * groundNY + velocity.z * groundNZ;
-      if (gDot < 0) {
-        const gb = gDot * OVERCLIP;
-        velocity.x -= groundNX * gb;
-        velocity.y -= groundNY * gb;
-        velocity.z -= groundNZ * gb;
-      }
-      // Zero residual vertical component on flat ground
-      if (groundNY > 0.99) velocity.y = 0;
-
-      PM_StepSlideMove(false, dt);
-
-    } else {
-      // ── Air movement ──────────────────────────────────────────────────────
-      velocity.y = Math.max(velocity.y, CFG.TERMINAL_VEL);
-      PM_Accelerate(wishDX, wishDZ, CFG.MOVE_SPEED, ACCEL_AIR, dt);
-      PM_StepSlideMove(true, dt);
-    }
-
-    // ── Ground trace ─────────────────────────────────────────────────────────
-    PM_GroundTrace();
-
-    // ── Push result back into camera ─────────────────────────────────────────
-    camera.position.set(physPos.x, physPos.y + halfH, physPos.z);
-
-    return yaw;
-  }
-
-  // ── Public API ────────────────────────────────────────────────────────────────
-  return {
-    update,
-
-    // No-op: BSP data is static, no scene traversal needed.
-    // Kept for drop-in compatibility with engine.js.
-    refreshCollidables() {},
-
-    teleport(camera, x, y, z) {
-      camera.position.set(x, y, z);
-      physPos.set(x, y - halfH, z);
-      velocity.set(0, 0, 0);
-      onGround     = false;
-      currentPitch = 0;
-    },
-
-    get isOnGround() { return onGround; },
-    get velocityY()  { return velocity.y; },
-  };
-}
