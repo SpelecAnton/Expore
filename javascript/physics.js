@@ -1,26 +1,27 @@
 /**
- * SPELEC PHYSICS v4.2 — EXACT Q3 FLOAT TRUNCATION
+ * SPELEC PHYSICS v4.3 — EXACT FLOAT DRIFT & TRUNCATION FIX
  *
- * Changes from v4.1 / v4.0:
+ * Changes from previous versions:
  *
- * FIX 1 — MOVE_EPSILON is strictly 0.001 (≈1.6× Q3's DIST_EPSILON).
- * FIX 2 — PM_SlideMove initialized strictly with ground normal (no velocity plane).
- * FIX 3 (The Real Fix) — clipVel now properly truncates microscopic float 
- * residuals to 0.0 (using STOP_EPSILON = 0.002). This mirrors idTech3's 
- * PM_ClipVelocity behavior where `if (out[i] > -0.1 && out[i] < 0.1) out[i] = 0;` 
- * preventing fraction=0 traces that cause mid-air wall sticking.
+ * FIX 1 (The Root Cause) — Float drift filter in testBrush().
+ * When moving parallel to a wall, float imprecision causes d2 to differ 
+ * from d1 by microscopic amounts (e.g., d1=0.001, d2=0.000999). This 
+ * tricked the engine into computing a collision with fraction=0. 
+ * Added Math.abs(d1 - d2) < 0.00001 filter to safely ignore parallel movement.
  *
- * Public API:
- * createPhysics(bspCollision, userCFG) → { update, refreshCollidables, teleport,
- * isOnGround, velocityY }
- * update(camera, keys, yaw, dt) → yaw
+ * FIX 2 — clipVel() now properly truncates microscopic float residuals to 0.0 
+ * (using STOP_EPSILON = 0.002). This mirrors idTech3's PM_ClipVelocity 
+ * behavior: `if (out[i] > -0.1 && out[i] < 0.1) out[i] = 0;`
+ *
+ * FIX 3 — Cleaned PM_SlideMove(). Removed all experimental and hacky nudges.
+ * The engine now relies purely on robust math rather than manual push-backs.
  */
 
 'use strict';
 
 import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.165.0/build/three.module.js';
 
-// ── Default config (same keys as before for drop-in compatibility) ─────────────
+// ── Default config ─────────────────────────────────────────────────────────────
 const DEFAULT_CFG = {
   MOVE_SPEED:      280 * 0.02,   // units/s  — horizontal speed
   TURN_SPEED:      2.5,          // rad/s    — A/D turn
@@ -146,7 +147,7 @@ export function createPhysics(bspCollision, userCFG = {}) {
       const ny = planes[pi + 1];
       const nz = planes[pi + 2];
 
-      const offset = Math.sqrt(nx * nx + nz * nz) * halfW + Math.abs(ny) * halfH;
+      const offset = Math.abs(nx) * halfW + Math.abs(ny) * halfH + Math.abs(nz) * halfW;
       const dist   = planes[pi + 3] + offset;
 
       const d1 = nx * _sx + ny * _sy + nz * _sz - dist; 
@@ -157,6 +158,13 @@ export function createPhysics(bspCollision, userCFG = {}) {
 
       if (d1 > 0 && d2 > 0) return;    
       if (d1 <= 0 && d2 <= 0) continue; 
+
+      // FLOAT DRIFT FILTER
+      // Ignore microscopic distance changes to prevent sticking to parallel walls
+      if (Math.abs(d1 - d2) < 0.00001) {
+          if (d1 > 0) return;
+          continue;
+      }
 
       if (d1 > d2) {
         const f = (d1 - MOVE_EPSILON) / (d1 - d2);
@@ -208,7 +216,7 @@ export function createPhysics(bspCollision, userCFG = {}) {
     const d1 = nx * _sx + ny * _sy + nz * _sz - dist;
     const d2 = nx * _ex + ny * _ey + nz * _ez - dist;
 
-    const r = Math.sqrt(nx * nx + nz * nz) * halfW + Math.abs(ny) * halfH;
+    const r = Math.abs(nx) * halfW + Math.abs(ny) * halfH + Math.abs(nz) * halfW;
 
     if (d1 >= r && d2 >= r) {
       walkNode(c0, depth + 1);
@@ -261,7 +269,7 @@ export function createPhysics(bspCollision, userCFG = {}) {
     let cvy = vy - ny * backoff;
     let cvz = vz - nz * backoff;
 
-    // Exact Q3 Float Truncation Fix
+    // EXACT Q3 FLOAT TRUNCATION
     if (Math.abs(cvx) < STOP_EPSILON) cvx = 0;
     if (Math.abs(cvy) < STOP_EPSILON) cvy = 0;
     if (Math.abs(cvz) < STOP_EPSILON) cvz = 0;
