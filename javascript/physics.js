@@ -146,7 +146,7 @@ export function createPhysics(bspCollision, userCFG = {}) {
       const ny = planes[pi + 1];
       const nz = planes[pi + 2];
 
-      const offset = Math.abs(nx) * halfW + Math.abs(ny) * halfH + Math.abs(nz) * halfW;
+      const offset = Math.sqrt(nx * nx + nz * nz) * halfW + Math.abs(ny) * halfH;
       const dist   = planes[pi + 3] + offset;
 
       const d1 = nx * _sx + ny * _sy + nz * _sz - dist; 
@@ -208,7 +208,7 @@ export function createPhysics(bspCollision, userCFG = {}) {
     const d1 = nx * _sx + ny * _sy + nz * _sz - dist;
     const d2 = nx * _ex + ny * _ey + nz * _ez - dist;
 
-    const r = Math.abs(nx) * halfW + Math.abs(ny) * halfH + Math.abs(nz) * halfW;
+    const r = Math.sqrt(nx * nx + nz * nz) * halfW + Math.abs(ny) * halfH;
 
     if (d1 >= r && d2 >= r) {
       walkNode(c0, depth + 1);
