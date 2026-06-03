@@ -1,550 +1,158 @@
 /**
- * SPELEC PHYSICS v4.3 — EXACT FLOAT DRIFT & TRUNCATION FIX
+ * SPELEC PHYSICS v5.0 — THREE.JS OCTREE + CAPSULE COLLIDER
  *
- * Changes from previous versions:
+ * Replaces BSP brush trace collision (v4.x) with Three.js Octree + Capsule.
  *
- * FIX 1 (The Root Cause) — Float drift filter in testBrush().
- * When moving parallel to a wall, float imprecision causes d2 to differ 
- * from d1 by microscopic amounts (e.g., d1=0.001, d2=0.000999). This 
- * tricked the engine into computing a collision with fraction=0. 
- * Added Math.abs(d1 - d2) < 0.00001 filter to safely ignore parallel movement.
+ * WHY THIS FIXES WALL-STICKING:
+ *   The old AABB/brush-trace system detected collision even when the player moved
+ *   *parallel* to a surface due to floating-point drift (d1 ≈ d2 → fraction ≈ 0).
+ *   A Capsule has two spherical ends that naturally slide along edges and corners.
+ *   capsuleIntersect() only fires when there is actual geometric penetration, so
+ *   parallel movement never triggers a false collision.
  *
- * FIX 2 — clipVel() now properly truncates microscopic float residuals to 0.0 
- * (using STOP_EPSILON = 0.002). This mirrors idTech3's PM_ClipVelocity 
- * behavior: `if (out[i] > -0.1 && out[i] < 0.1) out[i] = 0;`
+ * API (backwards-compatible):
+ *   createPhysics(worldOctree, userCFG)
+ *     worldOctree — THREE.Octree built from world collision meshes (engine.js)
+ *                   Pass null for no collision (player floats — fallback room).
+ *     userCFG     — optional overrides (same keys as before)
  *
- * FIX 3 — Cleaned PM_SlideMove(). Removed all experimental and hacky nudges.
- * The engine now relies purely on robust math rather than manual push-backs.
+ * Movement model:
+ *   Q3-style friction + acceleration on the ground.
+ *   Reduced air acceleration (ACCEL_AIR < ACCEL_GROUND).
+ *   Sub-stepped integration (SUBSTEPS = 5) for stable collision resolution.
+ *
+ * Step climbing:
+ *   The capsule bottom hemisphere (radius R = 0.28 u) naturally rolls over
+ *   obstacles up to ~R high.  Typical Q3 steps are 8 q-units = 0.16 u, which
+ *   is within this range.  Taller steps require a jump.
  */
 
 'use strict';
 
 import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.165.0/build/three.module.js';
+import { Capsule } from 'https://cdn.jsdelivr.net/npm/three@0.165.0/examples/jsm/math/Capsule.js';
 
-// ── Default config ─────────────────────────────────────────────────────────────
+// ── Default config (same keys as v4 for backwards-compat) ─────────────────────
 const DEFAULT_CFG = {
-  MOVE_SPEED:      280 * 0.02,   // units/s  — horizontal speed
-  TURN_SPEED:      2.5,          // rad/s    — A/D turn
-  LOOK_SPEED:      2.5,          // rad/s    — Q/E tilt
-  RETURN_SPEED:    5.0,          // rad/s    — auto-level after Q/E
-  GRAVITY:        -28.0,         // units/s² — negative = downward
-  JUMP_SPEED:      3.0,          // units/s  — initial jump velocity
-  TERMINAL_VEL:  -30.0,         // units/s  — max fall speed
-  PLAYER_HEIGHT:   80 * 0.02,   // units    — eye height above floor (1.6)
-  PLAYER_RADIUS:   0.28,         // units    — AABB x/z half-extent
-  PLAYER_MASS:     1.0,          // (unused)
-  STEP_HEIGHT:     0.45,         // units    — max climbable step
-  SLOPE_MAX_ANGLE: 50,           // degrees  — steeper = wall, not floor
-  SKIN_WIDTH:      0.02,         // units    — (unused in BSP physics)
-  GROUND_CHECK:    0.18,         // (unused, ground detection is fixed-dist)
-  NUM_SIDE_RAYS:   10,           // (unused in BSP physics)
-  NUM_SLOPE_RAYS:  4,            // (unused in BSP physics)
+  MOVE_SPEED:      280 * 0.02,   // walk speed  (units/s)
+  TURN_SPEED:      2.5,          // A/D turning (rad/s)
+  LOOK_SPEED:      2.5,          // Q/E tilt    (rad/s)
+  RETURN_SPEED:    5.0,          // auto-level after Q/E (rad/s)
+  GRAVITY:        -28.0,         // downward accel (units/s²)
+  JUMP_SPEED:      3.0,          // initial jump velocity (units/s)
+  TERMINAL_VEL:  -30.0,          // max fall speed (units/s)
+  PLAYER_HEIGHT:   80 * 0.02,   // eye height above floor (1.6 u)
+  PLAYER_RADIUS:   0.28,         // capsule radius
+  STEP_HEIGHT:     0.45,         // kept for config compatibility (not used explicitly —
+                                 // handled naturally by capsule hemisphere)
+  SLOPE_MAX_ANGLE: 50,           // surfaces steeper than this are walls, not floors (°)
+  SKIN_WIDTH:      0.02,         // kept for config compatibility
 };
 
-// ── Q3 content flags ───────────────────────────────────────────────────────────
-const CONTENTS_SOLID      = 1;
-const CONTENTS_PLAYERCLIP = 0x10000;
+// ── Q3-calibrated movement constants ──────────────────────────────────────────
+const STOP_SPEED   = 100 * 0.02;  // 2.0  — friction scales up below this speed
+const FRICTION     = 6;           // ground friction  (Q3: pm_friction)
+const ACCEL_GROUND = 10;          // ground accel     (Q3: pm_accelerate)
+const ACCEL_AIR    = 1.5;         // air accel        (Q3: pm_airaccelerate)
 
-// ── Trace / clip constants ─────────────────────────────────────────────────────
-// MOVE_EPSILON: gap kept between the AABB surface and brush planes after a trace.
-const MOVE_EPSILON    = 0.001;
-
-// OVERCLIP: Q3 uses 1.001 so velocity is reflected slightly past the plane,
-// guaranteeing the player drifts away rather than skating along it.
-const OVERCLIP        = 1.001;
-
-// INTO_THRESH: only clip velocity against a plane if the player moves at least
-// this fast INTO it.
-const INTO_THRESH     = 0.001;
-
-// STOP_EPSILON: Q3's 0.1 scaled down to Three.js units. Kills float micro-velocities.
-const STOP_EPSILON    = 0.002;
-
-const MAX_CLIP_PLANES = 5;    // max accumulated bounce planes per slide
-const MAX_NODE_DEPTH  = 128;  // BSP recursion guard
-
-// ── Q3-calibrated movement constants (already in Three.js-unit space) ──────────
-const STOP_SPEED   = 100 * 0.02;  // 2.0  — friction ramps up below this speed
-const FRICTION     = 6;           // dimensionless — Q3 pm_friction
-const ACCEL_GROUND = 10;          // Q3 pm_accelerate
-const ACCEL_AIR    = 1.5;         // Q3 pm_airaccelerate (much lower)
-
-// ── Short ground-check distance ────────────────────────────────────────────────
-const GROUND_DIST = 0.12;
-
-// ── Helpers ────────────────────────────────────────────────────────────────────
-function emptyBSP() {
-  return {
-    planes:      new Float32Array(0),
-    nodes:       new Int32Array(0),
-    leafs:       new Int32Array(0),
-    leafBrushes: new Int32Array(0),
-    brushes:     new Int32Array(0),
-    brushSides:  new Int32Array(0),
-  };
-}
+// ── Physics sub-steps ─────────────────────────────────────────────────────────
+// Each frame is split into SUBSTEPS smaller ticks.
+// More steps → less tunnelling and smoother corner resolution.
+// 5 steps at 60 fps → each step ≈ 3.3 ms → max displacement per step ≈ 0.019 u
+// (well below capsule radius 0.28 u, so tunnelling through normal BSP walls is impossible).
+const SUBSTEPS = 5;
 
 // ── createPhysics ──────────────────────────────────────────────────────────────
-export function createPhysics(bspCollision, userCFG = {}) {
+export function createPhysics(worldOctree, userCFG = {}) {
   const CFG = { ...DEFAULT_CFG, ...userCFG };
-  const col  = bspCollision ?? emptyBSP();
-  const { planes, nodes, leafs, leafBrushes, brushes, brushSides } = col;
 
-  const brushCount  = (brushes.length    / 3) | 0;
-  const nodeCount   = (nodes.length      / 3) | 0;
-  const leafCount   = (leafs.length      / 2) | 0;
+  const R = CFG.PLAYER_RADIUS;
+  const H = CFG.PLAYER_HEIGHT;
 
-  // AABB half-extents.
-  const halfW = CFG.PLAYER_RADIUS;
-  const halfH = CFG.PLAYER_HEIGHT / 2;
-
+  // Minimum Y-component of a surface normal to be considered walkable floor.
+  // cos(50°) ≈ 0.643 — surfaces with a shallower normal are cliffs/walls.
   const SLOPE_MIN_Y = Math.cos(CFG.SLOPE_MAX_ANGLE * Math.PI / 180);
-  const STEPSIZE    = CFG.STEP_HEIGHT;
 
-  // ── Player state ────────────────────────────────────────────────────────────
-  const velocity = new THREE.Vector3();
-  const physPos  = new THREE.Vector3(); // AABB centre = camera − (0, halfH, 0)
-  let   onGround      = false;
-  let   groundNX = 0, groundNY = 1, groundNZ = 0; // normal of floor we stand on
-  let   currentPitch  = 0;
-
-  // ── Trace state (reused per call — single-threaded JS) ──────────────────────
-  let _sx, _sy, _sz;   // trace start (AABB centre)
-  let _ex, _ey, _ez;   // trace end   (AABB centre)
-  let _tFrac;           // result: earliest hit fraction
-  let _tNX, _tNY, _tNZ; // result: hit plane normal
-  let _tSolid, _tAllSolid;
-
-  // Brush-deduplication stamp
-  const _stamp    = new Int32Array(Math.max(1, brushCount));
-  let   _stampVal = 0;
-
-  // ── testBrush ────────────────────────────────────────────────────────────────
-  function testBrush(brushIdx) {
-    if (brushIdx < 0 || brushIdx >= brushCount) return;
-    if (_stamp[brushIdx] === _stampVal) return;
-    _stamp[brushIdx] = _stampVal;
-
-    const bi        = brushIdx * 3;
-    const firstSide = brushes[bi];
-    const numSides  = brushes[bi + 1];
-    const contents  = brushes[bi + 2];
-
-    if (!(contents & (CONTENTS_SOLID | CONTENTS_PLAYERCLIP))) return;
-    if (numSides <= 0) return;
-
-    let enterFrac = -1, leaveFrac = 1;
-    let hx = 0, hy = 1, hz = 0;
-    let startsOut = false, endsOut = false;
-
-    for (let s = 0; s < numSides; s++) {
-      const si = firstSide + s;
-      if (si < 0 || si >= brushSides.length) continue;
-      const pi = brushSides[si] * 4;
-      if (pi < 0 || pi + 3 >= planes.length) continue;
-
-      const nx = planes[pi];
-      const ny = planes[pi + 1];
-      const nz = planes[pi + 2];
-
-      const offset = Math.abs(nx) * halfW + Math.abs(ny) * halfH + Math.abs(nz) * halfW;
-      const dist   = planes[pi + 3] + offset;
-
-      const d1 = nx * _sx + ny * _sy + nz * _sz - dist; 
-      const d2 = nx * _ex + ny * _ey + nz * _ez - dist; 
-
-      if (d1 > 0) startsOut = true;
-      if (d2 > 0) endsOut   = true;
-
-      if (d1 > 0 && d2 > 0) return;    
-      if (d1 <= 0 && d2 <= 0) continue; 
-
-      // FLOAT DRIFT FILTER
-      // Ignore microscopic distance changes to prevent sticking to parallel walls
-      if (Math.abs(d1 - d2) < 0.00001) {
-          if (d1 > 0) return;
-          continue;
-      }
-
-      if (d1 > d2) {
-        const f = (d1 - MOVE_EPSILON) / (d1 - d2);
-        if (f > enterFrac) { enterFrac = f; hx = nx; hy = ny; hz = nz; }
-      } else {
-        const f = (d1 + MOVE_EPSILON) / (d1 - d2);
-        if (f < leaveFrac) leaveFrac = f;
-      }
-    }
-
-    if (!startsOut) {
-      _tSolid = true;
-      if (!endsOut) _tAllSolid = true;
-      return;
-    }
-
-    if (enterFrac < leaveFrac && enterFrac > -1 && enterFrac < _tFrac) {
-      _tFrac = Math.max(0, enterFrac);
-      _tNX = hx; _tNY = hy; _tNZ = hz;
-    }
-  }
-
-  // ── walkNode ─────────────────────────────────────────────────────────────────
-  function walkNode(ni, depth) {
-    if (depth > MAX_NODE_DEPTH) return;
-
-    if (ni < 0) {
-      const leafIdx = -(ni + 1);
-      if (leafIdx >= leafCount) return;
-      const lo = leafIdx * 2;
-      const firstLB = leafs[lo], numLB = leafs[lo + 1];
-      for (let i = 0; i < numLB; i++) {
-        const idx = firstLB + i;
-        if (idx < leafBrushes.length) testBrush(leafBrushes[idx]);
-      }
-      return;
-    }
-
-    if (ni >= nodeCount) return;
-    const no       = ni * 3;
-    const pi       = nodes[no] * 4;
-    const c0       = nodes[no + 1];
-    const c1       = nodes[no + 2];
-    if (pi < 0 || pi + 3 >= planes.length) return;
-
-    const nx   = planes[pi], ny = planes[pi + 1], nz = planes[pi + 2];
-    const dist = planes[pi + 3];
-
-    const d1 = nx * _sx + ny * _sy + nz * _sz - dist;
-    const d2 = nx * _ex + ny * _ey + nz * _ez - dist;
-
-    const r = Math.abs(nx) * halfW + Math.abs(ny) * halfH + Math.abs(nz) * halfW;
-
-    if (d1 >= r && d2 >= r) {
-      walkNode(c0, depth + 1);
-    } else if (d1 < -r && d2 < -r) {
-      walkNode(c1, depth + 1);
-    } else {
-      if (d1 >= 0) { walkNode(c0, depth + 1); walkNode(c1, depth + 1); }
-      else         { walkNode(c1, depth + 1); walkNode(c0, depth + 1); }
-    }
-  }
-
-  // ── traceBox ─────────────────────────────────────────────────────────────────
-  function traceBox(sx, sy, sz, ex, ey, ez) {
-    if (nodeCount === 0 || brushCount === 0) {
-      return { fraction: 1, nx: 0, ny: 1, nz: 0,
-               startSolid: false, allSolid: false,
-               ex, ey, ez };
-    }
-
-    if (++_stampVal >= 0x7FFFFFFF) { _stamp.fill(0); _stampVal = 1; }
-
-    _sx = sx; _sy = sy; _sz = sz;
-    _ex = ex; _ey = ey; _ez = ez;
-    _tFrac     = 1;
-    _tNX       = 0; _tNY = 1; _tNZ = 0;
-    _tSolid    = false;
-    _tAllSolid = false;
-
-    walkNode(0, 0);
-
-    const f = _tFrac;
-    return {
-      fraction:   f,
-      nx: _tNX, ny: _tNY, nz: _tNZ,
-      startSolid: _tSolid,
-      allSolid:   _tAllSolid,
-      ex: sx + (ex - sx) * f,
-      ey: sy + (ey - sy) * f,
-      ez: sz + (ez - sz) * f,
-    };
-  }
-
-  // ── PM_ClipVelocity ───────────────────────────────────────────────────────────
-  function clipVel(vx, vy, vz, nx, ny, nz) {
-    let backoff = vx * nx + vy * ny + vz * nz;
-    if (backoff < 0) backoff *= OVERCLIP;
-    else             backoff /= OVERCLIP;
-    
-    let cvx = vx - nx * backoff;
-    let cvy = vy - ny * backoff;
-    let cvz = vz - nz * backoff;
-
-    // EXACT Q3 FLOAT TRUNCATION
-    if (Math.abs(cvx) < STOP_EPSILON) cvx = 0;
-    if (Math.abs(cvy) < STOP_EPSILON) cvy = 0;
-    if (Math.abs(cvz) < STOP_EPSILON) cvz = 0;
-
-    return { vx: cvx, vy: cvy, vz: cvz };
-  }
-
-  // ── PM_SlideMove ─────────────────────────────────────────────────────────────
-  function PM_SlideMove(gravity, dt) {
-    let bumpcount, numbumps = 4;
-    let time_left = dt;
-
-    let primalVX = velocity.x, primalVY = velocity.y, primalVZ = velocity.z;
-    let endVX = velocity.x, endVY = velocity.y, endVZ = velocity.z;
-
-    if (gravity) {
-      endVY = velocity.y + CFG.GRAVITY * dt;
-      velocity.y = (velocity.y + endVY) * 0.5;
-      primalVY = endVY;
-      if (onGround) {
-        const cv = clipVel(velocity.x, velocity.y, velocity.z, groundNX, groundNY, groundNZ);
-        velocity.x = cv.vx; velocity.y = cv.vy; velocity.z = cv.vz;
-      }
-    }
-
-    const pns = [];       
-    let numplanes = 0;
-
-    if (onGround) {
-      pns.push(groundNX, groundNY, groundNZ);
-      numplanes++;
-    }
-
-    for (bumpcount = 0; bumpcount < numbumps; bumpcount++) {
-      const endX = physPos.x + time_left * velocity.x;
-      const endY = physPos.y + time_left * velocity.y;
-      const endZ = physPos.z + time_left * velocity.z;
-
-      const trace = traceBox(physPos.x, physPos.y, physPos.z, endX, endY, endZ);
-
-      if (trace.allSolid) {
-        velocity.y = 0;
-        return true;
-      }
-
-      if (trace.fraction > 0) {
-        physPos.x = trace.ex;
-        physPos.y = trace.ey;
-        physPos.z = trace.ez;
-      }
-
-      if (trace.fraction === 1) {
-        break;
-      }
-
-      time_left -= time_left * trace.fraction;
-
-      if (numplanes >= MAX_CLIP_PLANES) {
-        velocity.x = 0; velocity.y = 0; velocity.z = 0;
-        return true;
-      }
-
-      let i;
-      for (i = 0; i < numplanes; i++) {
-        if (trace.nx * pns[i * 3] + trace.ny * pns[i * 3 + 1] + trace.nz * pns[i * 3 + 2] > 0.99) {
-          velocity.x += trace.nx * 0.02;
-          velocity.y += trace.ny * 0.02;
-          velocity.z += trace.nz * 0.02;
-          break;
-        }
-      }
-      if (i < numplanes) continue;
-
-      pns.push(trace.nx, trace.ny, trace.nz);
-      numplanes++;
-
-      let clipVX = 0, clipVY = 0, clipVZ = 0;
-      let endClipVX = 0, endClipVY = 0, endClipVZ = 0;
-
-      for (i = 0; i < numplanes; i++) {
-        const p_i_nx = pns[i * 3], p_i_ny = pns[i * 3 + 1], p_i_nz = pns[i * 3 + 2];
-        const into = velocity.x * p_i_nx + velocity.y * p_i_ny + velocity.z * p_i_nz;
-
-        if (into >= INTO_THRESH) continue;
-
-        let cv = clipVel(velocity.x, velocity.y, velocity.z, p_i_nx, p_i_ny, p_i_nz);
-        clipVX = cv.vx; clipVY = cv.vy; clipVZ = cv.vz;
-
-        let ecv = clipVel(endVX, endVY, endVZ, p_i_nx, p_i_ny, p_i_nz);
-        endClipVX = ecv.vx; endClipVY = ecv.vy; endClipVZ = ecv.vz;
-
-        let j;
-        for (j = 0; j < numplanes; j++) {
-          if (j === i) continue;
-          const p_j_nx = pns[j * 3], p_j_ny = pns[j * 3 + 1], p_j_nz = pns[j * 3 + 2];
-
-          if (clipVX * p_j_nx + clipVY * p_j_ny + clipVZ * p_j_nz >= INTO_THRESH) continue;
-
-          cv = clipVel(clipVX, clipVY, clipVZ, p_j_nx, p_j_ny, p_j_nz);
-          clipVX = cv.vx; clipVY = cv.vy; clipVZ = cv.vz;
-
-          ecv = clipVel(endClipVX, endClipVY, endClipVZ, p_j_nx, p_j_ny, p_j_nz);
-          endClipVX = ecv.vx; endClipVY = ecv.vy; endClipVZ = ecv.vz;
-
-          if (clipVX * p_i_nx + clipVY * p_i_ny + clipVZ * p_i_nz >= 0) continue;
-
-          let dirX = p_i_ny * p_j_nz - p_i_nz * p_j_ny;
-          let dirY = p_i_nz * p_j_nx - p_i_nx * p_j_nz;
-          let dirZ = p_i_nx * p_j_ny - p_i_ny * p_j_nx;
-          let dirlen = Math.sqrt(dirX * dirX + dirY * dirY + dirZ * dirZ);
-          if (dirlen > 0) {
-            dirX /= dirlen; dirY /= dirlen; dirZ /= dirlen;
-          }
-
-          let d = dirX * velocity.x + dirY * velocity.y + dirZ * velocity.z;
-          clipVX = dirX * d; clipVY = dirY * d; clipVZ = dirZ * d;
-
-          d = dirX * endVX + dirY * endVY + dirZ * endVZ;
-          endClipVX = dirX * d; endClipVY = dirY * d; endClipVZ = dirZ * d;
-
-          let k;
-          for (k = 0; k < numplanes; k++) {
-            if (k === i || k === j) continue;
-            const p_k_nx = pns[k * 3], p_k_ny = pns[k * 3 + 1], p_k_nz = pns[k * 3 + 2];
-
-            if (clipVX * p_k_nx + clipVY * p_k_ny + clipVZ * p_k_nz >= INTO_THRESH) continue;
-
-            velocity.x = 0; velocity.y = 0; velocity.z = 0;
-            return true;
-          }
-        }
-
-        velocity.x = clipVX; velocity.y = clipVY; velocity.z = clipVZ;
-        endVX = endClipVX; endVY = endClipVY; endVZ = endClipVZ;
-        break;
-      }
-    }
-
-    if (gravity) {
-      velocity.x = endVX; velocity.y = endVY; velocity.z = endVZ;
-    } else {
-      velocity.y = primalVY; 
-    }
-
-    return (bumpcount !== 0);
-  }
-
-  // ── PM_StepSlideMove ─────────────────────────────────────────────────────────
-  function PM_StepSlideMove(gravity, dt) {
-    const start_o = { x: physPos.x, y: physPos.y, z: physPos.z };
-    const start_v = { x: velocity.x, y: velocity.y, z: velocity.z };
-
-    if (!PM_SlideMove(gravity, dt)) {
-      return; 
-    }
-
-    const down_o  = { x: start_o.x, y: start_o.y - STEPSIZE, z: start_o.z };
-    const traceDown = traceBox(start_o.x, start_o.y, start_o.z, down_o.x, down_o.y, down_o.z);
-
-    if (velocity.y > 0 && (traceDown.fraction === 1.0 || traceDown.ny < 0.7)) {
-      return;
-    }
-
-    const slide_o = { x: physPos.x, y: physPos.y, z: physPos.z };
-    const slide_v = { x: velocity.x, y: velocity.y, z: velocity.z };
-
-    const up_o    = { x: start_o.x, y: start_o.y + STEPSIZE, z: start_o.z };
-    const traceUp = traceBox(start_o.x, start_o.y, start_o.z, up_o.x, up_o.y, up_o.z);
-
-    if (traceUp.allSolid) {
-      physPos.x = slide_o.x; physPos.y = slide_o.y; physPos.z = slide_o.z;
-      velocity.x = slide_v.x; velocity.y = slide_v.y; velocity.z = slide_v.z;
-      return;
-    }
-
-    const stepSize = traceUp.ey - start_o.y;
-
-    physPos.x = traceUp.ex; physPos.y = traceUp.ey; physPos.z = traceUp.ez;
-    velocity.x = start_v.x; velocity.y = start_v.y; velocity.z = start_v.z;
-
-    PM_SlideMove(gravity, dt);
-
-    const pushDown_o = { x: physPos.x, y: physPos.y - stepSize, z: physPos.z };
-    const tracePush  = traceBox(physPos.x, physPos.y, physPos.z,
-                                pushDown_o.x, pushDown_o.y, pushDown_o.z);
-
-    if (tracePush.fraction < 1.0 && tracePush.ny < SLOPE_MIN_Y) {
-      physPos.x = slide_o.x; physPos.y = slide_o.y; physPos.z = slide_o.z;
-      velocity.x = slide_v.x; velocity.y = slide_v.y; velocity.z = slide_v.z;
-      return;
-    }
-
-    if (!tracePush.allSolid) {
-      physPos.x = tracePush.ex; physPos.y = tracePush.ey; physPos.z = tracePush.ez;
-    }
-    if (tracePush.fraction < 1.0) {
-      const cv = clipVel(velocity.x, velocity.y, velocity.z,
-                         tracePush.nx, tracePush.ny, tracePush.nz);
-      velocity.x = cv.vx; velocity.y = cv.vy; velocity.z = cv.vz;
-    }
-  }
-
-  // ── PM_GroundTrace ────────────────────────────────────────────────────────────
-  function PM_GroundTrace() {
-    const tr = traceBox(physPos.x, physPos.y, physPos.z,
-                        physPos.x, physPos.y - GROUND_DIST, physPos.z);
-
-    if (tr.fraction >= 1) {
-      onGround = false;
-      return;
-    }
-
-    if (tr.ny < SLOPE_MIN_Y) {
-      onGround = false; 
-      return;
-    }
-
-    if (velocity.y > 0) {
-      const into = velocity.x * tr.nx + velocity.y * tr.ny + velocity.z * tr.nz;
-      if (into > 0.2) {
-        onGround = false;
-        return;
-      }
-    }
-
-    const snapTr = traceBox(tr.ex, tr.ey, tr.ez, tr.ex, tr.ey, tr.ez);
-    if (snapTr.allSolid) { onGround = false; return; }
-
-    physPos.x = tr.ex; physPos.y = tr.ey; physPos.z = tr.ez;
-    groundNX = tr.nx; groundNY = tr.ny; groundNZ = tr.nz;
-    onGround = true;
-
-    if (velocity.y < 0) velocity.y = 0;
+  // ── Capsule collider ──────────────────────────────────────────────────────────
+  // start = bottom sphere centre  (R above floor when standing → touches floor)
+  // end   = top sphere centre     = camera / eye level (= floor + H)
+  // The total capsule height (bottom of bottom sphere to top of top sphere) = H + R.
+  const playerCollider = new Capsule(
+    new THREE.Vector3(0, R, 0),
+    new THREE.Vector3(0, H, 0),
+    R
+  );
+
+  const velocity     = new THREE.Vector3();
+  const _tmpVec      = new THREE.Vector3(); // reused scratch vector — never aliased
+  let   onGround     = false;
+  let   currentPitch = 0;
+
+  // ── resolveCollision ──────────────────────────────────────────────────────────
+  // Queries the Octree for capsule penetration and resolves it in one call.
+  // Also redirects velocity to slide along the hit surface (no sticking).
+  function resolveCollision() {
+    if (!worldOctree) return;
+
+    const result = worldOctree.capsuleIntersect(playerCollider);
+    if (!result) return;
+
+    // Project velocity onto the surface plane (removes the component going INTO
+    // the surface).  This is the key sliding fix — the capsule never "catches"
+    // on a surface the player is moving parallel to.
+    const dot = velocity.dot(result.normal);
+    if (dot < 0) velocity.addScaledVector(result.normal, -dot);
+
+    // Mark as on ground if the surface is shallow enough to stand on.
+    if (result.normal.y > SLOPE_MIN_Y) onGround = true;
+
+    // Push the capsule out of the penetrating geometry.
+    // Using _tmpVec to avoid mutating result.normal (which we already read above).
+    _tmpVec.copy(result.normal).multiplyScalar(result.depth);
+    playerCollider.translate(_tmpVec);
   }
 
   // ── PM_Friction ───────────────────────────────────────────────────────────────
+  // Q3-style horizontal friction: ramps up below STOP_SPEED for crisp stops.
   function PM_Friction(dt) {
-    const hSpeedSq = velocity.x * velocity.x + velocity.z * velocity.z;
-    if (hSpeedSq < 0.0001) { velocity.x = 0; velocity.z = 0; return; }
-
-    const speed    = Math.sqrt(hSpeedSq);
+    const speed = Math.sqrt(velocity.x * velocity.x + velocity.z * velocity.z);
+    if (speed < 0.0001) { velocity.x = 0; velocity.z = 0; return; }
     const control  = Math.max(speed, STOP_SPEED);
-    const drop     = control * FRICTION * dt;
-    const newSpeed = Math.max(0, speed - drop) / speed;
-
+    const newSpeed = Math.max(0, speed - control * FRICTION * dt) / speed;
     velocity.x *= newSpeed;
     velocity.z *= newSpeed;
   }
 
   // ── PM_Accelerate ─────────────────────────────────────────────────────────────
+  // Q3-style velocity cap: only accelerate up to wishSpeed in the wish direction.
   function PM_Accelerate(wishDX, wishDZ, wishSpeed, accel, dt) {
     const wlen = Math.sqrt(wishDX * wishDX + wishDZ * wishDZ);
     if (wlen < 0.001) return;
     const wdx = wishDX / wlen, wdz = wishDZ / wlen;
-
     const curSpeed = velocity.x * wdx + velocity.z * wdz;
     const addSpeed = wishSpeed - curSpeed;
     if (addSpeed <= 0) return;
-
     const accelSpeed = Math.min(accel * dt * wishSpeed, addSpeed);
     velocity.x += accelSpeed * wdx;
     velocity.z += accelSpeed * wdz;
   }
 
-  // ── Main update ───────────────────────────────────────────────────────────────
+  // ── update ────────────────────────────────────────────────────────────────────
+  // Called every frame by engine.js.  Mutates camera.position and camera.rotation.
+  // Returns the current yaw so engine.js can persist it.
   function update(camera, keys, yaw, dt) {
-    dt = Math.min(dt, 0.05);
+    dt = Math.min(dt, 0.05); // cap at 50 ms to prevent spiral-of-death
 
-    physPos.set(camera.position.x, camera.position.y - halfH, camera.position.z);
+    // Re-sync the capsule from camera each frame.
+    // camera.y is always the eye level = playerCollider.end.y.
+    playerCollider.end.set(camera.position.x, camera.position.y, camera.position.z);
+    playerCollider.start.set(camera.position.x, camera.position.y - H + R, camera.position.z);
 
-    // ── Turning ──────────────────────────────────────────────────────────────
+    // ── Turning (A / D or arrow keys) ────────────────────────────────────────
     if (keys['a'] || keys['arrowleft'])  yaw += CFG.TURN_SPEED * dt;
     if (keys['d'] || keys['arrowright']) yaw -= CFG.TURN_SPEED * dt;
 
-    // ── Head tilt (Q / E) ────────────────────────────────────────────────────
+    // ── Head tilt (Q / E) — auto-levels when key released ────────────────────
     const MAX_PITCH = Math.PI / 4;
     if (keys['q']) {
       currentPitch = Math.max(currentPitch - CFG.LOOK_SPEED * dt, -MAX_PITCH);
@@ -557,49 +165,55 @@ export function createPhysics(bspCollision, userCFG = {}) {
     }
     camera.rotation.set(currentPitch, yaw, 0, 'YXZ');
 
-    // ── Jump ─────────────────────────────────────────────────────────────────
+    // ── Jump (Space) — only when on ground ───────────────────────────────────
     if ((keys[' '] || keys['space']) && onGround) {
       velocity.y = CFG.JUMP_SPEED;
-      onGround   = false;
+      onGround   = false; // force air-movement controls this frame
     }
 
-    // ── Wish direction ────────────────────────────────────────────────────────
+    // ── Horizontal wish direction (W / S or arrow keys) ───────────────────────
     let mvZ = 0;
     if (keys['w'] || keys['arrowup'])   mvZ -= 1;
     if (keys['s'] || keys['arrowdown']) mvZ += 1;
+    const cosY = Math.cos(yaw), sinY = Math.sin(yaw);
+    const wishDX = mvZ * sinY, wishDZ = mvZ * cosY;
 
-    const cosY  = Math.cos(yaw), sinY = Math.sin(yaw);
-    const wishDX = mvZ * sinY;
-    const wishDZ = mvZ * cosY;
-
-    // ── Ground movement ───────────────────────────────────────────────────────
+    // ── Ground / air movement controls (run once per frame, not per sub-step) ─
+    // Using this frame's onGround value (set by collision in the previous frame).
     if (onGround) {
       PM_Friction(dt);
       PM_Accelerate(wishDX, wishDZ, CFG.MOVE_SPEED, ACCEL_GROUND, dt);
-
-      const gDot = velocity.x * groundNX + velocity.y * groundNY + velocity.z * groundNZ;
-      if (gDot < 0) {
-        const gb = gDot * OVERCLIP;
-        velocity.x -= groundNX * gb;
-        velocity.y -= groundNY * gb;
-        velocity.z -= groundNZ * gb;
-      }
-      if (groundNY > 0.99) velocity.y = 0;
-
-      PM_StepSlideMove(false, dt);
-
     } else {
-      // ── Air movement ──────────────────────────────────────────────────────
-      velocity.y = Math.max(velocity.y, CFG.TERMINAL_VEL);
       PM_Accelerate(wishDX, wishDZ, CFG.MOVE_SPEED, ACCEL_AIR, dt);
-      PM_StepSlideMove(true, dt);
     }
 
-    // ── Ground trace ─────────────────────────────────────────────────────────
-    PM_GroundTrace();
+    // ── Sub-stepped integration ───────────────────────────────────────────────
+    // Reset ground state; collision in each sub-step will re-establish it.
+    // The reset ensures we correctly detect leaving the ground (stepping off edge).
+    onGround = false;
+    const subDt = dt / SUBSTEPS;
 
-    // ── Push result back into camera ─────────────────────────────────────────
-    camera.position.set(physPos.x, physPos.y + halfH, physPos.z);
+    for (let i = 0; i < SUBSTEPS; i++) {
+      // Apply gravity only while airborne (set in this sub-step loop).
+      // On the first sub-step, onGround is always false (reset above), so
+      // a tiny gravity impulse is applied.  If the player is on the floor,
+      // resolveCollision() will set onGround=true and cancel velocity.y,
+      // preventing accumulation.  This is intentional and mirrors id's approach.
+      if (!onGround) {
+        velocity.y = Math.max(velocity.y + CFG.GRAVITY * subDt, CFG.TERMINAL_VEL);
+      }
+
+      // Translate capsule by velocity × sub-step time.
+      _tmpVec.copy(velocity).multiplyScalar(subDt);
+      playerCollider.translate(_tmpVec);
+
+      // Resolve any penetration and slide velocity along surfaces.
+      resolveCollision();
+    }
+
+    // ── Write capsule result back to camera ───────────────────────────────────
+    // playerCollider.end is the top-sphere centre = eye level = camera position.
+    camera.position.copy(playerCollider.end);
 
     return yaw;
   }
@@ -607,14 +221,19 @@ export function createPhysics(bspCollision, userCFG = {}) {
   // ── Public API ────────────────────────────────────────────────────────────────
   return {
     update,
+
+    // No-op: Octree is immutable after creation; kept for API compatibility.
     refreshCollidables() {},
+
     teleport(camera, x, y, z) {
       camera.position.set(x, y, z);
-      physPos.set(x, y - halfH, z);
+      playerCollider.end.set(x, y, z);
+      playerCollider.start.set(x, y - H + R, z);
       velocity.set(0, 0, 0);
       onGround     = false;
       currentPitch = 0;
     },
+
     get isOnGround() { return onGround; },
     get velocityY()  { return velocity.y; },
   };

@@ -1,26 +1,29 @@
 /**
- * SPELEC EXPLORE ENGINE v7.0 — BSP BRUSH PHYSICS
+ * SPELEC EXPLORE ENGINE v8.0 — OCTREE CAPSULE PHYSICS
  *
- * Changes from v6.10:
- *   createPhysics(bspCollision, physicsConfig) — passes BSP brush data instead
- *   of the Three.js scene.  physics.js now does sphere sweep tests against BSP
- *   brushes; no more mesh raycasting for collision.
+ * Changes from v7.0:
+ *   Physics now uses Three.js Octree + Capsule instead of BSP brush traces.
  *
- *   worldMeshes is still built for portal occlusion raycasting (so portals
- *   correctly hide behind walls), but is no longer used for physics.
+ *   buildWorldOctree(scene) collects all solid and clip meshes from the scene
+ *   (excluding portals, noclip objects and sprites) and feeds them into an
+ *   Octree.  The Octree is passed to createPhysics() instead of bspCollision.
  *
- *   Fallback room (BSP load error): bspCollision is null → physics runs with
- *   empty BSP → no collision, player floats.  This is acceptable for the
- *   error case.
+ *   Portal meshes and their children (edge lines, label planes) are marked
+ *   userData.noCollide = true in buildPortal() so they are never added to the
+ *   Octree — the player walks straight through them.
  *
- *   Debug key F: still logs camera position / hash; BSP-specific info
- *   (brush counts, tree depth) is logged at load time.
+ *   worldMeshes is still built for portal-click occlusion raycasting (unchanged).
+ *
+ *   Fallback room: if BSP load fails, _fallbackRoom() creates plain geometry
+ *   that IS included in the Octree, so the player has real collision even in
+ *   the error state (improvement over v7.0 where fallback had no collision).
  */
 
 import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.165.0/build/three.module.js';
 import { EffectComposer }  from 'https://cdn.jsdelivr.net/npm/three@0.165.0/examples/jsm/postprocessing/EffectComposer.js';
 import { RenderPass }      from 'https://cdn.jsdelivr.net/npm/three@0.165.0/examples/jsm/postprocessing/RenderPass.js';
 import { UnrealBloomPass } from 'https://cdn.jsdelivr.net/npm/three@0.165.0/examples/jsm/postprocessing/UnrealBloomPass.js';
+import { Octree }          from 'https://cdn.jsdelivr.net/npm/three@0.165.0/examples/jsm/math/Octree.js';
 import { loadBSP, tickAnimatedTextures, initTexLoader } from 'https://spelecanton.github.io/Expore/javascript/bsp_loader.js';
 import { createPhysics } from 'https://spelecanton.github.io/Expore/javascript/physics.js';
 
@@ -156,6 +159,11 @@ function buildPortal(props, scene, portals) {
 
   buildPortalLabel(label, col, mesh);
   portals.push({ x, y, z, url, label, col, mesh, ptLight, opacity });
+
+  // Mark portal mesh and ALL its children (edge lines, label plane) as
+  // non-collidable so buildWorldOctree() skips them.
+  // The player should walk straight through portals.
+  mesh.traverse(obj => { obj.userData.noCollide = true; });
 }
 
 // ── Light sprite ──────────────────────────────────────────────────────────────
@@ -212,7 +220,7 @@ function addLightSprites(scene, lights) {
     const sprite = new THREE.Sprite(spriteMat);
     sprite.position.set(light.x, light.y, light.z);
     sprite.scale.setScalar(0.5);
-    sprite.userData.noclip = true;
+    sprite.userData.noclip = true; // excluded from Octree by buildWorldOctree()
     scene.add(sprite);
     spriteCount++;
   }
@@ -242,6 +250,44 @@ function _fallbackRoom(scene) {
     scene.add(m);
   }
   scene.add(new THREE.AmbientLight(0x334466, 3));
+}
+
+// ── buildWorldOctree ──────────────────────────────────────────────────────────
+// Iterates all meshes in the scene and adds collision-relevant ones to an Octree.
+//
+// Included:  visible solid meshes, invisible clip-brush meshes (userData.invisible)
+// Excluded:  portal meshes + children  (userData.noCollide — set by buildPortal)
+//            noclip objects            (userData.noclip — func_wall, sprites, etc.)
+//
+// Called AFTER both the BSP load try/catch and (if it failed) _fallbackRoom(),
+// so the fallback room geometry is also properly included.
+function buildWorldOctree(scene) {
+  console.log('[Engine] Building collision Octree...');
+  const t0     = performance.now();
+  const octree = new Octree();
+  let   triCount = 0;
+
+  scene.updateMatrixWorld(true);
+
+  scene.traverse(obj => {
+    if (!obj.isMesh || !obj.geometry) return;
+    if (obj.userData.noCollide) return; // portals and their label/edge children
+    if (obj.userData.noclip)    return; // func_wall, light sprites, etc.
+
+    // Estimate triangle count for the debug log.
+    const idx = obj.geometry.index;
+    triCount += idx ? idx.count / 3 : obj.geometry.attributes.position.count / 3;
+
+    // fromGraphNode on a single Mesh adds only that mesh's triangles to the Octree.
+    // BSP meshes have identity world transforms (vertices already in world space).
+    octree.fromGraphNode(obj);
+  });
+
+  console.log(
+    `[Engine] Octree ready: ~${triCount | 0} triangles` +
+    ` in ${(performance.now() - t0).toFixed(0)} ms`
+  );
+  return octree;
 }
 
 // ── initEngine ────────────────────────────────────────────────────────────────
@@ -282,13 +328,12 @@ export async function initEngine({
     bloomStrength, bloomRadius, bloomThreshold,
   ));
 
-  const portals    = [];
-  let   yaw        = 0;
-  let   bspCollision = null; // will be set from loadBSP result
+  const portals   = [];
+  let   yaw       = 0;
 
-  // worldMeshes: used only for portal occlusion raycast (not physics)
-  const worldMeshes    = [];
-  const portalMeshSet  = new Set();
+  // worldMeshes: used only for portal-click occlusion raycasting (not physics).
+  const worldMeshes   = [];
+  const portalMeshSet = new Set();
 
   const mapBase        = mapBaseFromUrl(mapUrl);
   const bgMusicPromise = findBackgroundMusic(mapBase);
@@ -310,8 +355,8 @@ export async function initEngine({
 
     addLightSprites(scene, result.lights ?? []);
 
-    // BSP collision data — passed directly to createPhysics below
-    bspCollision = result.bspCollision ?? null;
+    // Note: result.bspCollision is intentionally ignored here.
+    // Physics now uses the Octree built from scene meshes (below).
 
     const hashState = readHashState();
     if (hashState) {
@@ -323,14 +368,10 @@ export async function initEngine({
       yaw = ps.angle * Math.PI / 180;
     }
 
-    // Collect world meshes for portal wall-occlusion test
+    // Collect visible + clip meshes for portal occlusion raycasting (unchanged from v7).
     scene.traverse(obj => {
       if (obj.isMesh && obj.geometry && !portalMeshSet.has(obj)) {
-        // Chceme ignorovat 'noclip' objekty (jako jsou světelné sprity nebo iluze),
-        // aby přes ně šlo klikat.
         if (obj.userData.noclip) return;
-
-        // Do raycastu zahrneme viditelné objekty A TAKÉ neviditelné clip zdi.
         if (obj.userData.invisible || obj.material?.depthWrite !== false) {
           worldMeshes.push(obj);
         }
@@ -341,19 +382,23 @@ export async function initEngine({
     console.error('[Engine] BSP load failed:', err);
     _fallbackRoom(scene);
     ambient.intensity = 3;
-    // bspCollision stays null → empty BSP → physics runs without collision
+    // Fallback room meshes are plain geometry with no special userData,
+    // so buildWorldOctree() will include them → player has real collision.
   }
 
-  // ── Physics — now driven by BSP brush data, not scene meshes ─────────────
-  // createPhysics(null) is safe: returns empty BSP physics (player floats).
-  const physics = createPhysics(bspCollision, physicsConfig);
+  // ── Build world Octree for capsule collision ───────────────────────────────
+  // Runs after both the try block and catch block so it always picks up
+  // whatever geometry is currently in the scene (BSP map or fallback room).
+  // Blocks the main thread briefly — the loading screen stays visible during this.
+  const worldOctree = buildWorldOctree(scene);
 
-  // refreshCollidables is a no-op in v3.0 but kept for API compatibility
-  physics.refreshCollidables();
+  // ── Physics — Octree + Capsule (physics.js v5.0) ──────────────────────────
+  const physics = createPhysics(worldOctree, physicsConfig);
+  physics.refreshCollidables(); // no-op in v5.0, kept for API compatibility
 
-  window._cam      = camera;
-  window._physics  = physics;
-  window._scene    = scene;
+  window._cam     = camera;
+  window._physics = physics;
+  window._scene   = scene;
 
   const bgMusic        = await bgMusicPromise;
   let   bgMusicStarted = false;
@@ -394,20 +439,15 @@ export async function initEngine({
     return portals.find(p => p.mesh === portalHits[0].object) ?? null;
   }
 
-  // ── Debug: F key — camera position info ──────────────────────────────────
+  // ── Debug: F key ─────────────────────────────────────────────────────────
   window.addEventListener('keydown', e => {
     if (e.key.toLowerCase() !== 'f') return;
     const pos = camera.position;
     console.log('=== CAMERA DEBUG ===');
-    console.log(`Position: (${pos.x.toFixed(4)}, ${pos.y.toFixed(4)}, ${pos.z.toFixed(4)})`);
-    console.log(`Hash: ${pos.x.toFixed(3)},${pos.y.toFixed(3)},${pos.z.toFixed(3)},${yaw.toFixed(3)}`);
-    console.log(`onGround: ${physics.isOnGround}  velocityY: ${physics.velocityY.toFixed(3)}`);
-    console.log(`BSP collision: ${bspCollision ? 'loaded' : 'NONE (fallback)'}`);
-    if (bspCollision) {
-      console.log(`  planes: ${bspCollision.planes.length / 4}`);
-      console.log(`  nodes:  ${bspCollision.nodes.length / 3}`);
-      console.log(`  brushes: ${bspCollision.brushes.length / 3}`);
-    }
+    console.log(`Position:  (${pos.x.toFixed(4)}, ${pos.y.toFixed(4)}, ${pos.z.toFixed(4)})`);
+    console.log(`Hash:      ${pos.x.toFixed(3)},${pos.y.toFixed(3)},${pos.z.toFixed(3)},${yaw.toFixed(3)}`);
+    console.log(`onGround:  ${physics.isOnGround}   velocityY: ${physics.velocityY.toFixed(3)}`);
+    console.log(`Octree collision: ${worldOctree ? 'ready' : 'NONE'}`);
     console.log('====================');
   }, { passive: true });
 
