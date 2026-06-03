@@ -1,9 +1,7 @@
-# Expore 🚶‍♂️✨
+# Expore 🚶‍♂️✨ (work in progress)
 
 A 3D walking simulator engine made specifically for people who don't know how to make a game.
 I have no idea how to write javascript so this $hit is 99% vibecode
-
-It's work in progress so expect a lot of bugs
 
 ---
 
