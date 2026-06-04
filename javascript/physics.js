@@ -1,10 +1,11 @@
 /**
- * SPELEC PHYSICS v2.9 — ULTIMATE STEP FIX
+ * SPELEC PHYSICS v3.0 — CAPSULE & CCD UPDATE
  *
- * Verze 2.9 řeší problém s nutností "rozeběhnout se" na schody:
- * 1. Zvýšen rádius a počet paprsků v groundCheck (zajišťuje, že duch vždy vidí vršek schodu).
- * 2. Přidán kolizní prstenec těsně u nohou (0.95 H), aby malé překážky neprokluzovaly.
- * 3. Zmenšena epsilon tolerance při porovnávání tras, takže pomalý pohyb nedeaktivuje step.
+ * Změny ve verzi 3.0:
+ * 1. Hráč je nyní reprezentován matematickou kapsulí (zaoblená hlava a nohy), 
+ * což zabraňuje zasekávání o drobné nerovnosti.
+ * 2. Implementována Continuous Collision Detection (CCD) pro osu Y: zabraňuje propadnutí
+ * mapou při extrémních rychlostech pádu přes tenkou podlahu (raycast sweep z předchozí pozice).
  */
 
 import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.165.0/build/three.module.js';
@@ -25,7 +26,7 @@ const DEFAULT_CFG = {
   SKIN_WIDTH:      0.02,
   GROUND_CHECK:    0.18,
   NUM_SIDE_RAYS:   16,
-  NUM_SLOPE_RAYS:  8,   // Zvýšeno pro dokonalé pokrytí plochy pod hráčem
+  NUM_SLOPE_RAYS:  8,
 };
 
 function collectCollidables(scene) {
@@ -34,7 +35,7 @@ function collectCollidables(scene) {
     if (!obj.isMesh || !obj.geometry) return;
     if (obj.userData.noclip) return;
     
-    // OPRAVA: Povolíme kolize pro invisible objekty (CLIP) i v případě problémů s depthWrite
+    // Povolíme kolize pro invisible objekty (CLIP) i v případě problémů s depthWrite
     if (obj.material && obj.material.depthWrite === false && !obj.userData.invisible) {
       return;
     }
@@ -79,7 +80,7 @@ export function createPhysics(scene, userCFG = {}) {
 
   const ray = new THREE.Raycaster();
   ray.firstHitOnly = true;
-  ray.layers.enableAll(); // OPRAVA: Raycaster nyní vidí všechny vrstvy (včetně skryté kolizní vrstvy 1)
+  ray.layers.enableAll(); // Raycaster nyní vidí všechny vrstvy (včetně skryté kolizní vrstvy 1)
 
   function refreshCollidables() {
     scene.updateMatrixWorld(true);
@@ -87,19 +88,39 @@ export function createPhysics(scene, userCFG = {}) {
     collidablesReady = true;
   }
 
-  // ── Collect unique wall normals at a given position ───────────────────────
+  // ── Collect unique wall normals at a given position (CAPSULE SHAPE) ───────
   function collectWalls(position) {
     const walls = [];
 
-    // Vylepšeno: 4 prstence, nejnižší je těsně u nohou, aby zachytil i drobné překážky
+    // Upravené výšky pro lepší definici kapsule
     const checkHeights = [
-      CFG.PLAYER_HEIGHT * 0.15,
-      CFG.PLAYER_HEIGHT * 0.45,
-      CFG.PLAYER_HEIGHT * 0.75,
-      CFG.PLAYER_HEIGHT * 0.95, 
+      CFG.PLAYER_HEIGHT * 0.05, // Vrch hlavy
+      CFG.PLAYER_HEIGHT * 0.25, // Hruď
+      CFG.PLAYER_HEIGHT * 0.50, // Pas
+      CFG.PLAYER_HEIGHT * 0.85, // Kolena (začátek spodního zakřivení)
+      CFG.PLAYER_HEIGHT * 0.95, // Kotníky
     ];
 
+    const R = CFG.PLAYER_RADIUS;
+    const H = CFG.PLAYER_HEIGHT;
+
     for (const yOff of checkHeights) {
+      // VÝPOČET KAPSULE: efektivní poloměr v dané výšce (zaoblení nahoře a dole)
+      let effectiveRadius = R;
+      
+      if (yOff < R) { 
+        // Horní polokoule
+        const d = R - yOff;
+        effectiveRadius = Math.sqrt(Math.max(0, R * R - d * d));
+      } else if (yOff > H - R) { 
+        // Spodní polokoule
+        const d = yOff - (H - R);
+        effectiveRadius = Math.sqrt(Math.max(0, R * R - d * d));
+      }
+
+      // Pokud je zaoblení už příliš úzké, paprsek ignorujeme
+      if (effectiveRadius < 0.01) continue;
+
       _orig.set(position.x, position.y - yOff, position.z);
 
       for (let i = 0; i < CFG.NUM_SIDE_RAYS; i++) {
@@ -107,7 +128,7 @@ export function createPhysics(scene, userCFG = {}) {
         _dir.set(Math.cos(angle), 0, Math.sin(angle));
 
         ray.set(_orig, _dir);
-        ray.far = CFG.PLAYER_RADIUS + CFG.SKIN_WIDTH;
+        ray.far = effectiveRadius + CFG.SKIN_WIDTH; // Dosah přesně kopíruje tvar kapsule
 
         const nearby = nearbyMeshes(collidables, _orig, CFG.PLAYER_RADIUS + 0.5);
         const hits   = ray.intersectObjects(nearby, false);
@@ -131,9 +152,11 @@ export function createPhysics(scene, userCFG = {}) {
 
         const cosAngle = -_dir.dot(normal);
         const perpDist = hit.distance * cosAngle;
-        const pen = CFG.PLAYER_RADIUS - perpDist;
+        
+        // Penetrace počítána oproti zmenšenému poloměru kapsule
+        const pen = effectiveRadius - perpDist;
 
-        walls.push({ flat, pen });
+        if (pen > 0) walls.push({ flat, pen });
       }
     }
 
@@ -187,19 +210,20 @@ export function createPhysics(scene, userCFG = {}) {
     return out;
   }
 
-  // ── Ground detection ──────────────────────────────────────────────────────
-  function groundCheck(position) {
+  // ── Ground detection (s možností fallDistance) ────────────────────────────
+  function groundCheck(position, fallDistance = 0) {
     const offsets = [[0, 0]];
     for (let i = 0; i < CFG.NUM_SLOPE_RAYS; i++) {
       const a = (i / CFG.NUM_SLOPE_RAYS) * Math.PI * 2;
-      // Vylepšeno: Rozšířeno na 95 % poloměru hráče, aby paprsky "našly" okraj schodu
+      // Rozšířeno na 95 % poloměru hráče, aby paprsky "našly" okraj schodu
       offsets.push([
         Math.cos(a) * CFG.PLAYER_RADIUS * 0.95, 
         Math.sin(a) * CFG.PLAYER_RADIUS * 0.95,
       ]);
     }
 
-    const checkDist  = CFG.PLAYER_HEIGHT + CFG.STEP_HEIGHT + 0.2;
+    // Paprsek se prodlouží o vzdálenost pádu, takže zachytí i nekonečně tenkou zem
+    const checkDist  = CFG.PLAYER_HEIGHT + CFG.STEP_HEIGHT + 0.2 + fallDistance;
     let   highestFloor = null;
 
     for (const [ox, oz] of offsets) {
@@ -297,8 +321,6 @@ export function createPhysics(scene, userCFG = {}) {
       const lift = landY - position.y;
 
       if (lift > 0.001 && lift <= CFG.STEP_HEIGHT + 0.05) {
-        // Vylepšeno: Epsilon je zmenšeno na absolutní minimum, 
-        // takže projde i mikroskopický pomalý pohyb vpřed
         if (slidUp.lengthSq() > slidDown.lengthSq() + 0.000001) {
           position.y = landY; 
           return slidUp;      
@@ -391,6 +413,8 @@ export function createPhysics(scene, userCFG = {}) {
 
     // ── Vertical movement ─────────────────────────────────────────────────
     const deltaY = velocity.y * dt;
+    const prevPos = camera.position.clone(); // Uložíme pozici pro sweep raycast
+
     if (velocity.y > 0) {
       const HEAD_GAP  = 0.1;
       const clearance = ceilingClearance(camera.position);
@@ -404,35 +428,15 @@ export function createPhysics(scene, userCFG = {}) {
       camera.position.y += deltaY;
     }
 
-    // ── Ground snap ───────────────────────────────────────────────────────
-    let floorY = groundCheck(camera.position);
-
-    // Swept fallback
-    if (floorY === null && velocity.y <= 0) {
-      const prevPos = camera.position.clone();
-      prevPos.y -= deltaY;
-      const prevFloor = groundCheck(prevPos);
-      if (
-        prevFloor !== null &&
-        prevFloor <= prevPos.y + 0.01 &&
-        prevFloor >= camera.position.y - 0.05
-      ) {
-        floorY = prevFloor;
-      }
-    }
-
-    // Underground recovery
-    if (floorY === null) {
-      const recovered = recoverFromUnderground(camera.position);
-      if (recovered !== null) {
-        camera.position.y = recovered + CFG.SKIN_WIDTH;
-        velocity.y = 0;
-        onGround   = true;
-        floorY     = recovered;
-      }
-    }
+    // ── Ground snap (Continuous Collision Sweep) ──────────────────────────
+    // Spočítáme, jakou vzdálenost jsme propadli, a přidáme ji k délce paprsku
+    const fallDist = velocity.y < 0 ? Math.abs(deltaY) + 0.1 : 0;
+    
+    // Zásadní fix: Střílíme dolů z PŘEDCHOZÍ pozice. Tím protneme jakkoliv tenkou podlahu.
+    let floorY = groundCheck(prevPos, fallDist);
 
     if (floorY !== null) {
+      // Pokud bychom proletěli podlahou, "přilepíme" hráče zpět nahoru
       if (camera.position.y <= floorY + CFG.SKIN_WIDTH * 2) {
         camera.position.y = floorY;
         onGround           = true;
@@ -442,6 +446,17 @@ export function createPhysics(scene, userCFG = {}) {
       }
     } else {
       onGround = false;
+    }
+
+    // ── Underground recovery (Záchrana např. při teleportaci) ─────────────
+    if (!onGround) {
+      const recovered = recoverFromUnderground(camera.position);
+      if (recovered !== null) {
+        camera.position.y = recovered + CFG.SKIN_WIDTH;
+        velocity.y = 0;
+        onGround   = true;
+        floorY     = recovered;
+      }
     }
 
     escapeBrush(camera.position);
