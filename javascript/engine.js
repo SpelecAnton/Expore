@@ -1,5 +1,5 @@
 /**
- * SPELEC EXPLORE ENGINE v8.0 — OCTREE CAPSULE PHYSICS
+ * SPELEC EXPLORE ENGINE v8.1 — OCTREE CAPSULE PHYSICS
  *
  * Changes from v7.0:
  * Physics now uses Three.js Octree + Capsule instead of BSP brush traces.
