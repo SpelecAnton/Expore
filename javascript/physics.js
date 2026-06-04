@@ -1,5 +1,5 @@
 /**
- * SPELEC PHYSICS v5.1 — THREE.JS OCTREE + CAPSULE COLLIDER
+ * SPELEC PHYSICS v5.0 — THREE.JS OCTREE + CAPSULE COLLIDER
  *
  * Replaces BSP brush trace collision (v4.x) with Three.js Octree + Capsule.
  *
@@ -91,26 +91,30 @@ export function createPhysics(worldOctree, userCFG = {}) {
   function resolveCollision() {
     if (!worldOctree) return;
 
-    const result = worldOctree.capsuleIntersect(playerCollider);
-    if (!result) return;
+    // Smyčka vyřeší vícenásobné kolize v koutech a rozích geometrie 
+    // během jednoho fyzikálního podkroku.
+    for (let i = 0; i < 4; i++) {
+      const result = worldOctree.capsuleIntersect(playerCollider);
+      if (!result) break; // Žádná kolize -> hotovo
 
-    let normal = result.normal;
+      let normal = result.normal;
 
-    // 1. Reakce na zem
-    if (normal.y > SLOPE_MIN_Y) {
-      onGround = true;
-      if (velocity.y < 0) velocity.y = 0;
+      // 1. Reakce na zem (detekce pochozího úhlu)
+      if (normal.y > SLOPE_MIN_Y) {
+        onGround = true;
+        if (velocity.y < 0) velocity.y = 0;
+      }
+
+      // 2. Projekce rychlosti (klouzání podél stěn a hran)
+      const dot = velocity.dot(normal);
+      if (dot < 0) {
+        velocity.addScaledVector(normal, -dot);
+      }
+
+      // 3. Vytlačení kapsle ven z geometrie podle hloubky průniku
+      _tmpVec.copy(normal).multiplyScalar(result.depth);
+      playerCollider.translate(_tmpVec);
     }
-
-    // 2. Projekce rychlosti (klouzání)
-    const dot = velocity.dot(normal);
-    if (dot < 0) {
-      velocity.addScaledVector(normal, -dot);
-    }
-
-    // 3. Vytlačení (Three.js Octree vrací normálu směřující ven z geometrie směrem k hráči)
-    _tmpVec.copy(normal).multiplyScalar(result.depth);
-    playerCollider.translate(_tmpVec);
   }
 
   // ── PM_Friction ───────────────────────────────────────────────────────────────
