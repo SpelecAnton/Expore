@@ -88,28 +88,39 @@ export function createPhysics(worldOctree, userCFG = {}) {
   let   onGround     = false;
   let   currentPitch = 0;
 
-  // ── resolveCollision ──────────────────────────────────────────────────────────
-  // Queries the Octree for capsule penetration and resolves it in one call.
-  // Also redirects velocity to slide along the hit surface (no sticking).
-  function resolveCollision() {
+function resolveCollision() {
     if (!worldOctree) return;
 
     const result = worldOctree.capsuleIntersect(playerCollider);
     if (!result) return;
 
-    // Project velocity onto the surface plane (removes the component going INTO
-    // the surface).  This is the key sliding fix — the capsule never "catches"
-    // on a surface the player is moving parallel to.
+    // 1. Změna: Ošetření podlahy
+    // Pokud je normála směrem nahoru, jsme na zemi.
+    if (result.normal.y > SLOPE_MIN_Y) {
+      onGround = true;
+      velocity.y = 0; // Okamžitě zastavit vertikální rychlost při doteku země
+    }
+
+    // 2. Projekce rychlosti (klouzání po stěně)
     const dot = velocity.dot(result.normal);
-    if (dot < 0) velocity.addScaledVector(result.normal, -dot);
+    if (dot < 0) {
+      velocity.addScaledVector(result.normal, -dot);
+    }
 
-    // Mark as on ground if the surface is shallow enough to stand on.
-    if (result.normal.y > SLOPE_MIN_Y) onGround = true;
+    // 3. Ošetření teleportace do země (Limitace posunu)
+    // Pokud je hloubka průniku příliš velká (např. > 0.5), pravděpodobně nejsme 
+    // jen "lehce zaseknutí", ale engine nás poslal do špatného prostoru.
+    // Omezíme maximální posun na rozumnou mez.
+    const maxDepth = 0.2; 
+    const push = _tmpVec.copy(result.normal).multiplyScalar(Math.min(result.depth, maxDepth));
+    
+    // 4. Pokud nás to tlačí dolů (do země), a nejsme v situaci "stropu",
+    // tak tento posun ignorujeme.
+    if (push.y < -0.01 && !onGround) {
+        push.y = 0;
+    }
 
-    // Push the capsule out of the penetrating geometry.
-    // Using _tmpVec to avoid mutating result.normal (which we already read above).
-    _tmpVec.copy(result.normal).multiplyScalar(result.depth);
-    playerCollider.translate(_tmpVec);
+    playerCollider.translate(push);
   }
 
   // ── PM_Friction ───────────────────────────────────────────────────────────────
