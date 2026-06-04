@@ -1,29 +1,26 @@
 /**
- * SPELEC EXPLORE ENGINE v8.1 — OCTREE CAPSULE PHYSICS
+ * SPELEC EXPLORE ENGINE v6.9 — BLOOM + LIGHT SPRITES + DEBUG
  *
- * Changes from v7.0:
- * Physics now uses Three.js Octree + Capsule instead of BSP brush traces.
+ * Změny oproti v6.8:
+ * - UnrealBloomPass přidán přes EffectComposer → globální bloom efekt
+ * - addLightSprites(): pro light entity s _sprite 1 se vytvoří procedurálně
+ * generovaný sprite (canvas textura, glow halo) viditelný ve scéně
+ * - Světla bez _sprite 1 fungují jako dřív — pouze PointLight, žádný sprite
+ * - bloomPass parametry jsou doladěny pro tmavé mapy (strength 0.9, radius 0.4)
  *
- * buildWorldOctree(scene) collects all solid and clip meshes from the scene
- * (excluding portals, noclip objects and sprites) and feeds them into an
- * Octree.  The Octree is passed to createPhysics() instead of bspCollision.
+ * v6.10 — DEBUG:
+ * - Stisknutí F vypisuje groundCheck debug do konzole
+ * - Zjišťuje všechny raycaste z aktuální pozice a ukazuje normály, distance, mesh info
+ * - Pomocí identifikace problémů s propadáním (noclip, depthWrite, matrixWorld apod.)
  *
- * Portal meshes and their children (edge lines, label planes) are marked
- * userData.noCollide = true in buildPortal() so they are never added to the
- * Octree — the player walks straight through them.
- *
- * worldMeshes is still built for portal-click occlusion raycasting (unchanged).
- *
- * Fallback room: if BSP load fails, _fallbackRoom() creates plain geometry
- * that IS included in the Octree, so the player has real collision even in
- * the error state (improvement over v7.0 where fallback had no collision).
+ * FIX: loadBSP nyní předává lights[] do result → addLightSprites() správně
+ * přijímá parsovaná světla z bsp_worker.js včetně _sprite příznaku.
  */
 
 import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.165.0/build/three.module.js';
 import { EffectComposer }  from 'https://cdn.jsdelivr.net/npm/three@0.165.0/examples/jsm/postprocessing/EffectComposer.js';
 import { RenderPass }      from 'https://cdn.jsdelivr.net/npm/three@0.165.0/examples/jsm/postprocessing/RenderPass.js';
 import { UnrealBloomPass } from 'https://cdn.jsdelivr.net/npm/three@0.165.0/examples/jsm/postprocessing/UnrealBloomPass.js';
-import { Octree }          from 'https://cdn.jsdelivr.net/npm/three@0.165.0/examples/jsm/math/Octree.js';
 import { loadBSP, tickAnimatedTextures, initTexLoader } from 'https://spelecanton.github.io/Expore/javascript/bsp_loader.js';
 import { createPhysics } from 'https://spelecanton.github.io/Expore/javascript/physics.js';
 
@@ -32,11 +29,14 @@ const FOV           = 90;
 const UNIT          = 0.02;
 
 // ── URL hash helpers ──────────────────────────────────────────────────────────
+
 function readHashState() {
   const hash = window.location.hash.slice(1);
   if (!hash) return null;
+
   const parts = hash.split(',').map(Number);
   if (parts.length < 4 || parts.some(isNaN)) return null;
+
   return { x: parts[0], y: parts[1], z: parts[2], yaw: parts[3] };
 }
 
@@ -47,6 +47,7 @@ function writeHashState(x, y, z, yaw) {
 }
 
 // ── Audio helpers ─────────────────────────────────────────────────────────────
+
 const AUDIO_EXTS = new Set(['.mp3', '.ogg', '.wav', '.flac', '.aac']);
 
 function isAudioUrl(url) {
@@ -68,7 +69,10 @@ function playPortalAudio(url) {
     return;
   }
 
-  if (_activePortalAudio) { _activePortalAudio.pause(); _activePortalAudio = null; }
+  if (_activePortalAudio) {
+    _activePortalAudio.pause();
+    _activePortalAudio = null;
+  }
 
   const audio = new Audio(resolved);
   audio.play().catch(err => console.warn('[Engine] Portal audio play failed:', err));
@@ -76,21 +80,30 @@ function playPortalAudio(url) {
 }
 
 // ── Background music ──────────────────────────────────────────────────────────
+
 const BG_CANDIDATES = ['background.mp3', 'background.ogg', 'background.wav'];
 
 async function findBackgroundMusic(mapBase) {
   const results = await Promise.all(
     BG_CANDIDATES.map(async file => {
       const url = mapBase + file;
-      try { const res = await fetch(url, { method: 'HEAD' }); return res.ok ? url : null; }
-      catch { return null; }
+      try {
+        const res = await fetch(url, { method: 'HEAD' });
+        return res.ok ? url : null;
+      } catch { return null; }
     })
   );
+
   const url = results.find(Boolean);
-  if (!url) { console.log('[Engine] No background music found.'); return null; }
-  console.log(`[Engine] Background music: ${url}`);
-  const audio = new Audio(url);
-  audio.loop = true; audio.volume = 0.5;
+  if (!url) {
+    console.log('[Engine] No background music found (background.mp3/ogg/wav).');
+    return null;
+  }
+
+  console.log(`[Engine] Background music found: ${url}`);
+  const audio  = new Audio(url);
+  audio.loop   = true;
+  audio.volume = 0.5;
   return audio;
 }
 
@@ -98,26 +111,38 @@ function mapBaseFromUrl(mapUrl) {
   try {
     const abs = new URL(mapUrl, location.href).href;
     return abs.substring(0, abs.lastIndexOf('/') + 1);
-  } catch { return './'; }
+  } catch {
+    return './';
+  }
 }
 
 // ── Portal label ──────────────────────────────────────────────────────────────
+
 function buildPortalLabel(label, col, mesh) {
   if (!label) return null;
+
   const canvas  = document.createElement('canvas');
-  canvas.width  = 512; canvas.height = 80;
+  canvas.width  = 512;
+  canvas.height = 80;
   const ctx = canvas.getContext('2d');
+
   ctx.clearRect(0, 0, 512, 80);
-  ctx.shadowColor = `#${col.getHexString()}`; ctx.shadowBlur = 18;
-  ctx.font = 'bold 30px "Share Tech Mono", monospace';
-  ctx.fillStyle = `#${col.getHexString()}`;
-  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.shadowColor  = `#${col.getHexString()}`;
+  ctx.shadowBlur   = 18;
+  ctx.font         = 'bold 30px "Share Tech Mono", monospace';
+  ctx.fillStyle    = `#${col.getHexString()}`;
+  ctx.textAlign    = 'center';
+  ctx.textBaseline = 'middle';
   ctx.fillText(label.toUpperCase(), 256, 40);
+
   const tex = new THREE.CanvasTexture(canvas);
   tex.needsUpdate = true;
+
   const plane = new THREE.Mesh(
     new THREE.PlaneGeometry(2.8, 0.44),
-    new THREE.MeshBasicMaterial({ map: tex, transparent: true, depthWrite: false, side: THREE.DoubleSide })
+    new THREE.MeshBasicMaterial({
+      map: tex, transparent: true, depthWrite: false, side: THREE.DoubleSide,
+    })
   );
   plane.position.set(0, 0, 0.02);
   mesh.add(plane);
@@ -125,10 +150,12 @@ function buildPortalLabel(label, col, mesh) {
 }
 
 // ── Portal builder ────────────────────────────────────────────────────────────
+
 function buildPortal(props, scene, portals) {
   const [ox, oy, oz] = (props.origin || '0 0 0').split(' ').map(Number);
   const url   = props.target_url || '#';
   const label = props.label ? props.label.trim() : '';
+
   const col   = new THREE.Color().setHex(
     parseInt((props.color || '0xff2200').replace('#', ''), 16)
   );
@@ -137,12 +164,15 @@ function buildPortal(props, scene, portals) {
   const defaultSize = props.size || '110';
   const w = parseFloat(props.width  || defaultSize) * UNIT;
   const h = parseFloat(props.height || defaultSize) * UNIT;
+
   const opacity = Math.max(0, Math.min(1, parseFloat(props.opacity ?? '0.78')));
+
   const x = ox * UNIT, y = oz * UNIT, z = -oy * UNIT;
 
   const geo  = new THREE.PlaneGeometry(w, h);
   const mesh = new THREE.Mesh(geo, new THREE.MeshBasicMaterial({
-    color: col, transparent: true, opacity, side: THREE.DoubleSide, depthWrite: false,
+    color: col, transparent: true, opacity,
+    side: THREE.DoubleSide, depthWrite: false,
   }));
   mesh.position.set(x, y, z);
   mesh.rotation.y = angle;
@@ -158,76 +188,95 @@ function buildPortal(props, scene, portals) {
   scene.add(ptLight);
 
   buildPortalLabel(label, col, mesh);
-  portals.push({ x, y, z, url, label, col, mesh, ptLight, opacity });
 
-  // Mark portal mesh and ALL its children (edge lines, label plane) as
-  // non-collidable so buildWorldOctree() skips them.
-  // The player should walk straight through portals.
-  mesh.traverse(obj => { obj.userData.noCollide = true; });
+  portals.push({ x, y, z, url, label, col, mesh, ptLight, opacity });
 }
 
-// ── Light sprite ──────────────────────────────────────────────────────────────
+// ── Light sprite — procedurálně generovaný bloom sprite ──────────────────────
+
 function makeSpriteTexture(r, g, b) {
   const size = 128;
   const canvas = document.createElement('canvas');
-  canvas.width = canvas.height = size;
+  canvas.width  = size;
+  canvas.height = size;
   const ctx = canvas.getContext('2d');
-  const cx = size / 2, cy = size / 2;
+
+  const cx = size / 2;
+  const cy = size / 2;
 
   const outerGrad = ctx.createRadialGradient(cx, cy, 0, cx, cy, size / 2);
-  outerGrad.addColorStop(0,    `rgba(${(r*255)|0},${(g*255)|0},${(b*255)|0},0.9)`);
-  outerGrad.addColorStop(0.25, `rgba(${(r*255)|0},${(g*255)|0},${(b*255)|0},0.5)`);
-  outerGrad.addColorStop(0.6,  `rgba(${(r*255)|0},${(g*255)|0},${(b*255)|0},0.12)`);
-  outerGrad.addColorStop(1,    `rgba(${(r*255)|0},${(g*255)|0},${(b*255)|0},0)`);
-  ctx.fillStyle = outerGrad; ctx.fillRect(0, 0, size, size);
+  outerGrad.addColorStop(0,    `rgba(${Math.round(r*255)}, ${Math.round(g*255)}, ${Math.round(b*255)}, 0.9)`);
+  outerGrad.addColorStop(0.25, `rgba(${Math.round(r*255)}, ${Math.round(g*255)}, ${Math.round(b*255)}, 0.5)`);
+  outerGrad.addColorStop(0.6,  `rgba(${Math.round(r*255)}, ${Math.round(g*255)}, ${Math.round(b*255)}, 0.12)`);
+  outerGrad.addColorStop(1,    `rgba(${Math.round(r*255)}, ${Math.round(g*255)}, ${Math.round(b*255)}, 0)`);
+
+  ctx.fillStyle = outerGrad;
+  ctx.fillRect(0, 0, size, size);
 
   const coreGrad = ctx.createRadialGradient(cx, cy, 0, cx, cy, size * 0.12);
-  coreGrad.addColorStop(0,   '#ffffff');
-  coreGrad.addColorStop(0.5, `rgba(${(r*255)|0},${(g*255)|0},${(b*255)|0},0.9)`);
-  coreGrad.addColorStop(1,   `rgba(${(r*255)|0},${(g*255)|0},${(b*255)|0},0)`);
-  ctx.fillStyle = coreGrad; ctx.fillRect(0, 0, size, size);
+  coreGrad.addColorStop(0, '#ffffff');
+  coreGrad.addColorStop(0.5, `rgba(${Math.round(r*255)}, ${Math.round(g*255)}, ${Math.round(b*255)}, 0.9)`);
+  coreGrad.addColorStop(1,   `rgba(${Math.round(r*255)}, ${Math.round(g*255)}, ${Math.round(b*255)}, 0)`);
+
+  ctx.fillStyle = coreGrad;
+  ctx.fillRect(0, 0, size, size);
 
   const tex = new THREE.CanvasTexture(canvas);
-  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.colorSpace  = THREE.SRGBColorSpace;
   tex.needsUpdate = true;
   return tex;
 }
 
 const _spriteTexCache = new Map();
+
 function getSpriteTex(r, g, b) {
-  const key = `${(r*15)|0}:${(g*15)|0}:${(b*15)|0}`;
-  if (!_spriteTexCache.has(key)) _spriteTexCache.set(key, makeSpriteTexture(r, g, b));
+  const key = `${(r * 15) | 0}:${(g * 15) | 0}:${(b * 15) | 0}`;
+  if (!_spriteTexCache.has(key)) {
+    _spriteTexCache.set(key, makeSpriteTexture(r, g, b));
+  }
   return _spriteTexCache.get(key);
 }
 
 function addLightSprites(scene, lights) {
-  if (!lights?.length) return;
+  if (!lights || !lights.length) return;
+
   let spriteCount = 0;
+
   for (const light of lights) {
-    const col    = new THREE.Color(light.r, light.g, light.b);
-    const range  = Math.min(20, Math.max(2, light.intensity * 0.05));
-    const intens = Math.min(5, Math.max(0.2, light.intensity * 0.015));
-    const pt     = new THREE.PointLight(col, intens, range);
-    pt.position.set(light.x, light.y, light.z);
-    scene.add(pt);
+    const col = new THREE.Color(light.r, light.g, light.b);
+
+    const range     = Math.min(20, Math.max(2, light.intensity * 0.05));
+    const ptIntens  = Math.min(5, Math.max(0.2, light.intensity * 0.015));
+    const ptLight   = new THREE.PointLight(col, ptIntens, range);
+    ptLight.position.set(light.x, light.y, light.z);
+    scene.add(ptLight);
 
     if (!light.sprite) continue;
+
+    const tex = getSpriteTex(light.r, light.g, light.b);
+
     const spriteMat = new THREE.SpriteMaterial({
-      map: getSpriteTex(light.r, light.g, light.b),
-      transparent: true, depthWrite: false,
-      blending: THREE.AdditiveBlending, color: col,
+      map:         tex,
+      transparent: true,
+      depthWrite:  false,
+      blending:    THREE.AdditiveBlending,
+      color:       col,
     });
+
     const sprite = new THREE.Sprite(spriteMat);
     sprite.position.set(light.x, light.y, light.z);
     sprite.scale.setScalar(0.5);
-    sprite.userData.noclip = true; // excluded from Octree by buildWorldOctree()
+    sprite.userData.noclip = true;
     scene.add(sprite);
+
     spriteCount++;
   }
-  console.log(`[Engine] Lights: ${lights.length} total, ${spriteCount} with sprite`);
+
+  console.log(`[Engine] Světla: ${lights.length} celkem, ${spriteCount} se spritem`);
 }
 
-// ── Fallback room (shown when BSP fails to load) ──────────────────────────────
+// ── Fallback room ─────────────────────────────────────────────────────────────
+
 function _fallbackRoom(scene) {
   const floorMat   = new THREE.MeshLambertMaterial({ color: 0x1a1a2e });
   const wallMat    = new THREE.MeshLambertMaterial({ color: 0x16213e });
@@ -238,7 +287,8 @@ function _fallbackRoom(scene) {
   scene.add(floor);
 
   const ceil = new THREE.Mesh(new THREE.PlaneGeometry(20, 20), ceilingMat);
-  ceil.rotation.x = Math.PI / 2; ceil.position.y = 5;
+  ceil.rotation.x = Math.PI / 2;
+  ceil.position.y = 5;
   scene.add(ceil);
 
   for (const [wx, wy, wz, ry] of [
@@ -246,49 +296,16 @@ function _fallbackRoom(scene) {
     [0, 2.5, -10, Math.PI / 2], [0, 2.5, 10, -Math.PI / 2],
   ]) {
     const m = new THREE.Mesh(new THREE.PlaneGeometry(20, 5), wallMat);
-    m.position.set(wx, wy, wz); m.rotation.y = ry;
+    m.position.set(wx, wy, wz);
+    m.rotation.y = ry;
     scene.add(m);
   }
+
   scene.add(new THREE.AmbientLight(0x334466, 3));
 }
 
-// ── buildWorldOctree ──────────────────────────────────────────────────────────
-function buildWorldOctree(scene) {
-  console.log('[Engine] Building collision Octree...');
-  const t0     = performance.now();
-  const octree = new Octree();
-
-  scene.updateMatrixWorld(true);
-
-  // Step 1 — mask out portal meshes and noclip objects.
-  const masked = [];
-  scene.traverse(obj => {
-    if (!obj.isMesh) return;
-    if (obj.userData.noCollide || obj.userData.noclip) {
-      obj.isMesh = false; // hides this object from fromGraphNode's traversal
-      masked.push(obj);
-    }
-  });
-
-  // Step 2 — single fromGraphNode call (canonical Three.js Octree usage).
-  octree.fromGraphNode(scene);
-
-  // Step 3 — restore masked objects immediately.
-  masked.forEach(obj => { obj.isMesh = true; });
-
-  // Step 4 — Safety check for sub-tree structure.
-  // fromGraphNode() inside Three.js already triggers build() internally. 
-  // Calling build() again on an empty root triangle array would overwrite 
-  // octree.box to an inverted/invalid bounding box, causing collisions to fail.
-  if (octree.triangles.length > 0 && typeof octree.build === 'function') {
-    octree.build();
-  }
-
-  console.log(`[Engine] Octree ready in ${(performance.now() - t0).toFixed(0)} ms`);
-  return octree;
-}
-
 // ── initEngine ────────────────────────────────────────────────────────────────
+
 export async function initEngine({
   canvas,
   mapUrl          = '/explore/hub/maps/hub.bsp',
@@ -321,17 +338,18 @@ export async function initEngine({
 
   const composer = new EffectComposer(renderer);
   composer.addPass(new RenderPass(scene, camera));
-  composer.addPass(new UnrealBloomPass(
+
+  const bloomPass = new UnrealBloomPass(
     new THREE.Vector2(window.innerWidth, window.innerHeight),
-    bloomStrength, bloomRadius, bloomThreshold,
-  ));
+    bloomStrength,
+    bloomRadius,
+    bloomThreshold,
+  );
+  composer.addPass(bloomPass);
 
-  const portals   = [];
-  let   yaw       = 0;
-
-  // worldMeshes: used only for portal-click occlusion raycasting (not physics).
-  const worldMeshes   = [];
-  const portalMeshSet = new Set();
+  const portals    = [];
+  let   yaw        = 0;
+  let   worldMeshes = [];
 
   const mapBase        = mapBaseFromUrl(mapUrl);
   const bgMusicPromise = findBackgroundMusic(mapBase);
@@ -349,35 +367,30 @@ export async function initEngine({
     if (result.ambientIntensity !== undefined) ambient.intensity = result.ambientIntensity;
 
     for (const props of result.portals) buildPortal(props, scene, portals);
-    portals.forEach(p => portalMeshSet.add(p.mesh));
 
     addLightSprites(scene, result.lights ?? []);
 
-    // Note: result.bspCollision is intentionally ignored here.
-    // Physics now uses the Octree built from scene meshes (below).
-
     const hashState = readHashState();
+
     if (hashState) {
       camera.position.set(hashState.x, hashState.y, hashState.z);
       yaw = hashState.yaw;
     } else if (result.playerStart) {
       const ps = result.playerStart;
-      // OPRAVENO: Správný převod Quake BSP os (X=vpravo, Y=dopředu, Z=výška) do Three.js (X=vpravo, Y=výška, Z=-dopředu)
-      camera.position.set(
-        ps.x * UNIT, 
-        (ps.z + PLAYER_HEIGHT) * UNIT, 
-        -ps.y * UNIT
-      );
+      camera.position.set(ps.x, ps.y + PLAYER_HEIGHT * UNIT, ps.z);
       yaw = ps.angle * Math.PI / 180;
-    } 
+    }
 
-    // Collect visible + clip meshes for portal occlusion raycasting (unchanged from v7).
+    const portalMeshSet = new Set(portals.map(p => p.mesh));
     scene.traverse(obj => {
-      if (obj.isMesh && obj.geometry && !portalMeshSet.has(obj)) {
-        if (obj.userData.noclip) return;
-        if (obj.userData.invisible || obj.material?.depthWrite !== false) {
-          worldMeshes.push(obj);
-        }
+      // OPRAVA: Povolení průchodu objektům, které jsou skryté clip stěny
+      if (
+        obj.isMesh &&
+        obj.geometry &&
+        (obj.material?.depthWrite !== false || obj.userData.invisible) &&
+        !portalMeshSet.has(obj)
+      ) {
+        worldMeshes.push(obj);
       }
     });
 
@@ -385,25 +398,22 @@ export async function initEngine({
     console.error('[Engine] BSP load failed:', err);
     _fallbackRoom(scene);
     ambient.intensity = 3;
-    // Fallback room meshes are plain geometry with no special userData,
-    // so buildWorldOctree() will include them → player has real collision.
+
+    scene.traverse(obj => {
+      if (obj.isMesh && obj.geometry && (obj.material?.depthWrite !== false || obj.userData.invisible)) {
+        worldMeshes.push(obj);
+      }
+    });
   }
 
-  // ── Build world Octree for capsule collision ───────────────────────────────
-  // Runs after both the try block and catch block so it always picks up
-  // whatever geometry is currently in the scene (BSP map or fallback room).
-  // Blocks the main thread briefly — the loading screen stays visible during this.
-  const worldOctree = buildWorldOctree(scene);
-
-  // ── Physics — Octree + Capsule (physics.js v5.0) ──────────────────────────
-  const physics = createPhysics(worldOctree, physicsConfig);
-  physics.refreshCollidables(); // no-op in v5.0, kept for API compatibility
+  const physics = createPhysics(scene, physicsConfig);
+  physics.refreshCollidables();
 
   window._cam     = camera;
   window._physics = physics;
   window._scene   = scene;
 
-  const bgMusic        = await bgMusicPromise;
+  const bgMusic = await bgMusicPromise;
   let   bgMusicStarted = false;
 
   function startBgMusic() {
@@ -427,11 +437,14 @@ export async function initEngine({
 
   function getHoveredPortal() {
     if (!portalMeshes.length) return null;
+
     portalRaycaster.setFromCamera(mouseNDC, camera);
     const portalHits = portalRaycaster.intersectObjects(portalMeshes, false);
     if (!portalHits.length) return null;
 
-    const portalDist = portalHits[0].distance;
+    const portalHit  = portalHits[0];
+    const portalDist = portalHit.distance;
+
     wallRaycaster.ray.copy(portalRaycaster.ray);
     wallRaycaster.near = portalRaycaster.near;
     wallRaycaster.far  = portalDist - 0.05;
@@ -439,32 +452,74 @@ export async function initEngine({
     const wallHits = wallRaycaster.intersectObjects(worldMeshes, false);
     if (wallHits.length > 0) return null;
 
-    return portals.find(p => p.mesh === portalHits[0].object) ?? null;
+    return portals.find(p => p.mesh === portalHit.object) ?? null;
   }
 
-  // ── Debug: F key ─────────────────────────────────────────────────────────
+  // ── DEBUG: Ground check raycast na F ────────────────────────────────────────
   window.addEventListener('keydown', e => {
     if (e.key.toLowerCase() !== 'f') return;
+
     const pos = camera.position;
-    console.log('=== CAMERA DEBUG ===');
-    console.log(`Position:  (${pos.x.toFixed(4)}, ${pos.y.toFixed(4)}, ${pos.z.toFixed(4)})`);
-    console.log(`Hash:      ${pos.x.toFixed(3)},${pos.y.toFixed(3)},${pos.z.toFixed(3)},${yaw.toFixed(3)}`);
-    console.log(`onGround:  ${physics.isOnGround}   velocityY: ${physics.velocityY.toFixed(3)}`);
-    console.log(`Octree collision: ${worldOctree ? 'ready' : 'NONE'}`);
+    console.log('=== GROUND DEBUG ===');
+    console.log('Camera pos:', `(${pos.x.toFixed(4)}, ${pos.y.toFixed(4)}, ${pos.z.toFixed(4)})`);
+    console.log('Hash:', `${pos.x.toFixed(1)},${pos.y.toFixed(1)},${pos.z.toFixed(1)},${yaw.toFixed(1)}`);
+
+    const ray = new THREE.Raycaster();
+    ray.firstHitOnly = true;
+
+    const offsets = [[0,0],[0.2,0],[-0.2,0],[0,0.2],[0,-0.2]];
+    
+    for (const [ox, oz] of offsets) {
+      const origin = new THREE.Vector3(pos.x + ox, pos.y + 0.25, pos.z + oz);
+      ray.set(origin, new THREE.Vector3(0, -1, 0));
+      ray.far = 5.0;
+
+      const meshes = [];
+      scene.traverse(obj => {
+        // OPRAVA: Povolení průchodu pro userData.invisible objekty
+        if (obj.isMesh && obj.geometry &&
+            !obj.userData.noclip &&
+            (obj.material?.depthWrite !== false || obj.userData.invisible)) {
+          meshes.push(obj);
+        }
+      });
+
+      const hits = ray.intersectObjects(meshes, false);
+      if (hits.length > 0) {
+        const h = hits[0];
+        const n = h.face?.normal ? h.face.normal.clone().transformDirection(h.object.matrixWorld) : null;
+        console.log(
+          `  offset[${ox.toFixed(1)},${oz.toFixed(1)}]:`,
+          'dist=' + h.distance.toFixed(3),
+          'hitY=' + h.point.y.toFixed(3),
+          'normal=' + (n ? `(${n.x.toFixed(2)},${n.y.toFixed(2)},${n.z.toFixed(2)})` : 'N/A'),
+          'angle=' + (n ? Math.acos(Math.max(-1, Math.min(1, n.dot(new THREE.Vector3(0,1,0))))) * 180 / Math.PI : 'N/A').toFixed(1) + '°',
+          'mesh=' + (h.object.name || h.object.uuid.slice(0, 8)),
+          'matrixOK=' + (h.object.matrixWorld.elements[0] !== 0)
+        );
+      } else {
+        console.log(`  offset[${ox.toFixed(1)},${oz.toFixed(1)}]: NO HIT`);
+      }
+    }
+    
+    console.log('World meshes:', worldMeshes.length);
     console.log('====================');
   }, { passive: true });
 
   const keys = {};
+
   window.addEventListener('keydown', e => {
     keys[e.key.toLowerCase()] = true;
     if (e.key === ' ') e.preventDefault();
     startBgMusic();
     document.querySelectorAll('video').forEach(v => v.play().catch(() => {}));
   });
+
   window.addEventListener('keyup', e => { keys[e.key.toLowerCase()] = false; });
 
   window.addEventListener('click', () => {
     startBgMusic();
+
     const portal = getHoveredPortal();
     if (!portal) return;
 
@@ -496,18 +551,21 @@ export async function initEngine({
 
     tickAnimatedTextures();
 
-    // Animate portals
     for (let i = 0; i < portals.length; i++) {
       const p = portals[i];
       p.mesh.material.opacity = p.opacity;
       p.ptLight.intensity     = 3.0;
     }
 
-    // Periodically write camera position to URL hash
     const now = performance.now();
     if (now - _lastHashWrite >= HASH_WRITE_INTERVAL) {
       _lastHashWrite = now;
-      writeHashState(camera.position.x, camera.position.y, camera.position.z, yaw);
+      writeHashState(
+        camera.position.x,
+        camera.position.y,
+        camera.position.z,
+        yaw
+      );
     }
 
     canvas.style.cursor = getHoveredPortal() ? 'pointer' : 'default';

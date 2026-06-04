@@ -1,164 +1,349 @@
 /**
- * SPELEC PHYSICS v5.0 — THREE.JS OCTREE + CAPSULE COLLIDER
+ * SPELEC PHYSICS v2.9 — ULTIMATE STEP FIX
  *
- * Replaces BSP brush trace collision (v4.x) with Three.js Octree + Capsule.
- *
- * WHY THIS FIXES WALL-STICKING:
- * The old AABB/brush-trace system detected collision even when the player moved
- * *parallel* to a surface due to floating-point drift (d1 ≈ d2 → fraction ≈ 0).
- * A Capsule has two spherical ends that naturally slide along edges and corners.
- * capsuleIntersect() only fires when there is actual geometric penetration, so
- * parallel movement never triggers a false collision.
- *
- * API (backwards-compatible):
- * createPhysics(worldOctree, userCFG)
- * worldOctree — THREE.Octree built from world collision meshes (engine.js)
- * Pass null for no collision (player floats — fallback room).
- * userCFG     — optional overrides (same keys as before)
- *
- * Movement model:
- * Q3-style friction + acceleration on the ground.
- * Reduced air acceleration (ACCEL_AIR < ACCEL_GROUND).
- * Sub-stepped integration (SUBSTEPS = 5) for stable collision resolution.
- *
- * Step climbing:
- * The capsule bottom hemisphere (radius R = 0.28 u) naturally rolls over
- * obstacles up to ~R high.  Typical Q3 steps are 8 q-units = 0.16 u, which
- * is within this range.  Taller steps require a jump.
+ * Verze 2.9 řeší problém s nutností "rozeběhnout se" na schody:
+ * 1. Zvýšen rádius a počet paprsků v groundCheck (zajišťuje, že duch vždy vidí vršek schodu).
+ * 2. Přidán kolizní prstenec těsně u nohou (0.95 H), aby malé překážky neprokluzovaly.
+ * 3. Zmenšena epsilon tolerance při porovnávání tras, takže pomalý pohyb nedeaktivuje step.
  */
 
-'use strict';
-
 import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.165.0/build/three.module.js';
-import { Capsule } from 'https://cdn.jsdelivr.net/npm/three@0.165.0/examples/jsm/math/Capsule.js';
 
-// ── Default config (same keys as v4 for backwards-compat) ─────────────────────
 const DEFAULT_CFG = {
-  MOVE_SPEED:      280 * 0.02,   // walk speed  (units/s)
-  TURN_SPEED:      2.5,          // A/D turning (rad/s)
-  LOOK_SPEED:      2.5,          // Q/E tilt    (rad/s)
-  RETURN_SPEED:    5.0,          // auto-level after Q/E (rad/s)
-  GRAVITY:        -28.0,         // downward accel (units/s²)
-  JUMP_SPEED:      3.0,          // initial jump velocity (units/s)
-  TERMINAL_VEL:  -30.0,          // max fall speed (units/s)
-  PLAYER_HEIGHT:   80 * 0.02,   // eye height above floor (1.6 u)
-  PLAYER_RADIUS:   0.28,         // capsule radius
-  STEP_HEIGHT:     0.45,         // kept for config compatibility (not used explicitly —
-                                 // handled naturally by capsule hemisphere)
-  SLOPE_MAX_ANGLE: 50,           // surfaces steeper than this are walls, not floors (°)
-  SKIN_WIDTH:      0.02,         // kept for config compatibility
+  MOVE_SPEED:      280 * 0.02,
+  TURN_SPEED:      2.5,
+  LOOK_SPEED:      2.5,
+  RETURN_SPEED:    5.0,
+  GRAVITY:        -28.0,
+  JUMP_SPEED:      3.0,
+  TERMINAL_VEL:  -30.0,
+  PLAYER_HEIGHT:   80 * 0.02,
+  PLAYER_RADIUS:   0.28,
+  PLAYER_MASS:     1.0,
+  STEP_HEIGHT:     0.45,
+  SLOPE_MAX_ANGLE: 50,
+  SKIN_WIDTH:      0.02,
+  GROUND_CHECK:    0.18,
+  NUM_SIDE_RAYS:   16,
+  NUM_SLOPE_RAYS:  8,   // Zvýšeno pro dokonalé pokrytí plochy pod hráčem
 };
 
-// ── Q3-calibrated movement constants ──────────────────────────────────────────
-const STOP_SPEED   = 100 * 0.02;  // 2.0  — friction scales up below this speed
-const FRICTION     = 6;           // ground friction  (Q3: pm_friction)
-const ACCEL_GROUND = 10;          // ground accel     (Q3: pm_accelerate)
-const ACCEL_AIR    = 1.5;         // air accel        (Q3: pm_airaccelerate)
+function collectCollidables(scene) {
+  const list = [];
+  scene.traverse(obj => {
+    if (!obj.isMesh || !obj.geometry) return;
+    if (obj.userData.noclip) return;
+    
+    // OPRAVA: Povolíme kolize pro invisible objekty (CLIP) i v případě problémů s depthWrite
+    if (obj.material && obj.material.depthWrite === false && !obj.userData.invisible) {
+      return;
+    }
+    
+    if (!obj.geometry.attributes.position) return;
+    list.push(obj);
+  });
+  return list;
+}
 
-// ── Physics sub-steps ─────────────────────────────────────────────────────────
-// Each frame is split into SUBSTEPS smaller ticks.
-// More steps → less tunnelling and smoother corner resolution.
-// 5 steps at 60 fps → each step ≈ 3.3 ms → max displacement per step ≈ 0.019 u
-// (well below capsule radius 0.28 u, so tunnelling through normal BSP walls is impossible).
-const SUBSTEPS = 5;
+const _sv = new THREE.Vector3();
+const _sc = new THREE.Vector3();
 
-// ── createPhysics ──────────────────────────────────────────────────────────────
-export function createPhysics(worldOctree, userCFG = {}) {
+function nearbyMeshes(collidables, origin, maxDist) {
+  const result = [];
+  for (const mesh of collidables) {
+    if (!mesh.geometry.boundingSphere) mesh.geometry.computeBoundingSphere();
+    _sc.copy(mesh.geometry.boundingSphere.center).applyMatrix4(mesh.matrixWorld);
+    _sv.setFromMatrixScale(mesh.matrixWorld);
+    const s = Math.max(_sv.x, _sv.y, _sv.z);
+    const r = mesh.geometry.boundingSphere.radius * s + maxDist;
+    if (_sc.distanceToSquared(origin) < r * r) result.push(mesh);
+  }
+  return result;
+}
+
+const _up    = new THREE.Vector3(0, 1, 0);
+const _down  = new THREE.Vector3(0, -1, 0);
+const _dir   = new THREE.Vector3();
+const _orig  = new THREE.Vector3();
+const _move  = new THREE.Vector3();
+const _yAxis = new THREE.Vector3(0, 1, 0);
+
+export function createPhysics(scene, userCFG = {}) {
   const CFG = { ...DEFAULT_CFG, ...userCFG };
 
-  const R = CFG.PLAYER_RADIUS;
-  const H = CFG.PLAYER_HEIGHT;
-
-  // Minimum Y-component of a surface normal to be considered walkable floor.
-  // cos(50°) ≈ 0.643 — surfaces with a shallower normal are cliffs/walls.
-  const SLOPE_MIN_Y = Math.cos(CFG.SLOPE_MAX_ANGLE * Math.PI / 180);
-
-  // ── Capsule collider ──────────────────────────────────────────────────────────
-  // start = bottom sphere centre  (R above floor when standing → touches floor)
-  // end   = top sphere centre     = camera / eye level (= floor + H)
-  // The total capsule height (bottom of bottom sphere to top of top sphere) = H + R.
-  const playerCollider = new Capsule(
-    new THREE.Vector3(0, R, 0),
-    new THREE.Vector3(0, H, 0),
-    R
-  );
-
   const velocity     = new THREE.Vector3();
-  const _tmpVec      = new THREE.Vector3(); // reused scratch vector — never aliased
   let   onGround     = false;
+  let   collidables  = [];
   let   currentPitch = 0;
+  let   collidablesReady = false;
 
-  function resolveCollision() {
-    if (!worldOctree) return;
+  const ray = new THREE.Raycaster();
+  ray.firstHitOnly = true;
+  ray.layers.enableAll(); // OPRAVA: Raycaster nyní vidí všechny vrstvy (včetně skryté kolizní vrstvy 1)
 
-    // Smyčka vyřeší vícenásobné kolize v koutech a rozích geometrie 
-    // během jednoho fyzikálního podkroku.
-    for (let i = 0; i < 4; i++) {
-      const result = worldOctree.capsuleIntersect(playerCollider);
-      if (!result) break; // Žádná kolize -> hotovo
+  function refreshCollidables() {
+    scene.updateMatrixWorld(true);
+    collidables = collectCollidables(scene);
+    collidablesReady = true;
+  }
 
-      let normal = result.normal;
+  // ── Collect unique wall normals at a given position ───────────────────────
+  function collectWalls(position) {
+    const walls = [];
 
-      // 1. Reakce na zem (detekce pochozího úhlu)
-      if (normal.y > SLOPE_MIN_Y) {
-        onGround = true;
-        if (velocity.y < 0) velocity.y = 0;
+    // Vylepšeno: 4 prstence, nejnižší je těsně u nohou, aby zachytil i drobné překážky
+    const checkHeights = [
+      CFG.PLAYER_HEIGHT * 0.15,
+      CFG.PLAYER_HEIGHT * 0.45,
+      CFG.PLAYER_HEIGHT * 0.75,
+      CFG.PLAYER_HEIGHT * 0.95, 
+    ];
+
+    for (const yOff of checkHeights) {
+      _orig.set(position.x, position.y - yOff, position.z);
+
+      for (let i = 0; i < CFG.NUM_SIDE_RAYS; i++) {
+        const angle = (i / CFG.NUM_SIDE_RAYS) * Math.PI * 2;
+        _dir.set(Math.cos(angle), 0, Math.sin(angle));
+
+        ray.set(_orig, _dir);
+        ray.far = CFG.PLAYER_RADIUS + CFG.SKIN_WIDTH;
+
+        const nearby = nearbyMeshes(collidables, _orig, CFG.PLAYER_RADIUS + 0.5);
+        const hits   = ray.intersectObjects(nearby, false);
+        if (!hits.length) continue;
+
+        const hit = hits[0];
+        let normal = hit.face?.normal
+          .clone()
+          .transformDirection(hit.object.matrixWorld)
+          ?? new THREE.Vector3();
+        if (normal.dot(_dir) > 0) normal.negate();
+
+        const slopeAngle = Math.acos(
+          Math.max(-1, Math.min(1, normal.dot(_up)))
+        ) * (180 / Math.PI);
+        if (slopeAngle <= CFG.SLOPE_MAX_ANGLE) continue;
+
+        const flat = new THREE.Vector3(normal.x, 0, normal.z).normalize();
+        if (flat.lengthSq() < 0.001) continue;
+        if (walls.some(w => w.flat.dot(flat) > 0.85)) continue;
+
+        const cosAngle = -_dir.dot(normal);
+        const perpDist = hit.distance * cosAngle;
+        const pen = CFG.PLAYER_RADIUS - perpDist;
+
+        walls.push({ flat, pen });
+      }
+    }
+
+    return walls;
+  }
+
+  // ── Push position directly out of wall penetrations ───────────────────────
+  function pushOutOfWalls(position) {
+    for (let iter = 0; iter < 3; iter++) {
+      const walls = collectWalls(position);
+      let maxPen = 0;
+      let bestFlat = null;
+
+      for (const { flat, pen } of walls) {
+        if (pen > maxPen) {
+          maxPen = pen;
+          bestFlat = flat;
+        }
       }
 
-      // 2. Projekce rychlosti (klouzání podél stěn a hran)
-      const dot = velocity.dot(normal);
-      if (dot < 0) {
-        velocity.addScaledVector(normal, -dot);
+      if (maxPen > 0.001 && bestFlat) {
+        position.addScaledVector(bestFlat, maxPen * 1.005);
+      } else {
+        break; 
       }
-
-      // 3. Vytlačení kapsle ven z geometrie podle hloubky průniku
-      _tmpVec.copy(normal).multiplyScalar(result.depth);
-      playerCollider.translate(_tmpVec);
     }
   }
 
-  // ── PM_Friction ───────────────────────────────────────────────────────────────
-  // Q3-style horizontal friction: ramps up below STOP_SPEED for crisp stops.
-  function PM_Friction(dt) {
-    const speed = Math.sqrt(velocity.x * velocity.x + velocity.z * velocity.z);
-    if (speed < 0.0001) { velocity.x = 0; velocity.z = 0; return; }
-    const control  = Math.max(speed, STOP_SPEED);
-    const newSpeed = Math.max(0, speed - control * FRICTION * dt) / speed;
-    velocity.x *= newSpeed;
-    velocity.z *= newSpeed;
+  // ── Clip movement delta against wall planes ───────────────────────────────
+  function slideMove(position, delta) {
+    const walls = collectWalls(position);
+    const out   = delta.clone();
+    const clippedPlanes = [];
+
+    for (const { flat } of walls) {
+      const d = out.dot(flat);
+      if (d < 0) {
+        out.addScaledVector(flat, -d);
+
+        for (const prevFlat of clippedPlanes) {
+          if (out.dot(prevFlat) < -0.001) {
+            const crease = new THREE.Vector3().crossVectors(flat, prevFlat).normalize();
+            const speed = delta.dot(crease);
+            out.copy(crease).multiplyScalar(speed);
+            break; 
+          }
+        }
+        clippedPlanes.push(flat);
+      }
+    }
+    return out;
   }
 
-  // ── PM_Accelerate ─────────────────────────────────────────────────────────────
-  // Q3-style velocity cap: only accelerate up to wishSpeed in the wish direction.
-  function PM_Accelerate(wishDX, wishDZ, wishSpeed, accel, dt) {
-    const wlen = Math.sqrt(wishDX * wishDX + wishDZ * wishDZ);
-    if (wlen < 0.001) return;
-    const wdx = wishDX / wlen, wdz = wishDZ / wlen;
-    const curSpeed = velocity.x * wdx + velocity.z * wdz;
-    const addSpeed = wishSpeed - curSpeed;
-    if (addSpeed <= 0) return;
-    const accelSpeed = Math.min(accel * dt * wishSpeed, addSpeed);
-    velocity.x += accelSpeed * wdx;
-    velocity.z += accelSpeed * wdz;
+  // ── Ground detection ──────────────────────────────────────────────────────
+  function groundCheck(position) {
+    const offsets = [[0, 0]];
+    for (let i = 0; i < CFG.NUM_SLOPE_RAYS; i++) {
+      const a = (i / CFG.NUM_SLOPE_RAYS) * Math.PI * 2;
+      // Vylepšeno: Rozšířeno na 95 % poloměru hráče, aby paprsky "našly" okraj schodu
+      offsets.push([
+        Math.cos(a) * CFG.PLAYER_RADIUS * 0.95, 
+        Math.sin(a) * CFG.PLAYER_RADIUS * 0.95,
+      ]);
+    }
+
+    const checkDist  = CFG.PLAYER_HEIGHT + CFG.STEP_HEIGHT + 0.2;
+    let   highestFloor = null;
+
+    for (const [ox, oz] of offsets) {
+      _orig.set(position.x + ox, position.y, position.z + oz);
+      ray.set(_orig, _down);
+      ray.far = checkDist;
+
+      const nearby = nearbyMeshes(collidables, _orig, checkDist);
+      const hits   = ray.intersectObjects(nearby, false);
+      if (!hits.length) continue;
+
+      const hit = hits[0];
+      let normal = hit.face?.normal
+        .clone()
+        .transformDirection(hit.object.matrixWorld)
+        ?? _up.clone();
+      if (normal.dot(_down) > 0) normal.negate();
+
+      const angle = Math.acos(
+        Math.max(-1, Math.min(1, normal.dot(_up)))
+      ) * (180 / Math.PI);
+
+      if (angle < CFG.SLOPE_MAX_ANGLE) {
+        const eyeY = hit.point.y + CFG.PLAYER_HEIGHT;
+        if (highestFloor === null || eyeY > highestFloor) highestFloor = eyeY;
+      }
+    }
+
+    return highestFloor;
   }
 
-  // ── update ────────────────────────────────────────────────────────────────────
-  // Called every frame by engine.js.  Mutates camera.position and camera.rotation.
-  // Returns the current yaw so engine.js can persist it.
+  // ── Ceiling clearance at a given position ─────────────────────────────────
+  function ceilingClearance(position) {
+    _orig.set(position.x, position.y, position.z);
+    ray.set(_orig, _up);
+    ray.far = 4.0;
+
+    const nearby = nearbyMeshes(collidables, _orig, ray.far);
+    const hits   = ray.intersectObjects(nearby, false);
+    return hits.length ? hits[0].distance : Infinity;
+  }
+
+  // ── Underground recovery ──────────────────────────────────────────────────
+  function recoverFromUnderground(position) {
+    _orig.set(position.x, position.y - CFG.PLAYER_HEIGHT - 0.05, position.z);
+    ray.set(_orig, _up);
+    ray.far = CFG.PLAYER_HEIGHT + 0.6;
+
+    const nearby = nearbyMeshes(collidables, _orig, ray.far);
+    const hits   = ray.intersectObjects(nearby, false);
+    if (!hits.length) return null;
+
+    const hit = hits[0];
+    let normal = hit.face?.normal
+      .clone()
+      .transformDirection(hit.object.matrixWorld)
+      ?? _up.clone();
+    if (normal.dot(_up) > 0) return null;
+
+    const angle = Math.acos(
+      Math.max(-1, Math.min(1, Math.abs(normal.dot(_up))))
+    ) * (180 / Math.PI);
+
+    return angle < CFG.SLOPE_MAX_ANGLE
+      ? hit.point.y + CFG.PLAYER_HEIGHT
+      : null;
+  }
+
+  // ── Quake-style PM_StepSlideMove ──────────────────────────────────────────
+  function quakeStepSlideMove(position, intentMove) {
+    if (!onGround || intentMove.lengthSq() < 0.00001) {
+      return slideMove(position, intentMove); 
+    }
+
+    const slidDown = slideMove(position, intentMove);
+
+    if (slidDown.lengthSq() >= intentMove.lengthSq() * 0.99) {
+      return slidDown;
+    }
+
+    if (ceilingClearance(position) < CFG.STEP_HEIGHT + 0.1) {
+      return slidDown;
+    }
+
+    const posUp = position.clone();
+    posUp.y += CFG.STEP_HEIGHT;
+
+    const slidUp = slideMove(posUp, intentMove);
+    posUp.x += slidUp.x;
+    posUp.z += slidUp.z;
+
+    const landY = groundCheck(posUp);
+
+    if (landY !== null) {
+      const lift = landY - position.y;
+
+      if (lift > 0.001 && lift <= CFG.STEP_HEIGHT + 0.05) {
+        // Vylepšeno: Epsilon je zmenšeno na absolutní minimum, 
+        // takže projde i mikroskopický pomalý pohyb vpřed
+        if (slidUp.lengthSq() > slidDown.lengthSq() + 0.000001) {
+          position.y = landY; 
+          return slidUp;      
+        }
+      }
+    }
+
+    return slidDown;
+  }
+
+  // ── Brush escape ──────────────────────────────────────────────────────────
+  function escapeBrush(position) {
+    const escapeR = CFG.PLAYER_RADIUS * 1.5;
+    for (const mesh of collidables) {
+      if (!mesh.geometry.boundingSphere) continue;
+      _sc.copy(mesh.geometry.boundingSphere.center).applyMatrix4(mesh.matrixWorld);
+      _sv.setFromMatrixScale(mesh.matrixWorld);
+      const s = Math.max(_sv.x, _sv.y, _sv.z);
+      const r = mesh.geometry.boundingSphere.radius * s;
+      if (r > 3.0) continue;
+
+      const dist = _sc.distanceTo(position);
+      if (dist < escapeR) {
+        const out = new THREE.Vector3()
+          .subVectors(position, _sc)
+          .setY(0)
+          .normalize();
+        if (out.lengthSq() > 0.001) {
+          position.addScaledVector(out, escapeR - dist);
+        }
+      }
+    }
+  }
+
+  // ── Main update ───────────────────────────────────────────────────────────
   function update(camera, keys, yaw, dt) {
-    dt = Math.min(dt, 0.05); // cap at 50 ms to prevent spiral-of-death
+    dt = Math.min(dt, 0.05);
+    if (!collidablesReady) refreshCollidables();
 
-    // Re-sync the capsule from camera each frame.
-    // camera.y is always the eye level = playerCollider.end.y.
-    playerCollider.end.set(camera.position.x, camera.position.y, camera.position.z);
-    playerCollider.start.set(camera.position.x, camera.position.y - H + R, camera.position.z);
-
-    // ── Turning (A / D or arrow keys) ────────────────────────────────────────
+    // Turning
     if (keys['a'] || keys['arrowleft'])  yaw += CFG.TURN_SPEED * dt;
     if (keys['d'] || keys['arrowright']) yaw -= CFG.TURN_SPEED * dt;
 
-    // ── Head tilt (Q / E) — auto-levels when key released ────────────────────
-    const MAX_PITCH = Math.PI / 4;
+    // Head tilt
+    const MAX_PITCH = 45 * (Math.PI / 180);
     if (keys['q']) {
       currentPitch = Math.max(currentPitch - CFG.LOOK_SPEED * dt, -MAX_PITCH);
     } else if (keys['e']) {
@@ -170,75 +355,109 @@ export function createPhysics(worldOctree, userCFG = {}) {
     }
     camera.rotation.set(currentPitch, yaw, 0, 'YXZ');
 
-    // ── Jump (Space) — only when on ground ───────────────────────────────────
+    // Horizontal input
+    _move.set(0, 0, 0);
+    if (keys['w'] || keys['arrowup'])   _move.z -= 1;
+    if (keys['s'] || keys['arrowdown']) _move.z += 1;
+    if (_move.lengthSq() > 0) {
+      _move.normalize()
+        .multiplyScalar(CFG.MOVE_SPEED * dt)
+        .applyAxisAngle(_yAxis, yaw);
+    }
+
+    // Jump
     if ((keys[' '] || keys['space']) && onGround) {
       velocity.y = CFG.JUMP_SPEED;
-      onGround   = false; // force air-movement controls this frame
+      onGround   = false;
     }
 
-    // ── Horizontal wish direction (W / S or arrow keys) ───────────────────────
-    let mvZ = 0;
-    if (keys['w'] || keys['arrowup'])   mvZ -= 1;
-    if (keys['s'] || keys['arrowdown']) mvZ += 1;
-    const cosY = Math.cos(yaw), sinY = Math.sin(yaw);
-    const wishDX = mvZ * sinY, wishDZ = mvZ * cosY;
-
-    // ── Ground / air movement controls (run once per frame, not per sub-step) ─
-    // Using this frame's onGround value (set by collision in the previous frame).
-    if (onGround) {
-      PM_Friction(dt);
-      PM_Accelerate(wishDX, wishDZ, CFG.MOVE_SPEED, ACCEL_GROUND, dt);
+    // Vertical velocity
+    if (!onGround) {
+      velocity.y += CFG.GRAVITY * dt;
+      velocity.y  = Math.max(velocity.y, CFG.TERMINAL_VEL);
     } else {
-      PM_Accelerate(wishDX, wishDZ, CFG.MOVE_SPEED, ACCEL_AIR, dt);
+      velocity.y = Math.min(velocity.y, 0);
     }
 
-    // ── Sub-stepped integration ───────────────────────────────────────────────
-    // Reset ground state; collision in each sub-step will re-establish it.
-    // The reset ensures we correctly detect leaving the ground (stepping off edge).
-    onGround = false;
-    const subDt = dt / SUBSTEPS;
+    // ── Horizontal movement pipeline ──────────────────────────────────────
+    pushOutOfWalls(camera.position);
 
-    for (let i = 0; i < SUBSTEPS; i++) {
-      // Apply gravity only while airborne (set in this sub-step loop).
-      // On the first sub-step, onGround is always false (reset above), so
-      // a tiny gravity impulse is applied.  If the player is on the floor,
-      // resolveCollision() will set onGround=true and cancel velocity.y,
-      // preventing accumulation.  This is intentional and mirrors id's approach.
-      if (!onGround) {
-        velocity.y = Math.max(velocity.y + CFG.GRAVITY * subDt, CFG.TERMINAL_VEL);
+    const finalSlid = quakeStepSlideMove(camera.position, _move);
+
+    camera.position.x += finalSlid.x;
+    camera.position.z += finalSlid.z;
+
+    pushOutOfWalls(camera.position);
+
+    // ── Vertical movement ─────────────────────────────────────────────────
+    const deltaY = velocity.y * dt;
+    if (velocity.y > 0) {
+      const HEAD_GAP  = 0.1;
+      const clearance = ceilingClearance(camera.position);
+      if (deltaY >= clearance - HEAD_GAP) {
+        camera.position.y += Math.max(0, clearance - HEAD_GAP);
+        velocity.y = 0;
+      } else {
+        camera.position.y += deltaY;
       }
-
-      // Translate capsule by velocity × sub-step time.
-      _tmpVec.copy(velocity).multiplyScalar(subDt);
-      playerCollider.translate(_tmpVec);
-
-      // Resolve any penetration and slide velocity along surfaces.
-      resolveCollision();
+    } else {
+      camera.position.y += deltaY;
     }
 
-    // ── Write capsule result back to camera ───────────────────────────────────
-    // playerCollider.end is the top-sphere centre = eye level = camera position.
-    camera.position.copy(playerCollider.end);
+    // ── Ground snap ───────────────────────────────────────────────────────
+    let floorY = groundCheck(camera.position);
+
+    // Swept fallback
+    if (floorY === null && velocity.y <= 0) {
+      const prevPos = camera.position.clone();
+      prevPos.y -= deltaY;
+      const prevFloor = groundCheck(prevPos);
+      if (
+        prevFloor !== null &&
+        prevFloor <= prevPos.y + 0.01 &&
+        prevFloor >= camera.position.y - 0.05
+      ) {
+        floorY = prevFloor;
+      }
+    }
+
+    // Underground recovery
+    if (floorY === null) {
+      const recovered = recoverFromUnderground(camera.position);
+      if (recovered !== null) {
+        camera.position.y = recovered + CFG.SKIN_WIDTH;
+        velocity.y = 0;
+        onGround   = true;
+        floorY     = recovered;
+      }
+    }
+
+    if (floorY !== null) {
+      if (camera.position.y <= floorY + CFG.SKIN_WIDTH * 2) {
+        camera.position.y = floorY;
+        onGround           = true;
+        velocity.y         = 0;
+      } else {
+        onGround = false;
+      }
+    } else {
+      onGround = false;
+    }
+
+    escapeBrush(camera.position);
 
     return yaw;
   }
 
-  // ── Public API ────────────────────────────────────────────────────────────────
   return {
     update,
-
-    // No-op: Octree is immutable after creation; kept for API compatibility.
-    refreshCollidables() {},
-
+    refreshCollidables,
     teleport(camera, x, y, z) {
       camera.position.set(x, y, z);
-      playerCollider.end.set(x, y, z);
-      playerCollider.start.set(x, y - H + R, z);
       velocity.set(0, 0, 0);
-      onGround     = false;
+      onGround    = false;
       currentPitch = 0;
     },
-
     get isOnGround() { return onGround; },
     get velocityY()  { return velocity.y; },
   };
