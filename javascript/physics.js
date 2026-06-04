@@ -1,5 +1,5 @@
 /**
- * SPELEC PHYSICS v5.0 — THREE.JS OCTREE + CAPSULE COLLIDER
+ * SPELEC PHYSICS v5.1 — THREE.JS OCTREE + CAPSULE COLLIDER
  *
  * Replaces BSP brush trace collision (v4.x) with Three.js Octree + Capsule.
  *
