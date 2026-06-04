@@ -163,9 +163,11 @@ export function createPhysics(scene, userCFG = {}) {
     return walls;
   }
 
-  // ── Push position directly out of wall penetrations ───────────────────────
+// ── Push position safely out of wall penetrations ────────────────────────
   function pushOutOfWalls(position) {
-    for (let iter = 0; iter < 3; iter++) {
+    // Omezíme počet iterací a přidáme limit na sílu odsunu (max 0.1 jednotky na krok)
+    // aby nás to nevystřelilo mimo mapu při náhlém zasekutí
+    for (let iter = 0; iter < 2; iter++) {
       const walls = collectWalls(position);
       let maxPen = 0;
       let bestFlat = null;
@@ -177,8 +179,11 @@ export function createPhysics(scene, userCFG = {}) {
         }
       }
 
-      if (maxPen > 0.001 && bestFlat) {
-        position.addScaledVector(bestFlat, maxPen * 1.005);
+      // Pokud je průnik větší než poloměr kapsule, pravděpodobně jsme mimo mapu
+      // nebo v neplatném stavu -> raději nic nedělat, než tě vystřelit pryč
+      if (maxPen > 0.001 && maxPen < CFG.PLAYER_RADIUS && bestFlat) {
+        // Místo * 1.005 použijeme menší koeficient pro jemnější odsun
+        position.addScaledVector(bestFlat, maxPen * 1.05);
       } else {
         break; 
       }
