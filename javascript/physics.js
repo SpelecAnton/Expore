@@ -94,43 +94,33 @@ function resolveCollision() {
     const result = worldOctree.capsuleIntersect(playerCollider);
     if (!result) return;
 
-    // Získání normály
     let normal = result.normal;
-    
-    // 1. Diagnostika/Oprava obrácených normál:
-    // Pokud normála míří směrem do středu kapsle (dot product s vektorem od kapsle k normále < 0),
-    // je pravděpodobně otočená. Pro jistotu: pokud 'normal' míří proti směru pohybu, 
-    // nebo pokud je normála "podezřelá", musíme ji otočit.
-    // Jednoduchý trik: Pokud jsme v kolizi, normála by měla směřovat "ven" z geometrie.
-    // Pokud dot(velocity, normal) > 0, v podstatě se pohybujeme "ven" ze zdi, 
-    // přesto je tam kolize -> normála je pravděpodobně špatně orientovaná.
-    
-    // 2. Bezpečnostní vynucení orientace:
-    // Spočítej směr od kolizního bodu k hráči. Normála by měla mířit podobným směrem.
-    // Pokud je dot product mezi normálou a (kapsle.center - collisionPoint) záporný, normála je špatně.
-    const center = new THREE.Vector3().addVectors(playerCollider.start, playerCollider.end).multiplyScalar(0.5);
-    const dirToPlayer = new THREE.Vector3().subVectors(center, result.point);
-    
-    if (normal.dot(dirToPlayer) < 0) {
-      normal.negate(); // Otočení normály, pokud míří dovnitř
+
+    // 1. Ošetření: Kontrola, zda 'result.point' existuje, než jej použijeme.
+    // Pokud bod kolize není definován, přeskočíme opravu normály (necháme ji tak, jak je).
+    if (result.point) {
+        const center = new THREE.Vector3().addVectors(playerCollider.start, playerCollider.end).multiplyScalar(0.5);
+        const dirToPlayer = new THREE.Vector3().subVectors(center, result.point);
+
+        // Pokud normála míří dovnitř (proti hráči), otočíme ji.
+        if (normal.dot(dirToPlayer) < 0) {
+            normal.negate();
+        }
     }
 
-    // Nyní máme "opravenou" normálu, která vždy míří ven od geometrie.
-
-    // 3. Reakce na zem
+    // 2. Reakce na zem
     if (normal.y > SLOPE_MIN_Y) {
       onGround = true;
-      // Zastavit vertikální rychlost, pokud jsme na zemi
       if (velocity.y < 0) velocity.y = 0;
     }
 
-    // 4. Projekce rychlosti (klouzání)
+    // 3. Projekce rychlosti (klouzání)
     const dot = velocity.dot(normal);
     if (dot < 0) {
       velocity.addScaledVector(normal, -dot);
     }
 
-    // 5. Vytlačení (nyní bezpečné, protože normal míří ven)
+    // 4. Vytlačení
     _tmpVec.copy(normal).multiplyScalar(result.depth);
     playerCollider.translate(_tmpVec);
   }
