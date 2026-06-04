@@ -4,27 +4,27 @@
  * Replaces BSP brush trace collision (v4.x) with Three.js Octree + Capsule.
  *
  * WHY THIS FIXES WALL-STICKING:
- *   The old AABB/brush-trace system detected collision even when the player moved
- *   *parallel* to a surface due to floating-point drift (d1 ≈ d2 → fraction ≈ 0).
- *   A Capsule has two spherical ends that naturally slide along edges and corners.
- *   capsuleIntersect() only fires when there is actual geometric penetration, so
- *   parallel movement never triggers a false collision.
+ * The old AABB/brush-trace system detected collision even when the player moved
+ * *parallel* to a surface due to floating-point drift (d1 ≈ d2 → fraction ≈ 0).
+ * A Capsule has two spherical ends that naturally slide along edges and corners.
+ * capsuleIntersect() only fires when there is actual geometric penetration, so
+ * parallel movement never triggers a false collision.
  *
  * API (backwards-compatible):
- *   createPhysics(worldOctree, userCFG)
- *     worldOctree — THREE.Octree built from world collision meshes (engine.js)
- *                   Pass null for no collision (player floats — fallback room).
- *     userCFG     — optional overrides (same keys as before)
+ * createPhysics(worldOctree, userCFG)
+ * worldOctree — THREE.Octree built from world collision meshes (engine.js)
+ * Pass null for no collision (player floats — fallback room).
+ * userCFG     — optional overrides (same keys as before)
  *
  * Movement model:
- *   Q3-style friction + acceleration on the ground.
- *   Reduced air acceleration (ACCEL_AIR < ACCEL_GROUND).
- *   Sub-stepped integration (SUBSTEPS = 5) for stable collision resolution.
+ * Q3-style friction + acceleration on the ground.
+ * Reduced air acceleration (ACCEL_AIR < ACCEL_GROUND).
+ * Sub-stepped integration (SUBSTEPS = 5) for stable collision resolution.
  *
  * Step climbing:
- *   The capsule bottom hemisphere (radius R = 0.28 u) naturally rolls over
- *   obstacles up to ~R high.  Typical Q3 steps are 8 q-units = 0.16 u, which
- *   is within this range.  Taller steps require a jump.
+ * The capsule bottom hemisphere (radius R = 0.28 u) naturally rolls over
+ * obstacles up to ~R high.  Typical Q3 steps are 8 q-units = 0.16 u, which
+ * is within this range.  Taller steps require a jump.
  */
 
 'use strict';
@@ -88,7 +88,7 @@ export function createPhysics(worldOctree, userCFG = {}) {
   let   onGround     = false;
   let   currentPitch = 0;
 
-function resolveCollision() {
+  function resolveCollision() {
     if (!worldOctree) return;
 
     const result = worldOctree.capsuleIntersect(playerCollider);
@@ -96,31 +96,19 @@ function resolveCollision() {
 
     let normal = result.normal;
 
-    // 1. Ošetření: Kontrola, zda 'result.point' existuje, než jej použijeme.
-    // Pokud bod kolize není definován, přeskočíme opravu normály (necháme ji tak, jak je).
-    if (result.point) {
-        const center = new THREE.Vector3().addVectors(playerCollider.start, playerCollider.end).multiplyScalar(0.5);
-        const dirToPlayer = new THREE.Vector3().subVectors(center, result.point);
-
-        // Pokud normála míří dovnitř (proti hráči), otočíme ji.
-        if (normal.dot(dirToPlayer) < 0) {
-            normal.negate();
-        }
-    }
-
-    // 2. Reakce na zem
+    // 1. Reakce na zem
     if (normal.y > SLOPE_MIN_Y) {
       onGround = true;
       if (velocity.y < 0) velocity.y = 0;
     }
 
-    // 3. Projekce rychlosti (klouzání)
+    // 2. Projekce rychlosti (klouzání)
     const dot = velocity.dot(normal);
     if (dot < 0) {
       velocity.addScaledVector(normal, -dot);
     }
 
-    // 4. Vytlačení
+    // 3. Vytlačení (Three.js Octree vrací normálu směřující ven z geometrie směrem k hráči)
     _tmpVec.copy(normal).multiplyScalar(result.depth);
     playerCollider.translate(_tmpVec);
   }

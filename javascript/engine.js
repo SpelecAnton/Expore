@@ -361,15 +361,15 @@ export async function initEngine({
       camera.position.set(hashState.x, hashState.y, hashState.z);
       yaw = hashState.yaw;
     } else if (result.playerStart) {
-    const ps = result.playerStart;
-    // Všechny osy ze surového BSP je nutné vynásobit koeficientem UNIT
-    camera.position.set(
-      ps.x * UNIT, 
-      (ps.y + PLAYER_HEIGHT) * UNIT, 
-      ps.z * UNIT
-    );
-    yaw = ps.angle * Math.PI / 180;
-   } 
+      const ps = result.playerStart;
+      // OPRAVENO: Správný převod Quake BSP os (X=vpravo, Y=dopředu, Z=výška) do Three.js (X=vpravo, Y=výška, Z=-dopředu)
+      camera.position.set(
+        ps.x * UNIT, 
+        (ps.z + PLAYER_HEIGHT) * UNIT, 
+        -ps.y * UNIT
+      );
+      yaw = ps.angle * Math.PI / 180;
+    } 
 
     // Collect visible + clip meshes for portal occlusion raycasting (unchanged from v7).
     scene.traverse(obj => {
