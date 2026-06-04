@@ -163,10 +163,10 @@ export function createPhysics(scene, userCFG = {}) {
     return walls;
   }
 
-// ── Push position safely out of wall penetrations ────────────────────────
-  function pushOutOfWalls(position) {
-    // Omezíme počet iterací a přidáme limit na sílu odsunu (max 0.1 jednotky na krok)
-    // aby nás to nevystřelilo mimo mapu při náhlém zasekutí
+function pushOutOfWalls(position) {
+    const startPos = position.clone();
+    let totalMoved = 0;
+
     for (let iter = 0; iter < 2; iter++) {
       const walls = collectWalls(position);
       let maxPen = 0;
@@ -179,14 +179,20 @@ export function createPhysics(scene, userCFG = {}) {
         }
       }
 
-      // Pokud je průnik větší než poloměr kapsule, pravděpodobně jsme mimo mapu
-      // nebo v neplatném stavu -> raději nic nedělat, než tě vystřelit pryč
-      if (maxPen > 0.001 && maxPen < CFG.PLAYER_RADIUS && bestFlat) {
-        // Místo * 1.005 použijeme menší koeficient pro jemnější odsun
-        position.addScaledVector(bestFlat, maxPen * 1.05);
+      // 1. Zastropování: Pokud je průnik příliš velký, ignoruj ho (ochrana proti vystřelení)
+      if (maxPen > 0.001 && maxPen < 0.2 && bestFlat) {
+        const move = bestFlat.clone().multiplyScalar(maxPen);
+        position.add(move);
+        totalMoved += move.length();
       } else {
         break; 
       }
+    }
+
+    // 2. POJISTKA: Pokud jsme se posunuli příliš daleko od původní pozice, 
+    // znamená to, že systém selhal (pravděpodobně roh). Vrať se.
+    if (totalMoved > 0.3) {
+      position.copy(startPos);
     }
   }
 
