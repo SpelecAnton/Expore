@@ -1,5 +1,5 @@
 /**
- * SPELEC BSP Loader v5.6 — VIDEO TEXTURES via DataTexture + getImageData
+ * SPELEC BSP Loader v5.7 — VIDEO TEXTURES via DataTexture + getImageData
  *
  * Texture loading strategy:
  *   video WebM/MP4            → hidden <video> + hidden <canvas> → DataTexture (Uint8Array)
@@ -127,10 +127,45 @@ function applyTexFilters(tex, { linearMag = false, mipmaps = true } = {}) {
  * tickAnimatedTextures() copies decoded video pixels into the buffer each frame.
  * DataTexture has no special-casing in Three.js internals — works fine with EffectComposer.
  */
+/**
+ * Parse target display size from filename hint or companion .json sidecar.
+ *
+ * Filename hint:  textures/screen_320x180.webm  → { w: 320, h: 180 }
+ * JSON sidecar:   textures/screen.json = {"w":320,"h":180}
+ * Fallback:       use video natural size → repeat = (1,1), no tiling change.
+ *
+ * This controls tex.repeat so that UV=1.0 corresponds to exactly targetW
+ * pixels of video content — matching whatever size Q3 editor assumed.
+ */
+async function getVideoTargetSize(url) {
+  // 1. Parse WxH hint from filename: name_320x180.ext or name_320X180.ext
+  const base    = url.substring(0, url.lastIndexOf('.'));
+  const hinMatch = base.match(/_(\d+)[xX](\d+)$/);
+  if (hinMatch) {
+    return { w: parseInt(hinMatch[1], 10), h: parseInt(hinMatch[2], 10) };
+  }
+
+  // 2. Try companion JSON sidecar: same path but .json extension
+  try {
+    const jsonUrl = base + '.json';
+    const r = await fetch(jsonUrl, { method: 'GET' });
+    if (r.ok) {
+      const data = await r.json();
+      if (data.w && data.h) return { w: data.w, h: data.h };
+    }
+  } catch { /* no sidecar */ }
+
+  // 3. Fallback: natural video size (repeat=1, no scaling)
+  return null;
+}
+
 async function loadVideoTex(url) {
   const ext = url.substring(url.lastIndexOf('.')).toLowerCase();
   if (ext === '.webm' && !_videoSupport.webm) { console.warn('[BSP] WebM not supported:', url); return null; }
   if (ext === '.mp4'  && !_videoSupport.mp4)  { console.warn('[BSP] MP4 not supported:', url);  return null; }
+
+  // Fetch target size hint before starting video (non-blocking if no sidecar)
+  const targetSize = await getVideoTargetSize(url);
 
   return new Promise(resolve => {
     const video       = document.createElement('video');
@@ -190,8 +225,17 @@ async function loadVideoTex(url) {
       tex.needsUpdate = true;
       tex._isBspVideo = true;
 
+      // Set UV repeat so UV=1.0 corresponds to targetSize pixels.
+      // If targetSize is null, repeat=(1,1) which means full video = one tile.
+      if (targetSize && targetSize.w > 0 && targetSize.h > 0) {
+        tex.repeat.set(W / targetSize.w, H / targetSize.h);
+        console.log(`[BSP] Video DataTexture ready: ${url} (${W}×${H}), target: ${targetSize.w}×${targetSize.h}, repeat: ${(W/targetSize.w).toFixed(2)}×${(H/targetSize.h).toFixed(2)}`);
+      } else {
+        tex.repeat.set(1, 1);
+        console.log(`[BSP] Video DataTexture ready: ${url} (${W}×${H}), repeat: 1×1 (no hint found)`);
+      }
+
       _videoDataList.push({ video, canvas, ctx, W, H, tex });
-      console.log(`[BSP] Video DataTexture ready: ${url} (${W}×${H})`);
       resolve(tex);
     };
 
