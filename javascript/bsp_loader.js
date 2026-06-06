@@ -142,7 +142,7 @@ async function loadVideoTex(url) {
       tex.minFilter      = THREE.LinearFilter;
       tex.flipY          = true;   // DataTexture is bottom-up; canvas is top-down
       tex.needsUpdate    = true;
-      tex.isVideoTexture = true;   // flag for downstream checks (lightmap skip, alphaTest)
+      tex._isBspVideo = true;   // flag for downstream checks (lightmap skip, alphaTest)
 
       _videoDataList.push({ video, canvas, ctx, W, H, pixelBuf, tex });
       console.log(`[BSP] Video DataTexture ready: ${url} (${W}×${H})`);
@@ -358,7 +358,7 @@ export async function loadBSP({ url, scene, textureBase = '', fallbackTexBase = 
   await Promise.all(uniqueNames.map(async name => {
     const tex = await findTex(texBases, name);
     albedoMap.set(name, tex || _whiteTex);
-    if (tex?.isVideoTexture) videoCount++;
+    if (tex?._isBspVideo) videoCount++;
   }));
 
   if (videoCount > 0) console.log(`[BSP] Video textures active: ${videoCount}`);
@@ -378,7 +378,7 @@ export async function loadBSP({ url, scene, textureBase = '', fallbackTexBase = 
 
     const name   = texNames[b.texIdx] || 'default';
     const albedo = albedoMap.get(name) ?? _whiteTex;
-    const isVid  = albedo.isVideoTexture === true;
+    const isVid  = albedo._isBspVideo === true;
     let mat;
 
     if (b.invisible) {
