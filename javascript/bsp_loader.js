@@ -139,45 +139,79 @@ async function loadVideoTex(url) {
 
   return new Promise(resolve => {
     const video = document.createElement('video');
-    video.src        = url;
-    video.loop       = true;
-    video.muted      = true;
-    video.autoplay   = true;
+    video.src         = url;
+    video.loop        = true;
+    video.muted       = true;
+    video.autoplay    = true;
     video.playsInline = true;
-    // Keep the element off-screen but in the DOM so autoplay policies are satisfied
-    video.style.cssText = 'position:fixed;top:-9999px;left:-9999px;width:1px;height:1px;opacity:0;pointer-events:none;';
+    video.crossOrigin = 'anonymous';
+    // Keep the element off-screen but in the DOM so autoplay policies are satisfied.
+    // Must have non-zero rendered size — some browsers refuse to decode a 0×0 video.
+    video.style.cssText = 'position:fixed;top:-9999px;left:-9999px;width:2px;height:2px;opacity:0;pointer-events:none;';
     document.body.appendChild(video);
 
-    const onReady = () => {
-      video.removeEventListener('loadedmetadata', onReady);
-      video.removeEventListener('error', onError);
+    let resolved = false;
 
-      video.play().catch(err => {
-        // Autoplay blocked — will start on first user interaction
-        console.warn('[BSP] Video autoplay blocked (will retry on interaction):', url, err.message);
-      });
+    const cleanup = (eventName) => {
+      video.removeEventListener('canplay',  onCanPlay);
+      video.removeEventListener('error',    onError);
+      video.removeEventListener('playing',  onPlaying);
+    };
+
+    // Called once video has buffered enough to paint its first frame.
+    // At this point readyState >= HAVE_FUTURE_DATA so WebGL upload is safe.
+    const buildTexture = () => {
+      if (resolved) return;
+      resolved = true;
+      cleanup();
 
       const tex = new THREE.VideoTexture(video);
-      // VideoTexture does NOT support mipmaps (size is not always power-of-two)
+      // VideoTexture does NOT support mipmaps (size may be non-power-of-two).
       applyTexFilters(tex, { linearMag: true, mipmaps: false });
-      tex.minFilter = THREE.LinearFilter; // override — no mips for video
+      tex.minFilter   = THREE.LinearFilter; // override — no mips for video
       tex.needsUpdate = true;
 
       _videoList.push({ video, tex });
-      console.log(`[BSP] Video texture loaded: ${url} (${video.videoWidth}×${video.videoHeight})`);
+      console.log(`[BSP] Video texture ready: ${url} (${video.videoWidth}×${video.videoHeight})`);
       resolve(tex);
     };
 
+    // 'canplay' fires when the browser has decoded at least one frame.
+    const onCanPlay = () => buildTexture();
+
+    // Fallback: if the video starts actually playing we definitely have pixel data.
+    const onPlaying = () => buildTexture();
+
     const onError = () => {
-      video.removeEventListener('loadedmetadata', onReady);
-      video.removeEventListener('error', onError);
+      if (resolved) return;
+      resolved = true;
+      cleanup();
       document.body.removeChild(video);
       console.warn('[BSP] Video load failed:', url);
       resolve(null);
     };
 
-    video.addEventListener('loadedmetadata', onReady);
-    video.addEventListener('error', onError);
+    video.addEventListener('canplay',  onCanPlay,  { once: true });
+    video.addEventListener('playing',  onPlaying,  { once: true });
+    video.addEventListener('error',    onError,    { once: true });
+
+    // Kick off decode — play() returns a promise; rejection just means autoplay
+    // was blocked, the 'canplay' event will still fire once data is buffered.
+    video.play().catch(() => {
+      // Autoplay blocked — browser will still buffer and fire 'canplay'.
+      // The attachVideoResume() handler below will call play() on user gesture.
+      console.warn('[BSP] Video autoplay blocked, waiting for user interaction:', url);
+    });
+
+    // Safety timeout: if neither canplay nor error fires within 8 s, give up.
+    setTimeout(() => {
+      if (!resolved) {
+        resolved = true;
+        cleanup();
+        console.warn('[BSP] Video texture timed out:', url);
+        resolve(null);
+      }
+    }, 8000);
   });
 }
 
