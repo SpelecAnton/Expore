@@ -1,5 +1,5 @@
 /**
- * SPELEC BSP Loader v5.4 — VIDEO TEXTURES via DataTexture + getImageData
+ * SPELEC BSP Loader v5.5 — VIDEO TEXTURES via DataTexture + getImageData
  *
  * Texture loading strategy:
  *   video WebM/MP4            → hidden <video> + hidden <canvas> → DataTexture (Uint8Array)
@@ -82,7 +82,9 @@ export function tickAnimatedTextures() {
         'src:', v.src.slice(-40)
       );
       // Attach visible debug canvas to page corner to confirm decode
-      const dbgCanvas = entry.canvas.cloneNode();
+      const dbgCanvas = document.createElement('canvas');
+      dbgCanvas.width  = 320;
+      dbgCanvas.height = 180;
       dbgCanvas.style.cssText = 'position:fixed;bottom:8px;right:8px;width:320px;height:180px;z-index:9999;border:2px solid red;background:#000;';
       document.body.appendChild(dbgCanvas);
       entry._dbgCanvas = dbgCanvas;
@@ -91,14 +93,15 @@ export function tickAnimatedTextures() {
 
     if (v.readyState < 2) continue;
 
-    const { ctx, W, H, pixelBuf, tex } = entry;
+    const { ctx, W, H, tex } = entry;
     ctx.save();
     ctx.translate(0, H);
     ctx.scale(1, -1);
     ctx.drawImage(v, 0, 0, W, H);
     ctx.restore();
-    const imgData = ctx.getImageData(0, 0, W, H);
-    pixelBuf.set(imgData.data);
+    // Write directly into the DataTexture's own buffer — avoids aliasing issues
+    // where Three.js might hold a different reference than our local pixelBuf.
+    tex.image.data.set(ctx.getImageData(0, 0, W, H).data);
     tex.needsUpdate = true;
 
     // Mirror to debug canvas (not flipped — for human readability)
@@ -170,15 +173,19 @@ async function loadVideoTex(url) {
       const firstFrame = ctx.getImageData(0, 0, W, H);
 
       // DataTexture owns its own Uint8Array — no canvas reference in .image
-      const pixelBuf = new Uint8Array(firstFrame.data.buffer.slice(0));
-      const tex      = new THREE.DataTexture(pixelBuf, W, H, THREE.RGBAFormat, THREE.UnsignedByteType);
+      // DataTexture takes ownership of the Uint8Array.
+      // We always write into tex.image.data directly — never a separate copy —
+      // so Three.js always reads the latest pixels without buffer aliasing issues.
+      const pixelBuf = new Uint8Array(W * H * 4);
+      pixelBuf.set(firstFrame.data);
+      const tex = new THREE.DataTexture(pixelBuf, W, H, THREE.RGBAFormat, THREE.UnsignedByteType);
       applyTexFilters(tex, { linearMag: true, mipmaps: false });
       tex.minFilter   = THREE.LinearFilter;
-      tex.flipY       = false;  // must be false for DataTexture (WebGL non-DOM upload)
+      tex.flipY       = false;
       tex.needsUpdate = true;
-      tex._isBspVideo = true;  // flag for downstream checks (lightmap skip, alphaTest)
+      tex._isBspVideo = true;
 
-      _videoDataList.push({ video, canvas, ctx, W, H, pixelBuf, tex });
+      _videoDataList.push({ video, canvas, ctx, W, H, tex });
       console.log(`[BSP] Video DataTexture ready: ${url} (${W}×${H})`);
       resolve(tex);
     };
