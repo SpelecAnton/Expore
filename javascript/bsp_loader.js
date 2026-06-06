@@ -1,5 +1,5 @@
 /**
- * SPELEC BSP Loader v5.9 — VIDEO TEXTURES via DataTexture + getImageData
+ * SPELEC BSP Loader v6.0 — VIDEO TEXTURES via DataTexture + getImageData
  *
  * Texture loading strategy:
  *   video WebM/MP4            → hidden <video> + hidden <canvas> → DataTexture (Uint8Array)
@@ -49,7 +49,6 @@ const _texCache        = new Map();
 const _loader          = new THREE.TextureLoader();
 const _animList        = []; // GIF/AVIF/WEBP canvas entries
 const _videoDataList   = []; // video → DataTexture entries
-window._bspVideoDebug  = _videoDataList; // exposed for console debugging
 
 // ── Tick ──────────────────────────────────────────────────────────────────────
 export function tickAnimatedTextures() {
@@ -70,27 +69,6 @@ export function tickAnimatedTextures() {
   for (const entry of _videoDataList) {
     const v = entry.video;
 
-    // One-time debug log per entry
-    if (!entry._debugged) {
-      entry._debugged = true;
-      console.log('[BSP VIDEO DEBUG]',
-        'readyState:', v.readyState,
-        'paused:', v.paused,
-        'muted:', v.muted,
-        'currentTime:', v.currentTime,
-        'error:', v.error,
-        'src:', v.src.slice(-40)
-      );
-      // Attach visible debug canvas to page corner to confirm decode
-      const dbgCanvas = document.createElement('canvas');
-      dbgCanvas.width  = 320;
-      dbgCanvas.height = 180;
-      dbgCanvas.style.cssText = 'position:fixed;bottom:8px;right:8px;width:320px;height:180px;z-index:9999;border:2px solid red;background:#000;';
-      document.body.appendChild(dbgCanvas);
-      entry._dbgCanvas = dbgCanvas;
-      entry._dbgCtx    = dbgCanvas.getContext('2d');
-    }
-
     if (v.readyState < 2) continue;
 
     const { ctx, W, H, tex } = entry;
@@ -104,10 +82,6 @@ export function tickAnimatedTextures() {
     tex.image.data.set(ctx.getImageData(0, 0, W, H).data);
     tex.needsUpdate = true;
 
-    // Mirror to debug canvas (not flipped — for human readability)
-    if (entry._dbgCtx) {
-      entry._dbgCtx.drawImage(v, 0, 0, 320, 180);
-    }
   }
 }
 
