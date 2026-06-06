@@ -1,5 +1,5 @@
 /**
- * SPELEC BSP Loader v6.1 — VIDEO TEXTURES via DataTexture + getImageData
+ * SPELEC BSP Loader v6.2 — VIDEO TEXTURES via DataTexture + getImageData
  *
  * Texture loading strategy:
  *   video WebM/MP4            → hidden <video> + hidden <canvas> → DataTexture (Uint8Array)
@@ -102,43 +102,10 @@ function applyTexFilters(tex, { linearMag = false, mipmaps = true } = {}) {
  * DataTexture has no special-casing in Three.js internals — works fine with EffectComposer.
  */
 
-/**
- * Check if this video should play with audio.
- * Looks for: companion .json with "audio":true, OR same-name .mp3/.ogg/.wav file.
- * Returns true if video has an associated audio track that should be unmuted.
- */
-async function probeVideoHasAudio(base) {
-  // 1. JSON sidecar
-  try {
-    const r = await fetch(base + '.json');
-    if (r.ok) {
-      const d = await r.json();
-      if (d.audio === true) return true;
-    }
-  } catch { /* no sidecar */ }
-
-  // 2. Companion audio file with same base name
-  for (const ext of ['.mp3', '.ogg', '.wav']) {
-    try {
-      const r = await fetch(base + ext, { method: 'HEAD' });
-      if (r.ok) {
-        console.log(`[BSP] Video has companion audio: ${base}${ext} — video will provide audio instead`);
-        return true;
-      }
-    } catch { /* try next */ }
-  }
-
-  return false;
-}
-
 async function loadVideoTex(url) {
   const ext = url.substring(url.lastIndexOf('.')).toLowerCase();
   if (ext === '.webm' && !_videoSupport.webm) { console.warn('[BSP] WebM not supported:', url); return null; }
   if (ext === '.mp4'  && !_videoSupport.mp4)  { console.warn('[BSP] MP4 not supported:', url);  return null; }
-
-  // Probe for audio before entering the Promise — keeps hasAudio in scope for done()
-  const urlBase  = url.substring(0, url.lastIndexOf('.'));
-  const hasAudio = await probeVideoHasAudio(urlBase);
 
   return new Promise(resolve => {
     const video       = document.createElement('video');
@@ -200,7 +167,7 @@ async function loadVideoTex(url) {
 
       tex.repeat.set(1, 1);  // corrected after load in loadBSP once static ref is known
       console.log(`[BSP] Video DataTexture ready: ${url} (${W}×${H})`);
-      _videoDataList.push({ video, canvas, ctx, W, H, tex, hasAudio });
+      _videoDataList.push({ video, canvas, ctx, W, H, tex });
       resolve(tex);
     };
 
@@ -221,23 +188,14 @@ async function loadVideoTex(url) {
 }
 
 // ── Resume videos after user gesture ─────────────────────────────────────────
-// Expose flag so engine.js can skip loading background.mp3 when a video has audio
-export function bspHasVideoAudio() {
-  return _videoDataList.some(e => e.hasAudio);
-}
-
 (function attachVideoResume() {
   let _audioUnlocked = false;
   const resume = () => {
-    for (const entry of _videoDataList) {
-      if (entry.video.paused) entry.video.play().catch(() => {});
-
-      // Unmute audio videos on first user gesture — browser requires this
-      if (entry.hasAudio && !_audioUnlocked) {
-        entry.video.muted = false;
-        entry.video.currentTime = 0;  // restart for clean sync
-        entry.video.play().catch(() => {});
-        console.log('[BSP] Video audio unlocked');
+    for (const { video } of _videoDataList) {
+      if (video.paused) video.play().catch(() => {});
+      // Unmute on first user gesture — videos without an audio track stay silent automatically
+      if (!_audioUnlocked) {
+        video.muted = false;
       }
     }
     _audioUnlocked = true;
