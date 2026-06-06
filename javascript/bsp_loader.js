@@ -448,7 +448,7 @@ export async function loadBSP({ url, scene, textureBase = '', fallbackTexBase = 
       }
 
       if (refW > 0 && refH > 0) {
-        tex.repeat.set(entry.W / refW, entry.H / refH);
+        tex.repeat.set(refW / entry.W, refH / entry.H);
         console.log(`[BSP] Video UV repeat: ${name} ref=${refW}×${refH} video=${entry.W}×${entry.H} repeat=${tex.repeat.x.toFixed(2)}×${tex.repeat.y.toFixed(2)}`);
       } else {
         console.log(`[BSP] Video UV repeat: ${name} — no static ref found, repeat stays 1×1`);
