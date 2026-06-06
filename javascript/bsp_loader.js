@@ -1,5 +1,5 @@
 /**
- * SPELEC BSP Loader v5.2 — VIDEO TEXTURES via DataTexture + getImageData
+ * SPELEC BSP Loader v5.3 — VIDEO TEXTURES via DataTexture + getImageData
  *
  * Texture loading strategy:
  *   video WebM/MP4            → hidden <video> + hidden <canvas> → DataTexture (Uint8Array)
@@ -65,16 +65,22 @@ export function tickAnimatedTextures() {
     anim.nextFrameTime = now + frame.duration;
   }
 
-  // Video: draw into canvas → read pixels → copy into DataTexture buffer
+  // Video: draw into canvas → read pixels → copy into DataTexture buffer.
+  // Only skip if browser has no decoded frame yet (readyState < HAVE_CURRENT_DATA).
+  // Do NOT skip when paused — paused video still has a valid frame to show.
   for (const entry of _videoDataList) {
     const v = entry.video;
-    // readyState 2 = HAVE_CURRENT_DATA, enough for a valid frame
-    if (v.readyState < 2 || v.paused || v.ended) continue;
+    if (v.readyState < 2) continue;
 
     const { ctx, W, H, pixelBuf, tex } = entry;
+    // flipY=false on DataTexture, so flip vertically here in the canvas draw
+    ctx.save();
+    ctx.translate(0, H);
+    ctx.scale(1, -1);
     ctx.drawImage(v, 0, 0, W, H);
+    ctx.restore();
     const imgData = ctx.getImageData(0, 0, W, H);
-    pixelBuf.set(imgData.data);   // copy RGBA pixels into DataTexture buffer
+    pixelBuf.set(imgData.data);
     tex.needsUpdate = true;
   }
 }
@@ -131,18 +137,23 @@ async function loadVideoTex(url) {
       canvas.height = H;
       const ctx = canvas.getContext('2d', { willReadFrequently: true });
 
-      // Draw first frame now so the texture has valid data on frame 0
+      // Draw first frame now so the texture has valid data on frame 0.
+      // Flip vertically here since DataTexture uses flipY=false.
+      ctx.save();
+      ctx.translate(0, H);
+      ctx.scale(1, -1);
       ctx.drawImage(video, 0, 0, W, H);
+      ctx.restore();
       const firstFrame = ctx.getImageData(0, 0, W, H);
 
       // DataTexture owns its own Uint8Array — no canvas reference in .image
       const pixelBuf = new Uint8Array(firstFrame.data.buffer.slice(0));
       const tex      = new THREE.DataTexture(pixelBuf, W, H, THREE.RGBAFormat, THREE.UnsignedByteType);
       applyTexFilters(tex, { linearMag: true, mipmaps: false });
-      tex.minFilter      = THREE.LinearFilter;
-      tex.flipY          = true;   // DataTexture is bottom-up; canvas is top-down
-      tex.needsUpdate    = true;
-      tex._isBspVideo = true;   // flag for downstream checks (lightmap skip, alphaTest)
+      tex.minFilter   = THREE.LinearFilter;
+      tex.flipY       = false;  // must be false for DataTexture (WebGL non-DOM upload)
+      tex.needsUpdate = true;
+      tex._isBspVideo = true;  // flag for downstream checks (lightmap skip, alphaTest)
 
       _videoDataList.push({ video, canvas, ctx, W, H, pixelBuf, tex });
       console.log(`[BSP] Video DataTexture ready: ${url} (${W}×${H})`);
