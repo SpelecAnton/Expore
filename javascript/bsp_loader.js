@@ -1,8 +1,8 @@
 /**
- * SPELEC BSP Loader v5 — WORKER EDITION + ANIMATED TEXTURES + VIDEO TEXTURES + INVISIBLE CLIP MESHES
+ * SPELEC BSP Loader v5.1 — WORKER EDITION + ANIMATED TEXTURES + VIDEO TEXTURES + INVISIBLE CLIP MESHES
  *
  * Texture loading strategy:
- *   video WebM/MP4            → <video> element + THREE.VideoTexture (GPU-updated every frame)
+ *   video WebM/MP4            → <video> element decoded to CanvasTexture each frame via drawImage()
  *   animated GIF/AVIF/WEBP   → ImageDecoder API, all frames pre-decoded into ImageBitmap array
  *   static PNG/JPG/AVIF/WEBP → TextureLoader
  *
@@ -12,9 +12,11 @@
  *
  * Video behaviour:
  *   - muted, looped, autoplayed, playsinline (no user gesture required)
- *   - THREE.VideoTexture handles needsUpdate automatically each render frame
- *   - Video elements are tracked in _videoList so they can be paused/resumed
+ *   - Video frame is drawn into an off-screen canvas every tick via ctx.drawImage()
+ *   - CanvasTexture.needsUpdate = true is set manually — avoids THREE.VideoTexture
+ *     internals that fail silently when used with EffectComposer
  *   - Codec support is sniffed via HTMLVideoElement.canPlayType before loading
+ *   - Video elements tagged isVideoTexture = true for downstream checks
  *
  * v2 — func_wall / noclip:
  *   Batches with noclip=true get material.depthWrite = false
@@ -30,17 +32,21 @@
  *
  * v5 — VIDEO TEXTURE SUPPORT:
  *   .webm (AV1 / VP9) and .mp4 (H.264) files are treated as video textures.
- *   Each video gets its own <video> element hidden off-screen.
- *   Multiple surfaces sharing the same video file reuse the same VideoTexture.
+ *   Each video gets its own <video> + <canvas> pair.
+ *   Multiple BSP surfaces sharing the same filename reuse the same texture object.
+ *
+ * v5.1 — FIX: replaced THREE.VideoTexture with manual canvas-based approach.
+ *   THREE.VideoTexture's auto-update does not fire reliably when the scene is
+ *   rendered through EffectComposer instead of renderer.render() directly.
+ *   Solution: draw video into a canvas every tick and set needsUpdate = true,
+ *   identical to how GIF/AVIF animated textures are handled.
  */
 
 import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.165.0/build/three.module.js';
 
 // ── Configuration ─────────────────────────────────────────────────────────────
-// Video extensions checked BEFORE image extensions so a .webm/.mp4 always wins
-// when both a video and an image of the same name exist.
-const VIDEO_EXTS = ['.webm', '.mp4'];
-const ANIM_EXTS  = new Set(['.gif', '.avif', '.webp']);
+const VIDEO_EXTS     = ['.webm', '.mp4'];
+const ANIM_EXTS      = new Set(['.gif', '.avif', '.webp']);
 const VIDEO_EXTS_SET = new Set(VIDEO_EXTS);
 
 // Full probe order: video first, then animated images, then static images.
@@ -63,45 +69,46 @@ console.log(`[BSP] Video codec support — WebM: ${_videoSupport.webm}, MP4: ${_
 // ── Anisotropy — set from engine.js via initTexLoader() ──────────────────────
 let _maxAniso = 1;
 
-/**
- * Called from engine.js immediately after creating the renderer.
- * Queries max supported GPU anisotropy and stores it for all textures.
- */
 export function initTexLoader(renderer) {
   _maxAniso = Math.min(8, renderer.capabilities.getMaxAnisotropy());
   console.log(`[BSP] Anisotropic filtering: ${_maxAniso}×`);
 }
 
 // ── Internal state ────────────────────────────────────────────────────────────
-const _texCache = new Map();   // url → THREE.Texture | null
+const _texCache = new Map();
 const _loader   = new THREE.TextureLoader();
 
-// Animated (GIF/AVIF/WEBP) entries: { frames, canvas, ctx, tex, frameIdx, nextFrameTime }
-const _animList  = [];
+// GIF/AVIF/WEBP animated entries
+// { frames: [{bitmap, duration}], canvas, ctx, tex, frameIdx, nextFrameTime }
+const _animList = [];
 
-// Video entries: { video: HTMLVideoElement, tex: THREE.VideoTexture }
-// VideoTexture updates needsUpdate itself — we only track these for lifecycle.
-const _videoList = [];
+// Video entries — drawn into canvas every tick
+// { video: HTMLVideoElement, canvas, ctx, tex: THREE.CanvasTexture }
+const _videoCanvasList = [];
 
-// ── Tick — called every frame from the render loop ───────────────────────────
+// ── Tick — called every frame from engine.js render loop ─────────────────────
 export function tickAnimatedTextures() {
   const now = performance.now();
 
-  // Frame-based animated textures (GIF/AVIF/WEBP)
+  // GIF/AVIF/WEBP: advance frame when duration expires
   for (const anim of _animList) {
     if (now < anim.nextFrameTime) continue;
-
     const frame = anim.frames[anim.frameIdx];
     anim.ctx.clearRect(0, 0, anim.canvas.width, anim.canvas.height);
     anim.ctx.drawImage(frame.bitmap, 0, 0, anim.canvas.width, anim.canvas.height);
     anim.tex.needsUpdate = true;
-
     anim.frameIdx      = (anim.frameIdx + 1) % anim.frames.length;
     anim.nextFrameTime = now + frame.duration;
   }
 
-  // VideoTexture: Three.js handles needsUpdate internally when video is playing.
-  // Nothing extra required here — the loop exists for future pause/seek support.
+  // Video: blit current decoded frame into canvas every tick.
+  // Only upload to GPU when video has actual pixel data (readyState >= 2).
+  for (const entry of _videoCanvasList) {
+    const v = entry.video;
+    if (v.readyState < 2 || v.paused || v.ended) continue;
+    entry.ctx.drawImage(v, 0, 0, entry.canvas.width, entry.canvas.height);
+    entry.tex.needsUpdate = true;
+  }
 }
 
 // ── Apply shared filter settings to a texture ─────────────────────────────────
@@ -116,18 +123,16 @@ function applyTexFilters(tex, { linearMag = false, mipmaps = true } = {}) {
 
 // ── Video texture loader ──────────────────────────────────────────────────────
 /**
- * Creates a hidden <video> element, waits until metadata is loaded,
- * then wraps it in a THREE.VideoTexture.
+ * Creates a hidden <video> element and a matching <canvas>.
+ * Returns a THREE.CanvasTexture backed by the canvas.
+ * tickAnimatedTextures() blits video → canvas every frame.
  *
- * VideoTexture sets needsUpdate = true automatically on each frame
- * (Three.js checks video.readyState >= HAVE_CURRENT_DATA internally).
- *
- * Returns null if the browser cannot play the format.
+ * Using CanvasTexture instead of THREE.VideoTexture because VideoTexture's
+ * internal update mechanism is bypassed by EffectComposer, causing a black texture.
  */
 async function loadVideoTex(url) {
   const ext = url.substring(url.lastIndexOf('.')).toLowerCase();
 
-  // Guard: skip format if browser cannot play it
   if (ext === '.webm' && !_videoSupport.webm) {
     console.warn('[BSP] WebM not supported by this browser, skipping:', url);
     return null;
@@ -144,85 +149,79 @@ async function loadVideoTex(url) {
     video.muted       = true;
     video.autoplay    = true;
     video.playsInline = true;
-    video.crossOrigin = 'anonymous';
-    // Keep the element off-screen but in the DOM so autoplay policies are satisfied.
-    // Must have non-zero rendered size — some browsers refuse to decode a 0×0 video.
+    // Non-zero size so browsers decode the video — 2×2 is invisible but valid.
     video.style.cssText = 'position:fixed;top:-9999px;left:-9999px;width:2px;height:2px;opacity:0;pointer-events:none;';
     document.body.appendChild(video);
 
     let resolved = false;
 
-    const cleanup = (eventName) => {
-      video.removeEventListener('canplay',  onCanPlay);
-      video.removeEventListener('error',    onError);
-      video.removeEventListener('playing',  onPlaying);
-    };
-
-    // Called once video has buffered enough to paint its first frame.
-    // At this point readyState >= HAVE_FUTURE_DATA so WebGL upload is safe.
-    const buildTexture = () => {
+    const finish = (ok) => {
       if (resolved) return;
       resolved = true;
-      cleanup();
+      video.removeEventListener('canplay', onCanPlay);
+      video.removeEventListener('playing', onPlaying);
+      video.removeEventListener('error',   onError);
 
-      const tex = new THREE.VideoTexture(video);
-      // VideoTexture does NOT support mipmaps (size may be non-power-of-two).
+      if (!ok) {
+        document.body.removeChild(video);
+        resolve(null);
+        return;
+      }
+
+      const W = video.videoWidth  || 512;
+      const H = video.videoHeight || 512;
+
+      // Off-screen canvas — same resolution as the video
+      const canvas  = document.createElement('canvas');
+      canvas.width  = W;
+      canvas.height = H;
+      const ctx = canvas.getContext('2d');
+
+      // Draw first frame immediately so the texture is never black on frame 0
+      ctx.drawImage(video, 0, 0, W, H);
+
+      const tex = new THREE.CanvasTexture(canvas);
+      // No mipmaps for video — dimensions may be non-power-of-two
       applyTexFilters(tex, { linearMag: true, mipmaps: false });
-      tex.minFilter   = THREE.LinearFilter; // override — no mips for video
+      tex.minFilter   = THREE.LinearFilter;
       tex.needsUpdate = true;
 
-      _videoList.push({ video, tex });
-      console.log(`[BSP] Video texture ready: ${url} (${video.videoWidth}×${video.videoHeight})`);
+      // Mark as video so downstream code (lightmap skip, alphaTest) can detect it
+      tex.isVideoTexture = true;
+
+      _videoCanvasList.push({ video, canvas, ctx, tex });
+      console.log(`[BSP] Video texture ready: ${url} (${W}×${H})`);
       resolve(tex);
     };
 
-    // 'canplay' fires when the browser has decoded at least one frame.
-    const onCanPlay = () => buildTexture();
+    const onCanPlay = () => finish(true);
+    const onPlaying = () => finish(true);
+    const onError   = () => { console.warn('[BSP] Video load error:', url); finish(false); };
 
-    // Fallback: if the video starts actually playing we definitely have pixel data.
-    const onPlaying = () => buildTexture();
+    video.addEventListener('canplay', onCanPlay, { once: true });
+    video.addEventListener('playing', onPlaying, { once: true });
+    video.addEventListener('error',   onError,   { once: true });
 
-    const onError = () => {
-      if (resolved) return;
-      resolved = true;
-      cleanup();
-      document.body.removeChild(video);
-      console.warn('[BSP] Video load failed:', url);
-      resolve(null);
-    };
-
-    video.addEventListener('canplay',  onCanPlay,  { once: true });
-    video.addEventListener('playing',  onPlaying,  { once: true });
-    video.addEventListener('error',    onError,    { once: true });
-
-    // Kick off decode — play() returns a promise; rejection just means autoplay
-    // was blocked, the 'canplay' event will still fire once data is buffered.
     video.play().catch(() => {
-      // Autoplay blocked — browser will still buffer and fire 'canplay'.
-      // The attachVideoResume() handler below will call play() on user gesture.
+      // Autoplay blocked — canplay still fires once buffered; resume on user gesture below.
       console.warn('[BSP] Video autoplay blocked, waiting for user interaction:', url);
     });
 
-    // Safety timeout: if neither canplay nor error fires within 8 s, give up.
+    // Timeout safety — give up after 8 s
     setTimeout(() => {
       if (!resolved) {
-        resolved = true;
-        cleanup();
-        console.warn('[BSP] Video texture timed out:', url);
-        resolve(null);
+        console.warn('[BSP] Video texture load timed out:', url);
+        finish(false);
       }
     }, 8000);
   });
 }
 
-// ── Resume all paused videos on first user gesture ───────────────────────────
-// Some browsers block autoplay until a user interaction occurs.
+// ── Resume paused videos on first user gesture ────────────────────────────────
 (function attachVideoResume() {
   const resume = () => {
-    for (const { video } of _videoList) {
-      if (video.paused) {
-        video.play().catch(() => {});
-      }
+    for (const { video } of _videoCanvasList) {
+      if (video.paused) video.play().catch(() => {});
     }
   };
   ['click', 'keydown', 'touchstart'].forEach(evt =>
@@ -233,7 +232,7 @@ async function loadVideoTex(url) {
 // ── ImageDecoder loader (animated GIF / AVIF / WEBP) ─────────────────────────
 async function loadAnimatedTex(url) {
   if (typeof ImageDecoder === 'undefined') {
-    console.warn('[BSP] ImageDecoder is not available, static fallback:', url);
+    console.warn('[BSP] ImageDecoder not available, static fallback:', url);
     return loadStaticTex(url);
   }
 
@@ -257,7 +256,7 @@ async function loadAnimatedTex(url) {
 
     if (frameCount <= 1) return loadStaticTex(url);
 
-    console.log(`[BSP] Animated texture ${url}: ${frameCount} frames, decoding...`);
+    console.log(`[BSP] Animated texture ${url}: ${frameCount} frames`);
 
     const decoder = new ImageDecoder({
       data: new Blob([buffer], { type }).stream(),
@@ -272,13 +271,11 @@ async function loadAnimatedTex(url) {
     for (let i = 0; i < frameCount; i++) {
       const result   = await decoder.decode({ frameIndex: i });
       const img      = result.image;
-      const duration = (img.duration != null ? img.duration / 1000 : 100);
-
+      const duration = img.duration != null ? img.duration / 1000 : 100;
       if (i === 0) {
         w = img.displayWidth  || img.codedWidth  || 128;
         h = img.displayHeight || img.codedHeight || 128;
       }
-
       const bitmap = await createImageBitmap(img, { resizeWidth: w, resizeHeight: h });
       img.close();
       frames.push({ bitmap, duration });
@@ -297,19 +294,11 @@ async function loadAnimatedTex(url) {
     applyTexFilters(tex);
     tex.needsUpdate = true;
 
-    _animList.push({
-      frames,
-      canvas,
-      ctx,
-      tex,
-      frameIdx:      0,
-      nextFrameTime: performance.now() + frames[0].duration,
-    });
-
+    _animList.push({ frames, canvas, ctx, tex, frameIdx: 0, nextFrameTime: performance.now() + frames[0].duration });
     return tex;
 
   } catch (err) {
-    console.warn('[BSP] Animation failed, showing static picture instead:', url, err.message);
+    console.warn('[BSP] Animation decode failed, static fallback:', url, err.message);
     return loadStaticTex(url);
   }
 }
@@ -317,53 +306,27 @@ async function loadAnimatedTex(url) {
 // ── Static texture ────────────────────────────────────────────────────────────
 function loadStaticTex(url) {
   return new Promise(res => {
-    _loader.load(
-      url,
-      tex => {
-        applyTexFilters(tex);
-        res(tex);
-      },
-      undefined,
-      () => res(null)
-    );
+    _loader.load(url, tex => { applyTexFilters(tex); res(tex); }, undefined, () => res(null));
   });
 }
 
-// ── tryLoadTex — load any supported format ────────────────────────────────────
+// ── tryLoadTex ────────────────────────────────────────────────────────────────
 async function tryLoadTex(url) {
   if (_texCache.has(url)) return _texCache.get(url);
-
   try {
     const probe = await fetch(url, { method: 'HEAD' });
     if (!probe.ok) { _texCache.set(url, null); return null; }
-  } catch {
-    _texCache.set(url, null);
-    return null;
-  }
+  } catch { _texCache.set(url, null); return null; }
 
   const ext = url.substring(url.lastIndexOf('.')).toLowerCase();
-  let tex;
-
-  if (VIDEO_EXTS_SET.has(ext)) {
-    tex = await loadVideoTex(url);
-  } else if (ANIM_EXTS.has(ext)) {
-    tex = await loadAnimatedTex(url);
-  } else {
-    tex = await loadStaticTex(url);
-  }
-
+  const tex = VIDEO_EXTS_SET.has(ext) ? await loadVideoTex(url)
+            : ANIM_EXTS.has(ext)      ? await loadAnimatedTex(url)
+            :                           await loadStaticTex(url);
   _texCache.set(url, tex);
   return tex;
 }
 
-// ── findTex — parallel HEAD probe across bases and extensions ─────────────────
-/**
- * Probes all (base × extension) combinations in parallel.
- * Returns the first texture that loads successfully, or null.
- *
- * Video formats (.webm, .mp4) are listed first in TEX_EXTENSIONS so they
- * win when both a video and a static image exist with the same base name.
- */
+// ── findTex — parallel HEAD probe ────────────────────────────────────────────
 async function findTex(bases, name) {
   for (const base of bases) {
     if (!base) continue;
@@ -371,30 +334,19 @@ async function findTex(bases, name) {
     const probes = await Promise.all(
       TEX_EXTENSIONS.map(async ext => {
         const url = base + name + ext;
-        try {
-          const r = await fetch(url, { method: 'HEAD' });
-          return r.ok ? url : null;
-        } catch { return null; }
+        try { const r = await fetch(url, { method: 'HEAD' }); return r.ok ? url : null; }
+        catch { return null; }
       })
     );
 
-    // Respect extension priority order
     const found = probes.find(u => u !== null);
     if (!found) continue;
-
     if (_texCache.has(found)) return _texCache.get(found);
 
     const ext = found.substring(found.lastIndexOf('.')).toLowerCase();
-    let tex;
-
-    if (VIDEO_EXTS_SET.has(ext)) {
-      tex = await loadVideoTex(found);
-    } else if (ANIM_EXTS.has(ext)) {
-      tex = await loadAnimatedTex(found);
-    } else {
-      tex = await loadStaticTex(found);
-    }
-
+    const tex = VIDEO_EXTS_SET.has(ext) ? await loadVideoTex(found)
+              : ANIM_EXTS.has(ext)      ? await loadAnimatedTex(found)
+              :                           await loadStaticTex(found);
     _texCache.set(found, tex);
     if (tex) return tex;
   }
@@ -409,8 +361,8 @@ const _whiteTex = (() => {
   c.getContext('2d').fillRect(0, 0, 1, 1);
   const t = new THREE.CanvasTexture(c);
   t.colorSpace = THREE.SRGBColorSpace;
-  t.minFilter = THREE.LinearFilter;
-  t.magFilter = THREE.LinearFilter;
+  t.minFilter  = THREE.LinearFilter;
+  t.magFilter  = THREE.LinearFilter;
   return t;
 })();
 
@@ -424,13 +376,10 @@ async function fetchWorkerCode() {
   for (const url of [localUrl, remoteUrl]) {
     try {
       const r = await fetch(url);
-      if (r.ok) {
-        console.log('[BSP] Worker loaded from:', url);
-        return await r.text();
-      }
+      if (r.ok) { console.log('[BSP] Worker loaded from:', url); return await r.text(); }
     } catch { /* try next */ }
   }
-  throw new Error('bsp_worker.js not found (neither locally nor on GitHub)');
+  throw new Error('bsp_worker.js not found');
 }
 
 function runBSPWorker(buffer, textureBase, fallbackTexBase, onProgress) {
@@ -439,19 +388,16 @@ function runBSPWorker(buffer, textureBase, fallbackTexBase, onProgress) {
       const code    = await fetchWorkerCode();
       const blob    = new Blob([code], { type: 'application/javascript' });
       const blobUrl = URL.createObjectURL(blob);
+      const worker  = new Worker(blobUrl);
 
-      const worker = new Worker(blobUrl);
       worker.onmessage = ({ data }) => {
-        if      (data.type === 'progress') { onProgress?.(data.pct); }
+        if      (data.type === 'progress') onProgress?.(data.pct);
         else if (data.type === 'done')     { worker.terminate(); URL.revokeObjectURL(blobUrl); resolve(data); }
         else if (data.type === 'error')    { worker.terminate(); URL.revokeObjectURL(blobUrl); reject(new Error(`[BSP Worker] ${data.message}`)); }
       };
       worker.onerror = err => { worker.terminate(); URL.revokeObjectURL(blobUrl); reject(err); };
       worker.postMessage({ buffer, textureBase, fallbackTexBase }, [buffer]);
-
-    } catch (err) {
-      reject(err);
-    }
+    } catch (err) { reject(err); }
   });
 }
 
@@ -479,104 +425,75 @@ export async function loadBSP({
   // ── Lightmap ──────────────────────────────────────────────────────────────
   let lmTex = null;
   if (lmAtlas) {
-    if (lmAtlas.nonZero === 0) console.warn('[BSP] No lightmap — Baked light missing.');
+    if (lmAtlas.nonZero === 0) console.warn('[BSP] No lightmap — baked light missing.');
     else console.log(`[BSP] Lightmap atlas ${lmAtlas.W}×${lmAtlas.H}, non-zero: ${lmAtlas.nonZero}`);
 
     const atlasArr = new Uint8Array(lmAtlas.data);
     lmTex = new THREE.DataTexture(atlasArr, lmAtlas.W, lmAtlas.H, THREE.RGBAFormat);
-    lmTex.colorSpace = THREE.SRGBColorSpace;
-    lmTex.channel    = 1;
-    lmTex.minFilter  = THREE.LinearMipmapLinearFilter;
-    lmTex.magFilter  = THREE.LinearFilter;
-    lmTex.anisotropy = _maxAniso;
+    lmTex.colorSpace      = THREE.SRGBColorSpace;
+    lmTex.channel         = 1;
+    lmTex.minFilter       = THREE.LinearMipmapLinearFilter;
+    lmTex.magFilter       = THREE.LinearFilter;
+    lmTex.anisotropy      = _maxAniso;
     lmTex.generateMipmaps = true;
     lmTex.wrapS = lmTex.wrapT = THREE.ClampToEdgeWrapping;
     lmTex.needsUpdate = true;
   }
 
-  // ── Albedo textures (images + videos) ────────────────────────────────────
-  const texBases = [textureBase, fallbackTexBase];
-
+  // ── Albedo textures ───────────────────────────────────────────────────────
+  const texBases    = [textureBase, fallbackTexBase];
   const uniqueNames = [...new Set(
-    batches
-      .filter(b => !b.invisible)
-      .map(b => texNames[b.texIdx] || 'default')
+    batches.filter(b => !b.invisible).map(b => texNames[b.texIdx] || 'default')
   )];
 
   const albedoMap = new Map();
-  let videoCount = 0;
+  let videoCount  = 0;
 
   await Promise.all(uniqueNames.map(async name => {
     const tex = await findTex(texBases, name);
     albedoMap.set(name, tex || _whiteTex);
-    if (tex && tex.isVideoTexture) videoCount++;
+    if (tex?.isVideoTexture) videoCount++;
   }));
 
-  if (videoCount > 0) {
-    console.log(`[BSP] Video textures active: ${videoCount}`);
-  }
-
+  if (videoCount > 0) console.log(`[BSP] Video textures active: ${videoCount}`);
   onProgress?.(95);
 
   // ── Build meshes ──────────────────────────────────────────────────────────
   let totalMeshes = 0, meshesWithLM = 0, noclipMeshes = 0, invisibleMeshes = 0;
 
   for (const b of batches) {
-    const pos = new Float32Array(b.pos);
-    const nrm = new Float32Array(b.nrm);
-    const uv1 = new Float32Array(b.uv1);
-    const uv2 = new Float32Array(b.uv2);
-    const idx = new Uint32Array(b.idx);
-
     const geo = new THREE.BufferGeometry();
-    geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
-    geo.setAttribute('normal',   new THREE.BufferAttribute(nrm, 3));
-    geo.setAttribute('uv',       new THREE.BufferAttribute(uv1, 2));
-    geo.setAttribute('uv1',      new THREE.BufferAttribute(uv2, 2));
-    geo.setIndex(new THREE.BufferAttribute(idx, 1));
+    geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(b.pos), 3));
+    geo.setAttribute('normal',   new THREE.BufferAttribute(new Float32Array(b.nrm), 3));
+    geo.setAttribute('uv',       new THREE.BufferAttribute(new Float32Array(b.uv1), 2));
+    geo.setAttribute('uv1',      new THREE.BufferAttribute(new Float32Array(b.uv2), 2));
+    geo.setIndex(new THREE.BufferAttribute(new Uint32Array(b.idx), 1));
     geo.computeBoundingSphere();
 
-    const name = texNames[b.texIdx] || 'default';
+    const name   = texNames[b.texIdx] || 'default';
+    const albedo = albedoMap.get(name) ?? _whiteTex;
+    const isVid  = albedo.isVideoTexture === true;
     let mat;
 
     if (b.invisible) {
-      // Invisible clip brush: renders nothing, but raycaster still hits it.
       mat = new THREE.MeshBasicMaterial({
-        colorWrite:  false,
-        depthWrite:  false,
-        transparent: true,
-        opacity:     0,
-        side:        THREE.DoubleSide,
+        colorWrite: false, depthWrite: false, transparent: true, opacity: 0, side: THREE.DoubleSide,
       });
     } else {
-      const albedo = albedoMap.get(name) ?? _whiteTex;
-      const isVideo = albedo.isVideoTexture;
-
       mat = new THREE.MeshLambertMaterial({
         map:       albedo,
         side:      THREE.DoubleSide,
-        // Video textures are always opaque — skip alpha test to avoid flickering
-        alphaTest: isVideo ? 0 : 0.5,
+        alphaTest: isVid ? 0 : 0.5,   // no alpha test for video — avoids flicker
       });
     }
 
     const mesh = new THREE.Mesh(geo, mat);
 
-    if (b.invisible) {
-      mesh.userData.invisible = true;
-      invisibleMeshes++;
-    }
+    if (b.invisible) { mesh.userData.invisible = true; invisibleMeshes++; }
+    if (b.noclip)    { mesh.userData.noclip    = true; noclipMeshes++;    }
 
-    if (b.noclip) {
-      mesh.userData.noclip = true;
-      noclipMeshes++;
-    }
-
-    // Lightmap — skip for video textures (they supply their own luminance)
-    const albedo = albedoMap.get(name);
-    const isVideo = albedo?.isVideoTexture ?? false;
-
-    if (b.hasLM && lmTex && !b.invisible && !isVideo) {
+    // Lightmap — skip for video textures (they are self-illuminated)
+    if (b.hasLM && lmTex && !b.invisible && !isVid) {
       mat.lightMap          = lmTex;
       mat.lightMapIntensity = 1.0;
       meshesWithLM++;
@@ -587,9 +504,8 @@ export async function loadBSP({
   }
 
   console.log(
-    `[BSP] Meshes: ${totalMeshes}, with lightmap: ${meshesWithLM},` +
-    ` noclip: ${noclipMeshes}, invisible clip: ${invisibleMeshes}` +
-    ` video textures: ${videoCount}`
+    `[BSP] Meshes: ${totalMeshes}, lightmapped: ${meshesWithLM},` +
+    ` noclip: ${noclipMeshes}, invisible: ${invisibleMeshes}, video: ${videoCount}`
   );
   onProgress?.(100);
 
@@ -597,6 +513,5 @@ export async function loadBSP({
   if (ambientIntensity !== undefined) result.ambientIntensity = ambientIntensity;
   if (ambientColorArr)  result.ambientColor = new THREE.Color(...ambientColorArr);
   result.lights = parsed.lights ?? [];
-
   return result;
 }
