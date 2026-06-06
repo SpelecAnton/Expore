@@ -1,5 +1,5 @@
 /**
- * SPELEC BSP Loader v5.7 — VIDEO TEXTURES via DataTexture + getImageData
+ * SPELEC BSP Loader v5.8 — VIDEO TEXTURES via DataTexture + getImageData
  *
  * Texture loading strategy:
  *   video WebM/MP4            → hidden <video> + hidden <canvas> → DataTexture (Uint8Array)
@@ -128,44 +128,63 @@ function applyTexFilters(tex, { linearMag = false, mipmaps = true } = {}) {
  * DataTexture has no special-casing in Three.js internals — works fine with EffectComposer.
  */
 /**
- * Parse target display size from filename hint or companion .json sidecar.
- *
- * Filename hint:  textures/screen_320x180.webm  → { w: 320, h: 180 }
- * JSON sidecar:   textures/screen.json = {"w":320,"h":180}
- * Fallback:       use video natural size → repeat = (1,1), no tiling change.
- *
- * This controls tex.repeat so that UV=1.0 corresponds to exactly targetW
- * pixels of video content — matching whatever size Q3 editor assumed.
+ * Determine the "intended" texture size that Q3 editor used when baking UV coords.
+ * Strategy (in priority order):
+ *  1. WxH hint in filename:  screen_320x180.webm  → { w:320, h:180 }
+ *  2. Companion JSON sidecar: screen.json = {"w":320,"h":180}
+ *  3. Static image probe: load screen.png / .jpg and read naturalWidth/naturalHeight
+ *  4. Fallback: null → repeat=(1,1)
  */
-async function getVideoTargetSize(url) {
-  // 1. Parse WxH hint from filename: name_320x180.ext or name_320X180.ext
-  const base    = url.substring(0, url.lastIndexOf('.'));
+async function getVideoTargetSize(url, bases, texName) {
+  // 1. WxH hint in filename
+  const base     = url.substring(0, url.lastIndexOf('.'));
   const hinMatch = base.match(/_(\d+)[xX](\d+)$/);
-  if (hinMatch) {
-    return { w: parseInt(hinMatch[1], 10), h: parseInt(hinMatch[2], 10) };
-  }
+  if (hinMatch) return { w: parseInt(hinMatch[1], 10), h: parseInt(hinMatch[2], 10) };
 
-  // 2. Try companion JSON sidecar: same path but .json extension
+  // 2. Companion JSON sidecar
   try {
-    const jsonUrl = base + '.json';
-    const r = await fetch(jsonUrl, { method: 'GET' });
+    const r = await fetch(base + '.json');
     if (r.ok) {
-      const data = await r.json();
-      if (data.w && data.h) return { w: data.w, h: data.h };
+      const d = await r.json();
+      if (d.w && d.h) return { w: d.w, h: d.h };
     }
   } catch { /* no sidecar */ }
 
-  // 3. Fallback: natural video size (repeat=1, no scaling)
+  // 3. Probe static image with same texture name — read natural dimensions.
+  // These are the dimensions Q3 editor saw when it built the UV coords.
+  const STATIC_EXTS = ['.png', '.jpg', '.webp', '.avif'];
+  for (const staticBase of bases) {
+    if (!staticBase) continue;
+    for (const ext of STATIC_EXTS) {
+      const imgUrl = staticBase + texName + ext;
+      try {
+        const probe = await fetch(imgUrl, { method: 'HEAD' });
+        if (!probe.ok) continue;
+        // Load image to get naturalWidth/naturalHeight
+        const size = await new Promise(res => {
+          const img = new Image();
+          img.onload  = () => res({ w: img.naturalWidth, h: img.naturalHeight });
+          img.onerror = () => res(null);
+          img.src = imgUrl;
+        });
+        if (size && size.w > 0) {
+          console.log(`[BSP] Video UV reference: ${imgUrl} (${size.w}×${size.h})`);
+          return size;
+        }
+      } catch { /* try next */ }
+    }
+  }
+
   return null;
 }
 
-async function loadVideoTex(url) {
+async function loadVideoTex(url, bases = [], texName = '') {
   const ext = url.substring(url.lastIndexOf('.')).toLowerCase();
   if (ext === '.webm' && !_videoSupport.webm) { console.warn('[BSP] WebM not supported:', url); return null; }
   if (ext === '.mp4'  && !_videoSupport.mp4)  { console.warn('[BSP] MP4 not supported:', url);  return null; }
 
   // Fetch target size hint before starting video (non-blocking if no sidecar)
-  const targetSize = await getVideoTargetSize(url);
+  const targetSize = await getVideoTargetSize(url, bases, texName);
 
   return new Promise(resolve => {
     const video       = document.createElement('video');
@@ -359,7 +378,7 @@ async function findTex(bases, name) {
     if (!found) continue;
     if (_texCache.has(found)) return _texCache.get(found);
     const ext = found.substring(found.lastIndexOf('.')).toLowerCase();
-    const tex = VIDEO_EXTS_SET.has(ext) ? await loadVideoTex(found)
+    const tex = VIDEO_EXTS_SET.has(ext) ? await loadVideoTex(found, bases, name)
               : ANIM_EXTS.has(ext)      ? await loadAnimatedTex(found)
               :                           await loadStaticTex(found);
     _texCache.set(found, tex);
