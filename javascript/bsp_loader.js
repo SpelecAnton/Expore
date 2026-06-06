@@ -136,6 +136,10 @@ async function loadVideoTex(url) {
   if (ext === '.webm' && !_videoSupport.webm) { console.warn('[BSP] WebM not supported:', url); return null; }
   if (ext === '.mp4'  && !_videoSupport.mp4)  { console.warn('[BSP] MP4 not supported:', url);  return null; }
 
+  // Probe for audio before entering the Promise — keeps hasAudio in scope for done()
+  const urlBase  = url.substring(0, url.lastIndexOf('.'));
+  const hasAudio = await probeVideoHasAudio(urlBase);
+
   return new Promise(resolve => {
     const video       = document.createElement('video');
     video.src         = url;
