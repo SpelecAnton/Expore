@@ -1,5 +1,5 @@
 /**
- * SPELEC BSP Loader v5.8 — VIDEO TEXTURES via DataTexture + getImageData
+ * SPELEC BSP Loader v5.9 — VIDEO TEXTURES via DataTexture + getImageData
  *
  * Texture loading strategy:
  *   video WebM/MP4            → hidden <video> + hidden <canvas> → DataTexture (Uint8Array)
@@ -127,64 +127,11 @@ function applyTexFilters(tex, { linearMag = false, mipmaps = true } = {}) {
  * tickAnimatedTextures() copies decoded video pixels into the buffer each frame.
  * DataTexture has no special-casing in Three.js internals — works fine with EffectComposer.
  */
-/**
- * Determine the "intended" texture size that Q3 editor used when baking UV coords.
- * Strategy (in priority order):
- *  1. WxH hint in filename:  screen_320x180.webm  → { w:320, h:180 }
- *  2. Companion JSON sidecar: screen.json = {"w":320,"h":180}
- *  3. Static image probe: load screen.png / .jpg and read naturalWidth/naturalHeight
- *  4. Fallback: null → repeat=(1,1)
- */
-async function getVideoTargetSize(url, bases, texName) {
-  // 1. WxH hint in filename
-  const base     = url.substring(0, url.lastIndexOf('.'));
-  const hinMatch = base.match(/_(\d+)[xX](\d+)$/);
-  if (hinMatch) return { w: parseInt(hinMatch[1], 10), h: parseInt(hinMatch[2], 10) };
 
-  // 2. Companion JSON sidecar
-  try {
-    const r = await fetch(base + '.json');
-    if (r.ok) {
-      const d = await r.json();
-      if (d.w && d.h) return { w: d.w, h: d.h };
-    }
-  } catch { /* no sidecar */ }
-
-  // 3. Probe static image with same texture name — read natural dimensions.
-  // These are the dimensions Q3 editor saw when it built the UV coords.
-  const STATIC_EXTS = ['.png', '.jpg', '.webp', '.avif'];
-  for (const staticBase of bases) {
-    if (!staticBase) continue;
-    for (const ext of STATIC_EXTS) {
-      const imgUrl = staticBase + texName + ext;
-      try {
-        const probe = await fetch(imgUrl, { method: 'HEAD' });
-        if (!probe.ok) continue;
-        // Load image to get naturalWidth/naturalHeight
-        const size = await new Promise(res => {
-          const img = new Image();
-          img.onload  = () => res({ w: img.naturalWidth, h: img.naturalHeight });
-          img.onerror = () => res(null);
-          img.src = imgUrl;
-        });
-        if (size && size.w > 0) {
-          console.log(`[BSP] Video UV reference: ${imgUrl} (${size.w}×${size.h})`);
-          return size;
-        }
-      } catch { /* try next */ }
-    }
-  }
-
-  return null;
-}
-
-async function loadVideoTex(url, bases = [], texName = '') {
+async function loadVideoTex(url) {
   const ext = url.substring(url.lastIndexOf('.')).toLowerCase();
   if (ext === '.webm' && !_videoSupport.webm) { console.warn('[BSP] WebM not supported:', url); return null; }
   if (ext === '.mp4'  && !_videoSupport.mp4)  { console.warn('[BSP] MP4 not supported:', url);  return null; }
-
-  // Fetch target size hint before starting video (non-blocking if no sidecar)
-  const targetSize = await getVideoTargetSize(url, bases, texName);
 
   return new Promise(resolve => {
     const video       = document.createElement('video');
@@ -244,16 +191,8 @@ async function loadVideoTex(url, bases = [], texName = '') {
       tex.needsUpdate = true;
       tex._isBspVideo = true;
 
-      // Set UV repeat so UV=1.0 corresponds to targetSize pixels.
-      // If targetSize is null, repeat=(1,1) which means full video = one tile.
-      if (targetSize && targetSize.w > 0 && targetSize.h > 0) {
-        tex.repeat.set(W / targetSize.w, H / targetSize.h);
-        console.log(`[BSP] Video DataTexture ready: ${url} (${W}×${H}), target: ${targetSize.w}×${targetSize.h}, repeat: ${(W/targetSize.w).toFixed(2)}×${(H/targetSize.h).toFixed(2)}`);
-      } else {
-        tex.repeat.set(1, 1);
-        console.log(`[BSP] Video DataTexture ready: ${url} (${W}×${H}), repeat: 1×1 (no hint found)`);
-      }
-
+      tex.repeat.set(1, 1);  // corrected after load in loadBSP once static ref is known
+      console.log(`[BSP] Video DataTexture ready: ${url} (${W}×${H})`);
       _videoDataList.push({ video, canvas, ctx, W, H, tex });
       resolve(tex);
     };
@@ -378,7 +317,7 @@ async function findTex(bases, name) {
     if (!found) continue;
     if (_texCache.has(found)) return _texCache.get(found);
     const ext = found.substring(found.lastIndexOf('.')).toLowerCase();
-    const tex = VIDEO_EXTS_SET.has(ext) ? await loadVideoTex(found, bases, name)
+    const tex = VIDEO_EXTS_SET.has(ext) ? await loadVideoTex(found)
               : ANIM_EXTS.has(ext)      ? await loadAnimatedTex(found)
               :                           await loadStaticTex(found);
     _texCache.set(found, tex);
@@ -469,6 +408,53 @@ export async function loadBSP({ url, scene, textureBase = '', fallbackTexBase = 
     albedoMap.set(name, tex || _whiteTex);
     if (tex?._isBspVideo) videoCount++;
   }));
+
+  // ── Video UV repeat correction ───────────────────────────────────────────
+  // BSP UV coords assume UV=1.0 maps to one texture tile (e.g. 640×360 px).
+  // DataTexture uses video native size (e.g. 1280×720) as the tile unit.
+  // Fix: find reference dimensions from the static placeholder image (same BSP name),
+  // then set repeat = (videoW / refW, videoH / refH).
+  if (videoCount > 0) {
+    for (const [name, tex] of albedoMap) {
+      if (!tex._isBspVideo) continue;
+
+      // Find the video entry to get W/H
+      const entry = _videoDataList.find(e => e.tex === tex);
+      if (!entry) continue;
+
+      // Try to find a static image for this texture name to get reference dimensions
+      let refW = 0, refH = 0;
+
+      // First check: is there already a static texture loaded for this name?
+      // (unlikely since video won, but possible via cache from another batch)
+      const STATIC_EXTS = ['.png', '.jpg', '.webp', '.avif'];
+      for (const base of texBases) {
+        if (refW > 0) break;
+        if (!base) continue;
+        for (const ext of STATIC_EXTS) {
+          const imgUrl = base + name + ext;
+          try {
+            const probe = await fetch(imgUrl, { method: 'HEAD' });
+            if (!probe.ok) continue;
+            const size = await new Promise(res => {
+              const img = new Image();
+              img.onload  = () => res({ w: img.naturalWidth, h: img.naturalHeight });
+              img.onerror = () => res(null);
+              img.src = imgUrl;
+            });
+            if (size && size.w > 0) { refW = size.w; refH = size.h; break; }
+          } catch { /* try next */ }
+        }
+      }
+
+      if (refW > 0 && refH > 0) {
+        tex.repeat.set(entry.W / refW, entry.H / refH);
+        console.log(`[BSP] Video UV repeat: ${name} ref=${refW}×${refH} video=${entry.W}×${entry.H} repeat=${tex.repeat.x.toFixed(2)}×${tex.repeat.y.toFixed(2)}`);
+      } else {
+        console.log(`[BSP] Video UV repeat: ${name} — no static ref found, repeat stays 1×1`);
+      }
+    }
+  }
 
   if (videoCount > 0) console.log(`[BSP] Video textures active: ${videoCount}`);
   onProgress?.(95);
