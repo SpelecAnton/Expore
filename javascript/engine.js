@@ -21,7 +21,7 @@ import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.165.0/build/three.m
 import { EffectComposer }  from 'https://cdn.jsdelivr.net/npm/three@0.165.0/examples/jsm/postprocessing/EffectComposer.js';
 import { RenderPass }      from 'https://cdn.jsdelivr.net/npm/three@0.165.0/examples/jsm/postprocessing/RenderPass.js';
 import { UnrealBloomPass } from 'https://cdn.jsdelivr.net/npm/three@0.165.0/examples/jsm/postprocessing/UnrealBloomPass.js';
-import { loadBSP, tickAnimatedTextures, initTexLoader } from 'https://spelecanton.github.io/Expore/javascript/bsp_loader.js';
+import { loadBSP, tickAnimatedTextures, initTexLoader, bspHasVideoAudio } from 'https://spelecanton.github.io/Expore/javascript/bsp_loader.js';
 import { createPhysics } from 'https://spelecanton.github.io/Expore/javascript/physics.js';
 
 const PLAYER_HEIGHT = 80;
@@ -418,6 +418,7 @@ export async function initEngine({
 
   function startBgMusic() {
     if (bgMusicStarted || !bgMusic) return;
+    if (bspHasVideoAudio()) return;  // video provides its own audio — skip bg music
     bgMusicStarted = true;
     bgMusic.play().catch(err => console.warn('[Engine] BG music play failed:', err));
   }
