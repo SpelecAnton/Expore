@@ -1,5 +1,5 @@
 /**
- * SPELEC BSP Loader v5.5 — VIDEO TEXTURES via DataTexture + getImageData
+ * SPELEC BSP Loader v5.6 — VIDEO TEXTURES via DataTexture + getImageData
  *
  * Texture loading strategy:
  *   video WebM/MP4            → hidden <video> + hidden <canvas> → DataTexture (Uint8Array)
@@ -179,9 +179,14 @@ async function loadVideoTex(url) {
       const pixelBuf = new Uint8Array(W * H * 4);
       pixelBuf.set(firstFrame.data);
       const tex = new THREE.DataTexture(pixelBuf, W, H, THREE.RGBAFormat, THREE.UnsignedByteType);
-      applyTexFilters(tex, { linearMag: true, mipmaps: false });
+      tex.wrapS       = THREE.RepeatWrapping;
+      tex.wrapT       = THREE.RepeatWrapping;
       tex.minFilter   = THREE.LinearFilter;
+      tex.magFilter   = THREE.LinearFilter;
+      tex.colorSpace  = THREE.SRGBColorSpace;
+      tex.generateMipmaps = false;
       tex.flipY       = false;
+      tex.anisotropy  = _maxAniso;
       tex.needsUpdate = true;
       tex._isBspVideo = true;
 
@@ -426,11 +431,19 @@ export async function loadBSP({ url, scene, textureBase = '', fallbackTexBase = 
       mat = new THREE.MeshBasicMaterial({
         colorWrite: false, depthWrite: false, transparent: true, opacity: 0, side: THREE.DoubleSide,
       });
+    } else if (isVid) {
+      // Video textures: MeshBasicMaterial — self-illuminated, ignores scene lighting.
+      // This ensures the video is always visible regardless of ambient/lightmap state.
+      // UV repeat/offset are handled by the DataTexture directly.
+      mat = new THREE.MeshBasicMaterial({
+        map:  albedo,
+        side: THREE.DoubleSide,
+      });
     } else {
       mat = new THREE.MeshLambertMaterial({
         map:       albedo,
         side:      THREE.DoubleSide,
-        alphaTest: isVid ? 0 : 0.5,
+        alphaTest: 0.5,
       });
     }
 
