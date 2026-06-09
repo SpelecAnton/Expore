@@ -281,7 +281,7 @@ export async function initEngine({
   bloomStrength   = 0.4,   // Lowered default: full-screen bloom pass is expensive
   bloomRadius     = 0.4,
   bloomThreshold  = 0.2,
-  renderDistance  = 60,    // camera.far in Three.js units (default 60 ≈ 3000 Quake units)
+  renderDistance  = 180,    // camera.far in Three.js units (default 60 ≈ 3000 Quake units)
   maxPixelRatio   = 1.5,   // Cap pixel ratio — saves ~44% on Retina/4K vs 2.0
 }) {
   const renderer = new THREE.WebGLRenderer({
