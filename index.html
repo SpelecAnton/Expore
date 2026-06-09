@@ -66,36 +66,35 @@
     textureBase: 'textures/',
     mapName:     'MAP',
 
-    // ── Physics (BSP brush collision) ──────────────────────────────────────
-    // Units: Three.js (1 unit ≈ 50 Q3 units).
+    // ── Fog ───────────────────────────────────────────────────────────────
+    fogColor:       0x000000,   // fog + background color (hex)
+    renderDistance: 180,         // camera far plane in Three.js units
+
+    // ── Post-processing ───────────────────────────────────────────────────
+    bloomStrength:  0.1,
+    bloomRadius:    0.4,
+    bloomThreshold: 0.2,
+    maxPixelRatio:  1.5,
+
+    // ── Physics (Octree Capsule) ──────────────────────────────────────────
     physicsConfig: {
-      // Movement
-      MOVE_SPEED:      280 * 0.02,   // walk speed  (units/s)
-      TURN_SPEED:      2.5,          // A/D turning (rad/s)
-      LOOK_SPEED:      2.5,          // Q/E tilting (rad/s)
-      RETURN_SPEED:    5.0,          // auto-level speed after Q/E (rad/s)
+      MOVE_SPEED:      280 * 0.02,
+      TURN_SPEED:      2.5,
+      LOOK_SPEED:      2.5,
+      RETURN_SPEED:    5.0,
 
-      // Gravity & jump
-      GRAVITY:        -28.0,         // downward accel (units/s²)
-      JUMP_SPEED:      3.0,          // jump initial velocity (units/s)
-      TERMINAL_VEL:  -30.0,          // max fall speed (units/s)
+      GRAVITY:        -28.0,
+      JUMP_SPEED:      3.0,
+      TERMINAL_VEL:  -30.0,
 
-      // Player shape (affects collision box)
-      PLAYER_HEIGHT:  80 * 0.02,     // eye height above floor = 1.6 units
-      PLAYER_RADIUS:   0.28,         // AABB half-width
+      PLAYER_HEIGHT:  80 * 0.02,
+      PLAYER_RADIUS:   0.28,
 
-      // Collision tuning
-      STEP_HEIGHT:     0.45,         // max stair step height
-      SLOPE_MAX_ANGLE: 50,           // steeper = wall, not floor (degrees)
-      SKIN_WIDTH:      0.02,         // gap kept from surfaces
+      STEP_HEIGHT:     0.45,
+      SLOPE_MAX_ANGLE: 50,
+      SKIN_WIDTH:      0.02,
     },
 
-    // ── Post-processing bloom ───────────────────────────────────────────────
-    bloomStrength:  0.1,   // glow intensity
-    bloomRadius:    0.4,   // glow spread
-    bloomThreshold: 0.2,   // minimum brightness to bloom
-
-    // ── Callbacks ──────────────────────────────────────────────────────────
     onProgress(pct) {
       document.getElementById('progress-fill').style.width = pct + '%';
     },

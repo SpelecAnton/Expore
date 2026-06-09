@@ -283,6 +283,7 @@ export async function initEngine({
   bloomThreshold  = 0.2,
   renderDistance  = 180,    // camera.far in Three.js units (default 60 ≈ 3000 Quake units)
   maxPixelRatio   = 1.5,   // Cap pixel ratio — saves ~44% on Retina/4K vs 2.0
+  fogColor        = 0x000000, // Fog + scene background color
 }) {
   const renderer = new THREE.WebGLRenderer({
     canvas,
@@ -305,8 +306,8 @@ export async function initEngine({
   // Fog density derived from renderDistance: objects at renderDistance * 0.7 start fading
   // This prevents geometry from "popping" at the far clip plane
   const fogDensity = 2.8 / renderDistance;
-  scene.fog        = new THREE.FogExp2(0x000000, fogDensity);
-  scene.background = new THREE.Color(0x000000);
+  scene.fog        = new THREE.FogExp2(fogColor, fogDensity);
+  scene.background = new THREE.Color(fogColor);
 
   const camera = new THREE.PerspectiveCamera(FOV, window.innerWidth / window.innerHeight, 0.01, renderDistance);
   camera.position.set(0, PLAYER_HEIGHT * UNIT, 0);
