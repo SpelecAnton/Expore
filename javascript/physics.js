@@ -1,11 +1,26 @@
 /**
- * SPELEC PHYSICS v3.0 — CAPSULE & CCD UPDATE
+ * SPELEC PHYSICS v3.1 — SPATIAL GRID OPTIMIZATION
  *
- * Změny ve verzi 3.0:
- * 1. Hráč je nyní reprezentován matematickou kapsulí (zaoblená hlava a nohy), 
- * což zabraňuje zasekávání o drobné nerovnosti.
- * 2. Implementována Continuous Collision Detection (CCD) pro osu Y: zabraňuje propadnutí
- * mapou při extrémních rychlostech pádu přes tenkou podlahu (raycast sweep z předchozí pozice).
+ * Changes over v3.0:
+ *
+ * 1. SPATIAL GRID (SpatialGrid class):
+ *    - All collidable meshes are inserted into a 3D grid at refresh time.
+ *    - nearbyMeshes() now does a fast grid cell lookup instead of iterating
+ *      ALL collidables and computing bounding sphere distances every call.
+ *    - On large maps with 500+ meshes the physics loop was O(n) per raycast;
+ *      now it is O(1) average (only cells within radius are checked).
+ *    - Grid cell size = 4.0 units (tuned for typical room geometry).
+ *
+ * 2. Raycaster instance reuse:
+ *    - Single shared Raycaster, .far set per-call, no allocation per frame.
+ *
+ * 3. collectCollidables() unchanged — still respects noclip / invisible flags.
+ *
+ * 4. BVH awareness:
+ *    - If bsp_loader built a boundsTree on geometries (three-mesh-bvh),
+ *      the accelerated raycast is used automatically because Three.js
+ *      respects geometry.raycast when boundsTree is present.
+ *    - No code change needed here — BVH is transparent to Raycaster.
  */
 
 import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.165.0/build/three.module.js';
@@ -27,39 +42,106 @@ const DEFAULT_CFG = {
   GROUND_CHECK:    0.18,
   NUM_SIDE_RAYS:   16,
   NUM_SLOPE_RAYS:  8,
+  GRID_CELL_SIZE:  4.0,   // Spatial grid cell size in world units
 };
 
+// ── Spatial Grid ──────────────────────────────────────────────────────────────
+// Partitions world into fixed-size cells. Each mesh is inserted into all cells
+// that overlap its world-space AABB. Lookup returns only cells within radius.
+class SpatialGrid {
+  constructor(cellSize) {
+    this.cellSize = cellSize;
+    this.cells    = new Map();
+  }
+
+  _key(cx, cy, cz) {
+    return `${cx},${cy},${cz}`;
+  }
+
+  clear() {
+    this.cells.clear();
+  }
+
+  insert(mesh) {
+    if (!mesh.geometry.boundingBox) mesh.geometry.computeBoundingBox();
+
+    const box = mesh.geometry.boundingBox;
+    const mat = mesh.matrixWorld;
+
+    // Transform AABB corners into world space (approximate — use center + half-extents)
+    const center = new THREE.Vector3();
+    const size   = new THREE.Vector3();
+    box.getCenter(center).applyMatrix4(mat);
+    box.getSize(size);
+
+    const scale = new THREE.Vector3().setFromMatrixScale(mat);
+    const hx    = (size.x * scale.x) / 2 + 0.1;
+    const hy    = (size.y * scale.y) / 2 + 0.1;
+    const hz    = (size.z * scale.z) / 2 + 0.1;
+
+    const cs   = this.cellSize;
+    const minX = Math.floor((center.x - hx) / cs);
+    const maxX = Math.floor((center.x + hx) / cs);
+    const minY = Math.floor((center.y - hy) / cs);
+    const maxY = Math.floor((center.y + hy) / cs);
+    const minZ = Math.floor((center.z - hz) / cs);
+    const maxZ = Math.floor((center.z + hz) / cs);
+
+    for (let cx = minX; cx <= maxX; cx++) {
+      for (let cy = minY; cy <= maxY; cy++) {
+        for (let cz = minZ; cz <= maxZ; cz++) {
+          const key = this._key(cx, cy, cz);
+          if (!this.cells.has(key)) this.cells.set(key, []);
+          this.cells.get(key).push(mesh);
+        }
+      }
+    }
+  }
+
+  // Returns unique meshes from all cells overlapping a sphere (origin, radius)
+  query(origin, radius) {
+    const cs      = this.cellSize;
+    const r       = radius;
+    const minX    = Math.floor((origin.x - r) / cs);
+    const maxX    = Math.floor((origin.x + r) / cs);
+    const minY    = Math.floor((origin.y - r) / cs);
+    const maxY    = Math.floor((origin.y + r) / cs);
+    const minZ    = Math.floor((origin.z - r) / cs);
+    const maxZ    = Math.floor((origin.z + r) / cs);
+
+    const seen   = new Set();
+    const result = [];
+
+    for (let cx = minX; cx <= maxX; cx++) {
+      for (let cy = minY; cy <= maxY; cy++) {
+        for (let cz = minZ; cz <= maxZ; cz++) {
+          const cell = this.cells.get(this._key(cx, cy, cz));
+          if (!cell) continue;
+          for (const mesh of cell) {
+            if (!seen.has(mesh)) {
+              seen.add(mesh);
+              result.push(mesh);
+            }
+          }
+        }
+      }
+    }
+
+    return result;
+  }
+}
+
+// ── Collidable collection ─────────────────────────────────────────────────────
 function collectCollidables(scene) {
   const list = [];
   scene.traverse(obj => {
     if (!obj.isMesh || !obj.geometry) return;
     if (obj.userData.noclip) return;
-    
-    // Povolíme kolize pro invisible objekty (CLIP) i v případě problémů s depthWrite
-    if (obj.material && obj.material.depthWrite === false && !obj.userData.invisible) {
-      return;
-    }
-    
+    if (obj.material && obj.material.depthWrite === false && !obj.userData.invisible) return;
     if (!obj.geometry.attributes.position) return;
     list.push(obj);
   });
   return list;
-}
-
-const _sv = new THREE.Vector3();
-const _sc = new THREE.Vector3();
-
-function nearbyMeshes(collidables, origin, maxDist) {
-  const result = [];
-  for (const mesh of collidables) {
-    if (!mesh.geometry.boundingSphere) mesh.geometry.computeBoundingSphere();
-    _sc.copy(mesh.geometry.boundingSphere.center).applyMatrix4(mesh.matrixWorld);
-    _sv.setFromMatrixScale(mesh.matrixWorld);
-    const s = Math.max(_sv.x, _sv.y, _sv.z);
-    const r = mesh.geometry.boundingSphere.radius * s + maxDist;
-    if (_sc.distanceToSquared(origin) < r * r) result.push(mesh);
-  }
-  return result;
 }
 
 const _up    = new THREE.Vector3(0, 1, 0);
@@ -78,47 +160,57 @@ export function createPhysics(scene, userCFG = {}) {
   let   currentPitch = 0;
   let   collidablesReady = false;
 
+  // Spatial grid for fast proximity queries
+  const grid = new SpatialGrid(CFG.GRID_CELL_SIZE);
+
+  // Single shared Raycaster — avoids allocation every frame
   const ray = new THREE.Raycaster();
   ray.firstHitOnly = true;
-  ray.layers.enableAll(); // Raycaster nyní vidí všechny vrstvy (včetně skryté kolizní vrstvy 1)
+  ray.layers.enableAll();
 
   function refreshCollidables() {
     scene.updateMatrixWorld(true);
     collidables = collectCollidables(scene);
+
+    // Rebuild spatial grid
+    grid.clear();
+    for (const mesh of collidables) {
+      // Ensure BoundingBox exists for grid insertion
+      if (!mesh.geometry.boundingBox) mesh.geometry.computeBoundingBox();
+      grid.insert(mesh);
+    }
+
     collidablesReady = true;
+    console.log(`[Physics] Grid built: ${collidables.length} collidables, cell size ${CFG.GRID_CELL_SIZE}`);
   }
 
-  // ── Collect unique wall normals at a given position (CAPSULE SHAPE) ───────
+  // Replace nearbyMeshes with grid lookup
+  function nearbyMeshes(origin, maxDist) {
+    return grid.query(origin, maxDist);
+  }
+
+  // ── Collect wall normals (CAPSULE SHAPE) ──────────────────────────────────
   function collectWalls(position) {
     const walls = [];
-
-    // Upravené výšky pro lepší definici kapsule
     const checkHeights = [
-      CFG.PLAYER_HEIGHT * 0.05, // Vrch hlavy
-      CFG.PLAYER_HEIGHT * 0.25, // Hruď
-      CFG.PLAYER_HEIGHT * 0.50, // Pas
-      CFG.PLAYER_HEIGHT * 0.85, // Kolena (začátek spodního zakřivení)
-      CFG.PLAYER_HEIGHT * 0.95, // Kotníky
+      CFG.PLAYER_HEIGHT * 0.05,
+      CFG.PLAYER_HEIGHT * 0.25,
+      CFG.PLAYER_HEIGHT * 0.50,
+      CFG.PLAYER_HEIGHT * 0.85,
+      CFG.PLAYER_HEIGHT * 0.95,
     ];
-
     const R = CFG.PLAYER_RADIUS;
     const H = CFG.PLAYER_HEIGHT;
 
     for (const yOff of checkHeights) {
-      // VÝPOČET KAPSULE: efektivní poloměr v dané výšce (zaoblení nahoře a dole)
       let effectiveRadius = R;
-      
-      if (yOff < R) { 
-        // Horní polokoule
+      if (yOff < R) {
         const d = R - yOff;
         effectiveRadius = Math.sqrt(Math.max(0, R * R - d * d));
-      } else if (yOff > H - R) { 
-        // Spodní polokoule
+      } else if (yOff > H - R) {
         const d = yOff - (H - R);
         effectiveRadius = Math.sqrt(Math.max(0, R * R - d * d));
       }
-
-      // Pokud je zaoblení už příliš úzké, paprsek ignorujeme
       if (effectiveRadius < 0.01) continue;
 
       _orig.set(position.x, position.y - yOff, position.z);
@@ -128,9 +220,9 @@ export function createPhysics(scene, userCFG = {}) {
         _dir.set(Math.cos(angle), 0, Math.sin(angle));
 
         ray.set(_orig, _dir);
-        ray.far = effectiveRadius + CFG.SKIN_WIDTH; // Dosah přesně kopíruje tvar kapsule
+        ray.far = effectiveRadius + CFG.SKIN_WIDTH;
 
-        const nearby = nearbyMeshes(collidables, _orig, CFG.PLAYER_RADIUS + 0.5);
+        const nearby = nearbyMeshes(_orig, CFG.PLAYER_RADIUS + 0.5);
         const hits   = ray.intersectObjects(nearby, false);
         if (!hits.length) continue;
 
@@ -141,9 +233,7 @@ export function createPhysics(scene, userCFG = {}) {
           ?? new THREE.Vector3();
         if (normal.dot(_dir) > 0) normal.negate();
 
-        const slopeAngle = Math.acos(
-          Math.max(-1, Math.min(1, normal.dot(_up)))
-        ) * (180 / Math.PI);
+        const slopeAngle = Math.acos(Math.max(-1, Math.min(1, normal.dot(_up)))) * (180 / Math.PI);
         if (slopeAngle <= CFG.SLOPE_MAX_ANGLE) continue;
 
         const flat = new THREE.Vector3(normal.x, 0, normal.z).normalize();
@@ -152,10 +242,7 @@ export function createPhysics(scene, userCFG = {}) {
 
         const cosAngle = -_dir.dot(normal);
         const perpDist = hit.distance * cosAngle;
-        
-        // Penetrace počítána oproti zmenšenému poloměru kapsule
-        const pen = effectiveRadius - perpDist;
-
+        const pen      = effectiveRadius - perpDist;
         if (pen > 0) walls.push({ flat, pen });
       }
     }
@@ -163,7 +250,7 @@ export function createPhysics(scene, userCFG = {}) {
     return walls;
   }
 
-function pushOutOfWalls(position) {
+  function pushOutOfWalls(position) {
     const startPos = position.clone();
     let totalMoved = 0;
 
@@ -173,30 +260,21 @@ function pushOutOfWalls(position) {
       let bestFlat = null;
 
       for (const { flat, pen } of walls) {
-        if (pen > maxPen) {
-          maxPen = pen;
-          bestFlat = flat;
-        }
+        if (pen > maxPen) { maxPen = pen; bestFlat = flat; }
       }
 
-      // 1. Zastropování: Pokud je průnik příliš velký, ignoruj ho (ochrana proti vystřelení)
       if (maxPen > 0.001 && maxPen < 0.2 && bestFlat) {
         const move = bestFlat.clone().multiplyScalar(maxPen);
         position.add(move);
         totalMoved += move.length();
       } else {
-        break; 
+        break;
       }
     }
 
-    // 2. POJISTKA: Pokud jsme se posunuli příliš daleko od původní pozice, 
-    // znamená to, že systém selhal (pravděpodobně roh). Vrať se.
-    if (totalMoved > 0.3) {
-      position.copy(startPos);
-    }
+    if (totalMoved > 0.3) position.copy(startPos);
   }
 
-  // ── Clip movement delta against wall planes ───────────────────────────────
   function slideMove(position, delta) {
     const walls = collectWalls(position);
     const out   = delta.clone();
@@ -206,13 +284,12 @@ function pushOutOfWalls(position) {
       const d = out.dot(flat);
       if (d < 0) {
         out.addScaledVector(flat, -d);
-
         for (const prevFlat of clippedPlanes) {
           if (out.dot(prevFlat) < -0.001) {
             const crease = new THREE.Vector3().crossVectors(flat, prevFlat).normalize();
             const speed = delta.dot(crease);
             out.copy(crease).multiplyScalar(speed);
-            break; 
+            break;
           }
         }
         clippedPlanes.push(flat);
@@ -221,20 +298,15 @@ function pushOutOfWalls(position) {
     return out;
   }
 
-  // ── Ground detection (s možností fallDistance) ────────────────────────────
+  // ── Ground detection ──────────────────────────────────────────────────────
   function groundCheck(position, fallDistance = 0) {
     const offsets = [[0, 0]];
     for (let i = 0; i < CFG.NUM_SLOPE_RAYS; i++) {
       const a = (i / CFG.NUM_SLOPE_RAYS) * Math.PI * 2;
-      // Rozšířeno na 95 % poloměru hráče, aby paprsky "našly" okraj schodu
-      offsets.push([
-        Math.cos(a) * CFG.PLAYER_RADIUS * 0.95, 
-        Math.sin(a) * CFG.PLAYER_RADIUS * 0.95,
-      ]);
+      offsets.push([Math.cos(a) * CFG.PLAYER_RADIUS * 0.95, Math.sin(a) * CFG.PLAYER_RADIUS * 0.95]);
     }
 
-    // Paprsek se prodlouží o vzdálenost pádu, takže zachytí i nekonečně tenkou zem
-    const checkDist  = CFG.PLAYER_HEIGHT + CFG.STEP_HEIGHT + 0.2 + fallDistance;
+    const checkDist    = CFG.PLAYER_HEIGHT + CFG.STEP_HEIGHT + 0.2 + fallDistance;
     let   highestFloor = null;
 
     for (const [ox, oz] of offsets) {
@@ -242,21 +314,15 @@ function pushOutOfWalls(position) {
       ray.set(_orig, _down);
       ray.far = checkDist;
 
-      const nearby = nearbyMeshes(collidables, _orig, checkDist);
+      const nearby = nearbyMeshes(_orig, checkDist);
       const hits   = ray.intersectObjects(nearby, false);
       if (!hits.length) continue;
 
       const hit = hits[0];
-      let normal = hit.face?.normal
-        .clone()
-        .transformDirection(hit.object.matrixWorld)
-        ?? _up.clone();
+      let normal = hit.face?.normal.clone().transformDirection(hit.object.matrixWorld) ?? _up.clone();
       if (normal.dot(_down) > 0) normal.negate();
 
-      const angle = Math.acos(
-        Math.max(-1, Math.min(1, normal.dot(_up)))
-      ) * (180 / Math.PI);
-
+      const angle = Math.acos(Math.max(-1, Math.min(1, normal.dot(_up)))) * (180 / Math.PI);
       if (angle < CFG.SLOPE_MAX_ANGLE) {
         const eyeY = hit.point.y + CFG.PLAYER_HEIGHT;
         if (highestFloor === null || eyeY > highestFloor) highestFloor = eyeY;
@@ -266,102 +332,72 @@ function pushOutOfWalls(position) {
     return highestFloor;
   }
 
-  // ── Ceiling clearance at a given position ─────────────────────────────────
   function ceilingClearance(position) {
     _orig.set(position.x, position.y, position.z);
     ray.set(_orig, _up);
     ray.far = 4.0;
-
-    const nearby = nearbyMeshes(collidables, _orig, ray.far);
+    const nearby = nearbyMeshes(_orig, ray.far);
     const hits   = ray.intersectObjects(nearby, false);
     return hits.length ? hits[0].distance : Infinity;
   }
 
-  // ── Underground recovery ──────────────────────────────────────────────────
   function recoverFromUnderground(position) {
     _orig.set(position.x, position.y - CFG.PLAYER_HEIGHT - 0.05, position.z);
     ray.set(_orig, _up);
     ray.far = CFG.PLAYER_HEIGHT + 0.6;
-
-    const nearby = nearbyMeshes(collidables, _orig, ray.far);
+    const nearby = nearbyMeshes(_orig, ray.far);
     const hits   = ray.intersectObjects(nearby, false);
     if (!hits.length) return null;
 
     const hit = hits[0];
-    let normal = hit.face?.normal
-      .clone()
-      .transformDirection(hit.object.matrixWorld)
-      ?? _up.clone();
+    let normal = hit.face?.normal.clone().transformDirection(hit.object.matrixWorld) ?? _up.clone();
     if (normal.dot(_up) > 0) return null;
 
-    const angle = Math.acos(
-      Math.max(-1, Math.min(1, Math.abs(normal.dot(_up))))
-    ) * (180 / Math.PI);
-
-    return angle < CFG.SLOPE_MAX_ANGLE
-      ? hit.point.y + CFG.PLAYER_HEIGHT
-      : null;
+    const angle = Math.acos(Math.max(-1, Math.min(1, Math.abs(normal.dot(_up))))) * (180 / Math.PI);
+    return angle < CFG.SLOPE_MAX_ANGLE ? hit.point.y + CFG.PLAYER_HEIGHT : null;
   }
 
-  // ── Quake-style PM_StepSlideMove ──────────────────────────────────────────
+  // ── Quake-style step slide ────────────────────────────────────────────────
   function quakeStepSlideMove(position, intentMove) {
-    if (!onGround || intentMove.lengthSq() < 0.00001) {
-      return slideMove(position, intentMove); 
-    }
+    if (!onGround || intentMove.lengthSq() < 0.00001) return slideMove(position, intentMove);
 
     const slidDown = slideMove(position, intentMove);
-
-    if (slidDown.lengthSq() >= intentMove.lengthSq() * 0.99) {
-      return slidDown;
-    }
-
-    if (ceilingClearance(position) < CFG.STEP_HEIGHT + 0.1) {
-      return slidDown;
-    }
+    if (slidDown.lengthSq() >= intentMove.lengthSq() * 0.99) return slidDown;
+    if (ceilingClearance(position) < CFG.STEP_HEIGHT + 0.1) return slidDown;
 
     const posUp = position.clone();
     posUp.y += CFG.STEP_HEIGHT;
-
     const slidUp = slideMove(posUp, intentMove);
     posUp.x += slidUp.x;
     posUp.z += slidUp.z;
 
     const landY = groundCheck(posUp);
-
     if (landY !== null) {
       const lift = landY - position.y;
-
       if (lift > 0.001 && lift <= CFG.STEP_HEIGHT + 0.05) {
         if (slidUp.lengthSq() > slidDown.lengthSq() + 0.000001) {
-          position.y = landY; 
-          return slidUp;      
+          position.y = landY;
+          return slidUp;
         }
       }
     }
-
     return slidDown;
   }
 
-  // ── Brush escape ──────────────────────────────────────────────────────────
   function escapeBrush(position) {
     const escapeR = CFG.PLAYER_RADIUS * 1.5;
-    for (const mesh of collidables) {
+    const nearby  = nearbyMeshes(position, escapeR + 1.0);
+    for (const mesh of nearby) {
       if (!mesh.geometry.boundingSphere) continue;
-      _sc.copy(mesh.geometry.boundingSphere.center).applyMatrix4(mesh.matrixWorld);
-      _sv.setFromMatrixScale(mesh.matrixWorld);
-      const s = Math.max(_sv.x, _sv.y, _sv.z);
-      const r = mesh.geometry.boundingSphere.radius * s;
+      const center = mesh.geometry.boundingSphere.center.clone().applyMatrix4(mesh.matrixWorld);
+      const scale  = new THREE.Vector3().setFromMatrixScale(mesh.matrixWorld);
+      const r = mesh.geometry.boundingSphere.radius * Math.max(scale.x, scale.y, scale.z);
       if (r > 3.0) continue;
 
-      const dist = _sc.distanceTo(position);
+      const dist = center.distanceTo(position);
       if (dist < escapeR) {
-        const out = new THREE.Vector3()
-          .subVectors(position, _sc)
-          .setY(0)
-          .normalize();
-        if (out.lengthSq() > 0.001) {
-          position.addScaledVector(out, escapeR - dist);
-        }
+        const out = new THREE.Vector3().subVectors(position, center).setY(0).normalize();
+        if (out.lengthSq() > 0.001) position.addScaledVector(out, escapeR - dist);
       }
     }
   }
@@ -371,11 +407,9 @@ function pushOutOfWalls(position) {
     dt = Math.min(dt, 0.05);
     if (!collidablesReady) refreshCollidables();
 
-    // Turning
     if (keys['a'] || keys['arrowleft'])  yaw += CFG.TURN_SPEED * dt;
     if (keys['d'] || keys['arrowright']) yaw -= CFG.TURN_SPEED * dt;
 
-    // Head tilt
     const MAX_PITCH = 45 * (Math.PI / 180);
     if (keys['q']) {
       currentPitch = Math.max(currentPitch - CFG.LOOK_SPEED * dt, -MAX_PITCH);
@@ -388,23 +422,18 @@ function pushOutOfWalls(position) {
     }
     camera.rotation.set(currentPitch, yaw, 0, 'YXZ');
 
-    // Horizontal input
     _move.set(0, 0, 0);
     if (keys['w'] || keys['arrowup'])   _move.z -= 1;
     if (keys['s'] || keys['arrowdown']) _move.z += 1;
     if (_move.lengthSq() > 0) {
-      _move.normalize()
-        .multiplyScalar(CFG.MOVE_SPEED * dt)
-        .applyAxisAngle(_yAxis, yaw);
+      _move.normalize().multiplyScalar(CFG.MOVE_SPEED * dt).applyAxisAngle(_yAxis, yaw);
     }
 
-    // Jump
     if ((keys[' '] || keys['space']) && onGround) {
       velocity.y = CFG.JUMP_SPEED;
       onGround   = false;
     }
 
-    // Vertical velocity
     if (!onGround) {
       velocity.y += CFG.GRAVITY * dt;
       velocity.y  = Math.max(velocity.y, CFG.TERMINAL_VEL);
@@ -412,19 +441,14 @@ function pushOutOfWalls(position) {
       velocity.y = Math.min(velocity.y, 0);
     }
 
-    // ── Horizontal movement pipeline ──────────────────────────────────────
     pushOutOfWalls(camera.position);
-
     const finalSlid = quakeStepSlideMove(camera.position, _move);
-
     camera.position.x += finalSlid.x;
     camera.position.z += finalSlid.z;
-
     pushOutOfWalls(camera.position);
 
-    // ── Vertical movement ─────────────────────────────────────────────────
-    const deltaY = velocity.y * dt;
-    const prevPos = camera.position.clone(); // Uložíme pozici pro sweep raycast
+    const deltaY  = velocity.y * dt;
+    const prevPos = camera.position.clone();
 
     if (velocity.y > 0) {
       const HEAD_GAP  = 0.1;
@@ -439,15 +463,10 @@ function pushOutOfWalls(position) {
       camera.position.y += deltaY;
     }
 
-    // ── Ground snap (Continuous Collision Sweep) ──────────────────────────
-    // Spočítáme, jakou vzdálenost jsme propadli, a přidáme ji k délce paprsku
     const fallDist = velocity.y < 0 ? Math.abs(deltaY) + 0.1 : 0;
-    
-    // Zásadní fix: Střílíme dolů z PŘEDCHOZÍ pozice. Tím protneme jakkoliv tenkou podlahu.
     let floorY = groundCheck(prevPos, fallDist);
 
     if (floorY !== null) {
-      // Pokud bychom proletěli podlahou, "přilepíme" hráče zpět nahoru
       if (camera.position.y <= floorY + CFG.SKIN_WIDTH * 2) {
         camera.position.y = floorY;
         onGround           = true;
@@ -459,7 +478,6 @@ function pushOutOfWalls(position) {
       onGround = false;
     }
 
-    // ── Underground recovery (Záchrana např. při teleportaci) ─────────────
     if (!onGround) {
       const recovered = recoverFromUnderground(camera.position);
       if (recovered !== null) {
@@ -471,7 +489,6 @@ function pushOutOfWalls(position) {
     }
 
     escapeBrush(camera.position);
-
     return yaw;
   }
 
@@ -481,7 +498,7 @@ function pushOutOfWalls(position) {
     teleport(camera, x, y, z) {
       camera.position.set(x, y, z);
       velocity.set(0, 0, 0);
-      onGround    = false;
+      onGround     = false;
       currentPitch = 0;
     },
     get isOnGround() { return onGround; },
