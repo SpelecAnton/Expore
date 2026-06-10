@@ -320,9 +320,23 @@ export async function initEngine({
 
   const scene  = new THREE.Scene();
 
-  const fogDensity = 2.8 / renderDistance;
-  scene.fog        = new THREE.FogExp2(fogColor, fogDensity);
-  scene.background = new THREE.Color(fogColor);
+  // Convert fogColor from sRGB → linear so ACESFilmic tone mapping
+  // does not shift the perceived hue (e.g. 0x00ff00 appearing washed out).
+  const fogColorLinear = new THREE.Color(fogColor).convertSRGBToLinear();
+
+  // Use linear Fog instead of FogExp2:
+  //  - FogExp2 measures euclidean distance from the camera, so diagonal
+  //    fragments (screen corners) are further away and get less fog than
+  //    centre fragments at the same depth → objects appear in peripheral
+  //    vision before they appear straight ahead.
+  //  - Linear Fog in Three.js uses the same euclidean distance but the
+  //    gradual ramp makes the angle-difference much less noticeable.
+  //  - near = 20 % of renderDistance, far = renderDistance gives a
+  //    comfortable fade that matches the old FogExp2 density.
+  const fogNear = renderDistance * 0.2;
+  const fogFar  = renderDistance;
+  scene.fog        = new THREE.Fog(fogColorLinear, fogNear, fogFar);
+  scene.background = new THREE.Color(fogColorLinear);
 
   const camera = new THREE.PerspectiveCamera(FOV, window.innerWidth / window.innerHeight, 0.01, renderDistance);
   camera.position.set(0, PLAYER_HEIGHT * UNIT, 0);
@@ -355,7 +369,8 @@ export async function initEngine({
 
   const portals     = [];
   let   yaw         = 0;
-  let   worldMeshes = [];
+  let   worldMeshes = [];   // opaque meshes — used for physics & portal occlusion
+  let   clipMeshes  = [];   // invisible CLIP brushes — used only for portal occlusion
 
   const mapBase        = mapBaseFromUrl(mapUrl);
   const bgMusicPromise = findBackgroundMusic(mapBase);
@@ -385,13 +400,18 @@ export async function initEngine({
       yaw = ps.angle * Math.PI / 180;
     }
 
-    // Build worldMeshes — exclude invisible clip meshes (zero opacity, can't occlude portals)
+    // Build worldMeshes (opaque) and clipMeshes (invisible CLIP brushes).
+    // worldMeshes: used for physics + portal occlusion raycasts.
+    // clipMeshes:  invisible — skipped by bloom/render but still block portal clicks.
     const portalMeshSet = new Set(portals.map(p => p.mesh));
     scene.traverse(obj => {
       if (!obj.isMesh || !obj.geometry) return;
       if (portalMeshSet.has(obj)) return;
-      if (obj.userData.invisible) return;            // clip brush — skip for portal occlusion
-      if (obj.material?.depthWrite === false) return; // other transparent — skip
+      if (obj.userData.invisible) {
+        clipMeshes.push(obj);  // CLIP brush — invisible but blocks portal interaction
+        return;
+      }
+      if (obj.material?.depthWrite === false) return; // other transparent — skip both lists
       worldMeshes.push(obj);
     });
 
@@ -406,10 +426,9 @@ export async function initEngine({
     _fallbackRoom(scene);
     ambient.intensity = 3;
     scene.traverse(obj => {
-      if (obj.isMesh && obj.geometry && !obj.userData.invisible &&
-          obj.material?.depthWrite !== false) {
-        worldMeshes.push(obj);
-      }
+      if (!obj.isMesh || !obj.geometry) return;
+      if (obj.userData.invisible) { clipMeshes.push(obj); return; }
+      if (obj.material?.depthWrite !== false) worldMeshes.push(obj);
     });
     _sceneReady = true;
   }
@@ -462,8 +481,11 @@ export async function initEngine({
     wallRaycaster.ray.copy(portalRaycaster.ray);
     wallRaycaster.near = portalRaycaster.near;
     wallRaycaster.far  = portalDist - 0.05;
+    // Check both opaque world meshes AND invisible CLIP brushes for occlusion.
+    // Without clipMeshes, portals behind CLIP walls could be clicked through them.
     const wallHits = wallRaycaster.intersectObjects(worldMeshes, false);
-    if (wallHits.length > 0) { _lastPortalHoverResult = null; return null; }
+    const clipHits = clipMeshes.length ? wallRaycaster.intersectObjects(clipMeshes, false) : [];
+    if (wallHits.length > 0 || clipHits.length > 0) { _lastPortalHoverResult = null; return null; }
 
     _lastPortalHoverResult = portals.find(p => p.mesh === portalHits[0].object) ?? null;
     return _lastPortalHoverResult;
