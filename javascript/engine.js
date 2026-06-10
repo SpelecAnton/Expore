@@ -50,6 +50,7 @@ import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.165.0/build/three.m
 import { EffectComposer }  from 'https://cdn.jsdelivr.net/npm/three@0.165.0/examples/jsm/postprocessing/EffectComposer.js';
 import { RenderPass }      from 'https://cdn.jsdelivr.net/npm/three@0.165.0/examples/jsm/postprocessing/RenderPass.js';
 import { UnrealBloomPass } from 'https://cdn.jsdelivr.net/npm/three@0.165.0/examples/jsm/postprocessing/UnrealBloomPass.js';
+import { ShaderPass }      from 'https://cdn.jsdelivr.net/npm/three@0.165.0/examples/jsm/postprocessing/ShaderPass.js';
 import { loadBSP, tickAnimatedTextures, initTexLoader } from 'https://spelecanton.github.io/Expore/javascript/bsp_loader.js';
 import { createPhysics } from 'https://spelecanton.github.io/Expore/javascript/physics.js';
 
@@ -320,23 +321,14 @@ export async function initEngine({
 
   const scene  = new THREE.Scene();
 
-  // Convert fogColor from sRGB → linear so ACESFilmic tone mapping
-  // does not shift the perceived hue (e.g. 0x00ff00 appearing washed out).
-  const fogColorLinear = new THREE.Color(fogColor).convertSRGBToLinear();
-
-  // Use linear Fog instead of FogExp2:
-  //  - FogExp2 measures euclidean distance from the camera, so diagonal
-  //    fragments (screen corners) are further away and get less fog than
-  //    centre fragments at the same depth → objects appear in peripheral
-  //    vision before they appear straight ahead.
-  //  - Linear Fog in Three.js uses the same euclidean distance but the
-  //    gradual ramp makes the angle-difference much less noticeable.
-  //  - near = 20 % of renderDistance, far = renderDistance gives a
-  //    comfortable fade that matches the old FogExp2 density.
-  const fogNear = renderDistance * 0.2;
-  const fogFar  = renderDistance;
-  scene.fog        = new THREE.Fog(fogColorLinear, fogNear, fogFar);
-  scene.background = new THREE.Color(fogColorLinear);
+  // No scene.fog — fog is applied as a Z-depth post-processing ShaderPass AFTER
+  // tone mapping. This means:
+  //   1. fogColor is exact sRGB (not shifted by ACESFilmic / exposure).
+  //   2. Fog factor is based on camera Z-depth, not euclidean distance, so
+  //      no angle-dependent variation in screen corners.
+  scene.fog        = null;
+  scene.background = null;
+  renderer.setClearColor(0x000000, 1); // cleared to black; fog pass replaces it
 
   const camera = new THREE.PerspectiveCamera(FOV, window.innerWidth / window.innerHeight, 0.01, renderDistance);
   camera.position.set(0, PLAYER_HEIGHT * UNIT, 0);
@@ -345,7 +337,21 @@ export async function initEngine({
   scene.add(ambient);
 
   // ── Post-processing setup ─────────────────────────────────────────────────
-  const composer  = new EffectComposer(renderer);
+
+  // sceneRT has a DepthTexture so the Z-depth fog ShaderPass can read real
+  // per-pixel Z values from the depth buffer after the scene is rendered.
+  const sceneRT = new THREE.WebGLRenderTarget(
+    window.innerWidth, window.innerHeight,
+    { minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter, stencilBuffer: false },
+  );
+  sceneRT.depthBuffer  = true;
+  sceneRT.depthTexture = new THREE.DepthTexture(window.innerWidth, window.innerHeight);
+  sceneRT.depthTexture.type = THREE.FloatType;
+
+  // Passing sceneRT to EffectComposer makes renderTarget1 = sceneRT.
+  // RenderPass writes to renderTarget1, so sceneRT.depthTexture is populated
+  // with depth data that persists through subsequent passes (bloom etc.).
+  const composer   = new EffectComposer(renderer, sceneRT);
   const renderPass = new RenderPass(scene, camera);
   composer.addPass(renderPass);
 
@@ -360,11 +366,67 @@ export async function initEngine({
       bloomRadius,
       bloomThreshold,
     );
+    // Start disabled — enabled after scene is fully built (avoids 3 FPS during load).
+    bloomPass.enabled = false;
     composer.addPass(bloomPass);
   }
 
-  // Flag: use cheap renderer.render() until scene is fully built.
-  // Bloom on a half-built 80 MB scene was the main cause of 3 FPS during load.
+  // ── Z-Depth Fog ShaderPass ────────────────────────────────────────────────
+  // Applied AFTER tone mapping so fogColor reaches the screen as exact sRGB.
+  // Uses linearised Z-depth from sceneRT.depthTexture (not euclidean distance)
+  // so fog density is perfectly uniform regardless of viewing angle.
+  const fogPass = new ShaderPass({
+    uniforms: {
+      tDiffuse:   { value: null },                          // set automatically by ShaderPass
+      tDepth:     { value: sceneRT.depthTexture },          // depth captured during RenderPass
+      fogColor:   { value: new THREE.Color(fogColor) },     // exact sRGB — not tone-mapped
+      fogNear:    { value: 0 },                             // fog starts at camera (distance 0)
+      fogFar:     { value: renderDistance },
+      cameraNear: { value: camera.near },
+      cameraFar:  { value: camera.far },
+    },
+    vertexShader: `
+      varying vec2 vUv;
+      void main() {
+        vUv = uv;
+        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+      }
+    `,
+    fragmentShader: `
+      uniform sampler2D tDiffuse;
+      uniform sampler2D tDepth;
+      uniform vec3      fogColor;
+      uniform float     fogNear;
+      uniform float     fogFar;
+      uniform float     cameraNear;
+      uniform float     cameraFar;
+
+      varying vec2 vUv;
+
+      // Convert raw depth buffer value [0,1] → eye-space Z distance from camera.
+      // Uses the standard perspective reconstruction formula.
+      float linearizeDepth(float rawDepth) {
+        float z_ndc = rawDepth * 2.0 - 1.0;
+        return (2.0 * cameraNear * cameraFar)
+               / (cameraFar + cameraNear - z_ndc * (cameraFar - cameraNear));
+      }
+
+      void main() {
+        vec4  sceneColor = texture2D(tDiffuse, vUv);
+        float rawDepth   = texture2D(tDepth,   vUv).r;
+        float zEye       = linearizeDepth(rawDepth);
+        // Linear fog ramp: 0 at fogNear, 1 at fogFar.
+        float fogFactor  = clamp((zEye - fogNear) / (fogFar - fogNear), 0.0, 1.0);
+        // Mix tone-mapped scene color with exact fogColor.
+        // At depth == far plane (sky/void): rawDepth≈1 → zEye≈cameraFar → fogFactor=1 → pure fogColor.
+        gl_FragColor = vec4(mix(sceneColor.rgb, fogColor, fogFactor), sceneColor.a);
+      }
+    `,
+  });
+  composer.addPass(fogPass);
+
+  // Flag: bloom is disabled until scene is fully built.
+  // (Fog pass runs every frame from the start — it's cheap.)
   let _sceneReady = false;
 
   const portals     = [];
@@ -418,6 +480,7 @@ export async function initEngine({
     // Delay enabling bloom — give background mesh-build yields time to complete
     setTimeout(() => {
       _sceneReady = true;
+      if (bloomPass) bloomPass.enabled = true;
       console.log('[Engine] Scene ready — full render pipeline active');
     }, 500);
 
@@ -431,6 +494,7 @@ export async function initEngine({
       if (obj.material?.depthWrite !== false) worldMeshes.push(obj);
     });
     _sceneReady = true;
+    if (bloomPass) bloomPass.enabled = true;
   }
 
   const physics = createPhysics(scene, physicsConfig);
@@ -567,6 +631,7 @@ export async function initEngine({
       camera.aspect = window.innerWidth / window.innerHeight;
       camera.updateProjectionMatrix();
       renderer.setSize(window.innerWidth, window.innerHeight);
+      sceneRT.setSize(window.innerWidth, window.innerHeight);  // keep depth texture in sync
       composer.setSize(window.innerWidth, window.innerHeight);
       if (bloomPass) {
         bloomPass.resolution.set(
@@ -608,12 +673,9 @@ export async function initEngine({
 
     canvas.style.cursor = getHoveredPortal() ? 'pointer' : 'default';
 
-    // Use cheap render until scene is fully built; bloom on a half-built
-    // 80 MB scene was the primary cause of 3 FPS during load.
-    if (_sceneReady) {
-      composer.render();
-    } else {
-      renderer.render(scene, camera);
-    }
+    // Always use the composer — bloom is disabled (not removed) until _sceneReady,
+    // so the pipeline is: RenderPass → (bloom disabled) → ZDepthFogPass.
+    // Cost is similar to raw renderer.render() during load.
+    composer.render();
   })();
 }
