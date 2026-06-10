@@ -65,9 +65,9 @@ const DEFAULT_CFG = {
   SLOPE_MAX_ANGLE: 50,
   SKIN_WIDTH:      0.02,
   GROUND_CHECK:    0.18,
-  NUM_SIDE_RAYS:   12,
-  NUM_SLOPE_RAYS:  5,
-  GRID_CELL_SIZE:  6.0,
+  NUM_SIDE_RAYS:   16,
+  NUM_SLOPE_RAYS:  8,
+  GRID_CELL_SIZE:  2.0,
 };
 
 // ── Module-level pre-allocated scratch vectors — zero per-frame allocation ─────
