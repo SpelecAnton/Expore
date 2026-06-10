@@ -1,44 +1,17 @@
 /**
- * SPELEC BSP Loader v5.2 — LARGE MAP EDITION
+ * SPELEC BSP Loader v5.3 — CLIP BRUSH RAYCAST FIX
  *
- * Changes over v5.1:
+ * Changes over v5.2:
  *
- * 1. MESH_YIELD_EVERY REDUCED 50 → 10:
- *    - On an 80 MB map buildMeshesProgressively() was running 50 GPU uploads
- *      before yielding. Each BufferGeometry upload to the GPU can take 2–5 ms
- *      depending on vertex count. 50 × 5 ms = 250 ms stall per chunk.
- *    - Reduced to 10 so the browser paints a frame at least every ~50 ms
- *      during initial mesh construction.
- *
- * 2. TEXTURE_BATCH_SIZE REDUCED 8 → 4:
- *    - On large maps 8 simultaneous image decodes + GPU uploads causes
- *      frame spikes because ImageBitmap decoding is not fully off-thread.
- *    - 4 parallel loads keeps decode pressure manageable.
- *
- * 3. ALBEDO MAP SWAP-IN AFTER FIRST FRAME:
- *    - Previously all textures were loaded before buildMeshesProgressively().
- *    - Now the first batch of textures (covering the most common faces) is
- *      loaded synchronously, then remaining textures are loaded in the
- *      background and swapped in per-mesh as they arrive.
- *    - Map becomes walkable and visually stable in 1–2 seconds even for 80 MB.
- *
- * 4. GEOMETRY BUFFER DISPOSE GUARD:
- *    - buildGeometry() now calls geo.dispose() on any intermediate geometry
- *      that gets split, so the old ArrayBuffers are released to GC immediately.
- *
- * 5. LIGHTMAP ATLAS UPLOAD DEFERRED:
- *    - lmTex.needsUpdate is set inside a setTimeout(0) so the DataTexture
- *      GPU upload happens after the first frame, not during BSP parsing.
- *    - Avoids a synchronous stall on the main thread for large atlases.
- *
- * 6. PROGRESSIVE TEXTURE SWAP:
- *    - loadTexturesInBatches() now returns a live Map and a Promise.
- *    - Meshes are built immediately with whatever textures are available
- *      (whiteTex fallback), and a background swap pass runs as each batch
- *      completes to replace whiteTex with the real albedo.
- *
- * Backward compat: exports loadBSP, tickAnimatedTextures, initTexLoader
- * unchanged.
+ * 1. _invisibleMat depthWrite: false → true:
+ *    - Three.js Raycaster uses the material's depthWrite property during
+ *      BVH-accelerated intersection to decide whether a hit is valid.
+ *      With depthWrite: false, clip brush meshes were silently skipped
+ *      by the wall-occlusion raycast in getHoveredPortal(), making portals
+ *      clickable through clip walls.
+ *    - depthWrite: true fixes raycasting while colorWrite: false and
+ *      opacity: 0 keep the mesh completely invisible in the rendered output.
+ *      The mesh stays invisible to the player but solid to raycasts.
  */
 
 import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.165.0/build/three.module.js';
@@ -97,8 +70,8 @@ function buildBVH(geometry) {
 // ── Configuration ─────────────────────────────────────────────────────────────
 const TEX_EXTENSIONS     = ['.gif', '.avif', '.webp', '.png', '.jpg'];
 const ANIM_EXTS          = new Set(['.gif', '.avif', '.webp']);
-const TEXTURE_BATCH_SIZE = 4;    // Reduced 8 → 4: fewer simultaneous ImageBitmap decodes
-const MESH_YIELD_EVERY   = 10;   // Reduced 50 → 10: yield more often to avoid 250ms stalls
+const TEXTURE_BATCH_SIZE = 4;
+const MESH_YIELD_EVERY   = 10;
 const MAX_ATLAS_MIPMAP   = 4096;
 
 // ── Anisotropy ────────────────────────────────────────────────────────────────
@@ -255,11 +228,16 @@ const _whiteTex = (() => {
   return t;
 })();
 
-// ── Shared invisible material ─────────────────────────────────────────────────
+// ── Shared invisible material for clip brushes ────────────────────────────────
+// colorWrite: false  → pixel shader writes nothing → mesh is invisible
+// depthWrite: true   → depth buffer IS written → raycasts hit the mesh
+//                      (depthWrite: false caused raycasts to miss clip walls,
+//                       making portals clickable through them)
+// opacity: 0         → no visual contribution even if colorWrite slips through
 const _invisibleMat = new THREE.MeshBasicMaterial({
   colorWrite:  false,
-  depthWrite:  false,
-  transparent: true,
+  depthWrite:  true,    // MUST be true for Raycaster to intersect clip geometry
+  transparent: false,
   opacity:     0,
   side:        THREE.DoubleSide,
 });
@@ -414,12 +392,8 @@ function yieldToEventLoop() {
 }
 
 // ── Build meshes progressively ────────────────────────────────────────────────
-// albedoMap may be partially populated at call time.
-// meshMaterialMap is populated by this function so the texture swap pass
-// can update materials that were built with _whiteTex.
 async function buildMeshesProgressively(mergedBatches, texNames, lmTex, albedoMap, scene, onProgress) {
   let totalMeshes = 0, meshesWithLM = 0, noclipMeshes = 0, invisibleMeshes = 0;
-  // Map from texture name → array of MeshLambertMaterials awaiting real texture
   const pendingSwap = new Map();
 
   for (let i = 0; i < mergedBatches.length; i++) {
@@ -441,7 +415,6 @@ async function buildMeshesProgressively(mergedBatches, texNames, lmTex, albedoMa
         side:      THREE.DoubleSide,
         alphaTest: 0.5,
       });
-      // Track materials that still need a real texture swapped in
       if (!tex) {
         if (!pendingSwap.has(name)) pendingSwap.set(name, []);
         pendingSwap.get(name).push(mat);
@@ -479,11 +452,8 @@ async function buildMeshesProgressively(mergedBatches, texNames, lmTex, albedoMa
   return { totalMeshes, pendingSwap };
 }
 
-// ── Batch texture loader — returns live Map + background Promise ──────────────
-// The first INITIAL_BATCHES are awaited synchronously before mesh build starts.
-// Remaining textures load in the background; when each batch finishes,
-// pendingSwap materials are updated so the map visually fills in.
-const INITIAL_BATCHES = 2; // Load first 2 × TEXTURE_BATCH_SIZE textures before first mesh
+// ── Batch texture loader ──────────────────────────────────────────────────────
+const INITIAL_BATCHES = 2;
 
 async function loadTexturesInBatches(uniqueNames, texBases, onProgress, pendingSwapRef) {
   const albedoMap = new Map();
@@ -495,7 +465,6 @@ async function loadTexturesInBatches(uniqueNames, texBases, onProgress, pendingS
       const tex = await findTex(texBases, name);
       albedoMap.set(name, tex || _whiteTex);
 
-      // If meshes are already built and waiting for this texture, swap it in
       if (pendingSwapRef && tex) {
         const mats = pendingSwapRef.get(name);
         if (mats) {
@@ -565,24 +534,20 @@ export async function loadBSP({
     lmTex.anisotropy = _maxAniso;
     lmTex.wrapS = lmTex.wrapT = THREE.ClampToEdgeWrapping;
 
-    // Defer the GPU upload so it does not stall the first render frame.
-    // needsUpdate = true tells Three.js to upload on the next renderer.render() call.
-    // By putting it in a setTimeout we ensure the first frame renders first.
     setTimeout(() => { lmTex.needsUpdate = true; }, 0);
   }
 
-  // ── Merge geometries first (CPU only, no GPU) ─────────────────────────────
+  // ── Merge geometries ──────────────────────────────────────────────────────
   console.log(`[BSP] Merging ${batches.length} batches (vertex budget: ${MAX_VERTS_PER_DRAW})...`);
   const mergedBatches = mergeBatchGeometries(batches);
   console.log(`[BSP] After merge: ${mergedBatches.length} draw calls`);
 
-  // ── Load first N texture batches synchronously before building any mesh ───
+  // ── Load initial textures before first mesh ───────────────────────────────
   const texBases    = [textureBase, fallbackTexBase];
   const uniqueNames = [...new Set(batches.filter(b => !b.invisible).map(b => texNames[b.texIdx] || 'default'))];
 
   console.log(`[BSP] Loading ${uniqueNames.length} unique textures (${TEXTURE_BATCH_SIZE}/batch)...`);
 
-  // Partial albedoMap: first INITIAL_BATCHES × TEXTURE_BATCH_SIZE textures
   const initialNames = uniqueNames.slice(0, INITIAL_BATCHES * TEXTURE_BATCH_SIZE);
   const albedoMap    = new Map();
 
@@ -593,18 +558,17 @@ export async function loadBSP({
 
   onProgress?.(82);
 
-  // ── Build all meshes now (remaining textures swap in later) ───────────────
+  // ── Build meshes progressively ────────────────────────────────────────────
   const { pendingSwap } = await buildMeshesProgressively(
     mergedBatches, texNames, lmTex, albedoMap, scene, onProgress
   );
 
   onProgress?.(100);
 
-  // ── Load remaining textures in the background ─────────────────────────────
+  // ── Load remaining textures in background ─────────────────────────────────
   const remainingNames = uniqueNames.slice(initialNames.length);
   if (remainingNames.length > 0) {
     console.log(`[BSP] Background-loading ${remainingNames.length} remaining textures...`);
-    // Run without awaiting — fire and forget, swap happens via pendingSwap
     loadTexturesInBatches(remainingNames, texBases, null, pendingSwap).catch(err => {
       console.warn('[BSP] Background texture load error:', err);
     });

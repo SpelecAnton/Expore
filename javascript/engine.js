@@ -1,597 +1,583 @@
 /**
- * SPELEC EXPLORE ENGINE v7.2 — PERFORMANCE EDITION
+ * SPELEC BSP Loader v5.3 — CLIP BRUSH RAYCAST FIX
  *
- * Changes over v7.1:
+ * Changes over v5.2:
  *
- * 1. COMPOSER RENDER THROTTLED DURING TEXTURE LOAD:
- *    - composer.render() was called every frame even while the map was still
- *      building meshes after loadBSP() returned. During that period the scene
- *      is half-built and the bloom pass processes thousands of new GPU objects
- *      per frame → 3 FPS.
- *    - A _sceneReady flag gates the full composer render. Before the flag is
- *      set, a cheap renderer.render() (no bloom) is used instead.
- *    - Flag is set via setTimeout(500) after loadBSP() returns so the final
- *      mesh-build yield passes complete before bloom kicks in.
- *
- * 2. BLOOM PASS STRENGTH ZERO WHEN NOTHING TO BLOOM:
- *    - If bloomStrength is 0 the UnrealBloomPass is skipped entirely.
- *      Avoids allocating bloom FBOs for maps that don't need it.
- *
- * 3. PORTAL HOVER THROTTLE INCREASED:
- *    - Portal hover check was every 2nd frame (v7.1).
- *    - Increased to every 4th frame — portals don't move, 15Hz hover
- *      detection is imperceptible to users.
- *
- * 4. ANIMATED TEXTURE TICK THROTTLED:
- *    - tickAnimatedTextures() was called every rAF (~60Hz).
- *    - Now called every 3rd frame (~20Hz). Animated textures rarely need
- *      more than 12–15 fps, and the tick itself is cheap but not free.
- *
- * 5. HASH WRITE INTERVAL INCREASED 2000 → 3000 ms:
- *    - history.replaceState() causes a layout invalidation in some browsers.
- *    - 3 second granularity is still fine for URL state persistence.
- *
- * 6. WORLD MESHES LIST FILTERED AT BUILD TIME:
- *    - In v7.1 worldMeshes included invisible clip meshes
- *      (mesh.material.depthWrite === false with userData.invisible).
- *    - These are zero-opacity and can never occlude portals, so they were
- *      wasted raycasts in getHoveredPortal(). Now filtered out at build time.
- *
- * 7. RENDERER INFO LOGGING REMOVED FROM HOT PATH:
- *    - window._rendererInfo was assigned every frame. Moved to a one-time
- *      assignment after renderer creation.
- *
- * 8. RESIZE HANDLER DEBOUNCED:
- *    - resize fired composer.setSize() synchronously, which can stall a frame
- *      if it happens mid-render. Now debounced 150 ms.
+ * 1. _invisibleMat depthWrite: false → true:
+ *    - Three.js Raycaster uses the material's depthWrite property during
+ *      BVH-accelerated intersection to decide whether a hit is valid.
+ *      With depthWrite: false, clip brush meshes were silently skipped
+ *      by the wall-occlusion raycast in getHoveredPortal(), making portals
+ *      clickable through clip walls.
+ *    - depthWrite: true fixes raycasting while colorWrite: false and
+ *      opacity: 0 keep the mesh completely invisible in the rendered output.
+ *      The mesh stays invisible to the player but solid to raycasts.
  */
 
 import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.165.0/build/three.module.js';
-import { EffectComposer }  from 'https://cdn.jsdelivr.net/npm/three@0.165.0/examples/jsm/postprocessing/EffectComposer.js';
-import { RenderPass }      from 'https://cdn.jsdelivr.net/npm/three@0.165.0/examples/jsm/postprocessing/RenderPass.js';
-import { UnrealBloomPass } from 'https://cdn.jsdelivr.net/npm/three@0.165.0/examples/jsm/postprocessing/UnrealBloomPass.js';
-import { loadBSP, tickAnimatedTextures, initTexLoader } from 'https://spelecanton.github.io/Expore/javascript/bsp_loader.js';
-import { createPhysics } from 'https://spelecanton.github.io/Expore/javascript/physics.js';
 
-const PLAYER_HEIGHT = 80;
-const FOV           = 90;
-const UNIT          = 0.02;
+// ── Optional BVH acceleration ─────────────────────────────────────────────────
+let _bvhAvailable       = false;
+let _MeshBVH            = null;
+let _acceleratedRaycast = null;
 
-// ── URL hash helpers ──────────────────────────────────────────────────────────
-
-function readHashState() {
-  const hash = window.location.hash.slice(1);
-  if (!hash) return null;
-  const parts = hash.split(',').map(Number);
-  if (parts.length < 4 || parts.some(isNaN)) return null;
-  return { x: parts[0], y: parts[1], z: parts[2], yaw: parts[3] };
-}
-
-function writeHashState(x, y, z, yaw) {
-  const r = v => Math.round(v * 1000) / 1000;
-  history.replaceState(null, '', '#' + `${r(x)},${r(y)},${r(z)},${r(yaw)}`);
-}
-
-// ── Audio helpers ─────────────────────────────────────────────────────────────
-
-const AUDIO_EXTS = new Set(['.mp3', '.ogg', '.wav', '.flac', '.aac']);
-
-function isAudioUrl(url) {
+(async () => {
   try {
-    const path = new URL(url, location.href).pathname;
-    return AUDIO_EXTS.has(path.substring(path.lastIndexOf('.')).toLowerCase());
-  } catch { return false; }
-}
-
-let _activePortalAudio = null;
-
-function playPortalAudio(url) {
-  const resolved = new URL(url, location.href).href;
-  if (_activePortalAudio && _activePortalAudio.src === resolved) {
-    _activePortalAudio.paused ? _activePortalAudio.play() : _activePortalAudio.pause();
-    return;
+    const bvhModule     = await import('https://cdn.jsdelivr.net/npm/three-mesh-bvh@0.7.3/build/index.module.js');
+    _MeshBVH            = bvhModule.MeshBVH;
+    _acceleratedRaycast = bvhModule.acceleratedRaycast;
+    _bvhAvailable       = true;
+    console.log('[BSP] three-mesh-bvh loaded — BVH raycasting enabled');
+  } catch {
+    console.warn('[BSP] three-mesh-bvh not available — using standard raycasting');
   }
-  if (_activePortalAudio) { _activePortalAudio.pause(); _activePortalAudio = null; }
-  const audio = new Audio(resolved);
-  audio.play().catch(err => console.warn('[Engine] Portal audio play failed:', err));
-  _activePortalAudio = audio;
+})();
+
+const _bvhQueue    = [];
+let   _bvhScheduled = false;
+
+function scheduleBVHBuild(geometry) {
+  _bvhQueue.push(geometry);
+  if (_bvhScheduled) return;
+  _bvhScheduled = true;
+
+  const schedFn = typeof requestIdleCallback === 'function'
+    ? cb => requestIdleCallback(cb, { timeout: 2000 })
+    : cb => setTimeout(cb, 0);
+
+  schedFn(function drainBVHQueue(deadline) {
+    const hasTime = () => deadline ? deadline.timeRemaining() > 2 : true;
+    while (_bvhQueue.length && hasTime()) {
+      const geo = _bvhQueue.shift();
+      try {
+        geo.boundsTree  = new _MeshBVH(geo);
+        geo.rawcastFunc = _acceleratedRaycast;
+      } catch { /* non-indexed or already disposed */ }
+    }
+    if (_bvhQueue.length) {
+      schedFn(drainBVHQueue);
+    } else {
+      _bvhScheduled = false;
+    }
+  });
 }
 
-// ── Background music ──────────────────────────────────────────────────────────
-
-const BG_CANDIDATES = ['background.mp3', 'background.ogg', 'background.wav'];
-
-async function findBackgroundMusic(mapBase) {
-  const results = await Promise.all(
-    BG_CANDIDATES.map(async file => {
-      const url = mapBase + file;
-      try { const res = await fetch(url, { method: 'HEAD' }); return res.ok ? url : null; }
-      catch { return null; }
-    })
-  );
-  const url = results.find(Boolean);
-  if (!url) { console.log('[Engine] No background music found.'); return null; }
-  console.log(`[Engine] Background music: ${url}`);
-  const audio  = new Audio(url);
-  audio.loop   = true;
-  audio.volume = 0.5;
-  return audio;
+function buildBVH(geometry) {
+  if (!_bvhAvailable || !_MeshBVH || !_acceleratedRaycast) return;
+  scheduleBVHBuild(geometry);
 }
 
-function mapBaseFromUrl(mapUrl) {
+// ── Configuration ─────────────────────────────────────────────────────────────
+const TEX_EXTENSIONS     = ['.gif', '.avif', '.webp', '.png', '.jpg'];
+const ANIM_EXTS          = new Set(['.gif', '.avif', '.webp']);
+const TEXTURE_BATCH_SIZE = 4;
+const MESH_YIELD_EVERY   = 10;
+const MAX_ATLAS_MIPMAP   = 4096;
+
+// ── Anisotropy ────────────────────────────────────────────────────────────────
+let _maxAniso = 1;
+
+export function initTexLoader(renderer) {
+  _maxAniso = Math.min(8, renderer.capabilities.getMaxAnisotropy());
+  console.log(`[BSP] Anisotropic filtering: ${_maxAniso}×`);
+}
+
+// ── Internal state ────────────────────────────────────────────────────────────
+const _texCache = new Map();
+const _loader   = new THREE.TextureLoader();
+const _animList = [];
+
+// ── Tick animated textures ────────────────────────────────────────────────────
+export function tickAnimatedTextures() {
+  if (!_animList.length) return;
+  const now = performance.now();
+  for (const anim of _animList) {
+    if (now < anim.nextFrameTime) continue;
+    const frame = anim.frames[anim.frameIdx];
+    anim.ctx.clearRect(0, 0, anim.canvas.width, anim.canvas.height);
+    anim.ctx.drawImage(frame.bitmap, 0, 0, anim.canvas.width, anim.canvas.height);
+    anim.tex.needsUpdate = true;
+    anim.frameIdx      = (anim.frameIdx + 1) % anim.frames.length;
+    anim.nextFrameTime = now + frame.duration;
+  }
+}
+
+// ── Texture filter helper ─────────────────────────────────────────────────────
+function applyTexFilters(tex, { linearMag = false } = {}) {
+  tex.wrapS      = tex.wrapT = THREE.RepeatWrapping;
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.minFilter  = THREE.LinearMipmapLinearFilter;
+  tex.magFilter  = linearMag ? THREE.LinearFilter : THREE.NearestFilter;
+  tex.anisotropy = _maxAniso;
+  tex.generateMipmaps = true;
+}
+
+// ── Animated texture loader ───────────────────────────────────────────────────
+async function loadAnimatedTex(url) {
+  if (typeof ImageDecoder === 'undefined') {
+    console.warn('[BSP] ImageDecoder not available, static fallback:', url);
+    return loadStaticTex(url);
+  }
   try {
-    const abs = new URL(mapUrl, location.href).href;
-    return abs.substring(0, abs.lastIndexOf('/') + 1);
-  } catch { return './'; }
+    const response = await fetch(url);
+    if (!response.ok) return null;
+    const buffer = await response.arrayBuffer();
+    const ext     = url.substring(url.lastIndexOf('.')).toLowerCase();
+    const typeMap = { '.gif': 'image/gif', '.avif': 'image/avif', '.webp': 'image/webp' };
+    const type    = typeMap[ext] ?? 'image/gif';
+
+    const probeDecoder = new ImageDecoder({
+      data: new Blob([buffer], { type }).stream(), type, preferAnimation: true,
+    });
+    await probeDecoder.tracks.ready;
+    const frameCount = probeDecoder.tracks.selectedTrack?.frameCount ?? 1;
+    probeDecoder.close();
+    if (frameCount <= 1) return loadStaticTex(url);
+
+    console.log(`[BSP] Animated texture ${url}: ${frameCount} frames`);
+    const decoder = new ImageDecoder({
+      data: new Blob([buffer], { type }).stream(), type, preferAnimation: true,
+    });
+    await decoder.tracks.ready;
+
+    const frames = [];
+    let w = 0, h = 0;
+    for (let i = 0; i < frameCount; i++) {
+      const result   = await decoder.decode({ frameIndex: i });
+      const img      = result.image;
+      const duration = img.duration != null ? img.duration / 1000 : 100;
+      if (i === 0) {
+        w = img.displayWidth  || img.codedWidth  || 128;
+        h = img.displayHeight || img.codedHeight || 128;
+      }
+      const bitmap = await createImageBitmap(img, { resizeWidth: w, resizeHeight: h });
+      img.close();
+      frames.push({ bitmap, duration });
+    }
+    decoder.close();
+    if (!frames.length) return loadStaticTex(url);
+
+    const canvas = document.createElement('canvas');
+    canvas.width  = w;
+    canvas.height = h;
+    const ctx = canvas.getContext('2d');
+    ctx.drawImage(frames[0].bitmap, 0, 0, w, h);
+
+    const tex = new THREE.CanvasTexture(canvas);
+    applyTexFilters(tex);
+    tex.needsUpdate = true;
+
+    _animList.push({ frames, canvas, ctx, tex, frameIdx: 0, nextFrameTime: performance.now() + frames[0].duration });
+    return tex;
+  } catch (err) {
+    console.warn('[BSP] Animation load failed, fallback static:', url, err.message);
+    return loadStaticTex(url);
+  }
 }
 
-// ── Portal label ──────────────────────────────────────────────────────────────
-
-function buildPortalLabel(label, col, mesh) {
-  if (!label) return null;
-  const canvas  = document.createElement('canvas');
-  canvas.width  = 512;
-  canvas.height = 80;
-  const ctx = canvas.getContext('2d');
-  ctx.clearRect(0, 0, 512, 80);
-  ctx.shadowColor  = `#${col.getHexString()}`;
-  ctx.shadowBlur   = 18;
-  ctx.font         = 'bold 30px "Share Tech Mono", monospace';
-  ctx.fillStyle    = `#${col.getHexString()}`;
-  ctx.textAlign    = 'center';
-  ctx.textBaseline = 'middle';
-  ctx.fillText(label.toUpperCase(), 256, 40);
-  const tex = new THREE.CanvasTexture(canvas);
-  tex.needsUpdate = true;
-  const plane = new THREE.Mesh(
-    new THREE.PlaneGeometry(2.8, 0.44),
-    new THREE.MeshBasicMaterial({ map: tex, transparent: true, depthWrite: false, side: THREE.DoubleSide })
-  );
-  plane.position.set(0, 0, 0.02);
-  mesh.add(plane);
-  return plane;
+// ── Static texture loader ─────────────────────────────────────────────────────
+function loadStaticTex(url) {
+  return new Promise(res => {
+    _loader.load(url, tex => { applyTexFilters(tex); res(tex); }, undefined, () => res(null));
+  });
 }
 
-// ── Portal builder ────────────────────────────────────────────────────────────
-
-function buildPortal(props, scene, portals) {
-  const [ox, oy, oz] = (props.origin || '0 0 0').split(' ').map(Number);
-  const url   = props.target_url || '#';
-  const label = props.label ? props.label.trim() : '';
-  const col   = new THREE.Color().setHex(parseInt((props.color || '0xff2200').replace('#', ''), 16));
-  const angle = parseFloat(props.angle || '0') * Math.PI / 180;
-
-  const defaultSize = props.size || '110';
-  const w       = parseFloat(props.width  || defaultSize) * UNIT;
-  const h       = parseFloat(props.height || defaultSize) * UNIT;
-  const opacity = Math.max(0, Math.min(1, parseFloat(props.opacity ?? '0.78')));
-  const x = ox * UNIT, y = oz * UNIT, z = -oy * UNIT;
-
-  const geo  = new THREE.PlaneGeometry(w, h);
-  const mesh = new THREE.Mesh(geo, new THREE.MeshBasicMaterial({
-    color: col, transparent: true, opacity, side: THREE.DoubleSide, depthWrite: false,
-  }));
-  mesh.position.set(x, y, z);
-  mesh.rotation.y = angle;
-  scene.add(mesh);
-
-  mesh.add(new THREE.LineSegments(
-    new THREE.EdgesGeometry(geo),
-    new THREE.LineBasicMaterial({ color: col, opacity, transparent: true })
-  ));
-
-  const ptLight = new THREE.PointLight(col, 3.0, 7);
-  ptLight.position.set(x, y, z);
-  scene.add(ptLight);
-
-  buildPortalLabel(label, col, mesh);
-  portals.push({ x, y, z, url, label, col, mesh, ptLight, opacity });
-}
-
-// ── Light sprite ──────────────────────────────────────────────────────────────
-
-function makeSpriteTexture(r, g, b) {
-  const size   = 128;
-  const canvas = document.createElement('canvas');
-  canvas.width = canvas.height = size;
-  const ctx = canvas.getContext('2d');
-  const cx = size / 2, cy = size / 2;
-
-  const outerGrad = ctx.createRadialGradient(cx, cy, 0, cx, cy, size / 2);
-  outerGrad.addColorStop(0,    `rgba(${Math.round(r*255)},${Math.round(g*255)},${Math.round(b*255)},0.9)`);
-  outerGrad.addColorStop(0.25, `rgba(${Math.round(r*255)},${Math.round(g*255)},${Math.round(b*255)},0.5)`);
-  outerGrad.addColorStop(0.6,  `rgba(${Math.round(r*255)},${Math.round(g*255)},${Math.round(b*255)},0.12)`);
-  outerGrad.addColorStop(1,    `rgba(${Math.round(r*255)},${Math.round(g*255)},${Math.round(b*255)},0)`);
-  ctx.fillStyle = outerGrad;
-  ctx.fillRect(0, 0, size, size);
-
-  const coreGrad = ctx.createRadialGradient(cx, cy, 0, cx, cy, size * 0.12);
-  coreGrad.addColorStop(0,   '#ffffff');
-  coreGrad.addColorStop(0.5, `rgba(${Math.round(r*255)},${Math.round(g*255)},${Math.round(b*255)},0.9)`);
-  coreGrad.addColorStop(1,   `rgba(${Math.round(r*255)},${Math.round(g*255)},${Math.round(b*255)},0)`);
-  ctx.fillStyle = coreGrad;
-  ctx.fillRect(0, 0, size, size);
-
-  const tex = new THREE.CanvasTexture(canvas);
-  tex.colorSpace  = THREE.SRGBColorSpace;
-  tex.needsUpdate = true;
+async function tryLoadTex(url) {
+  if (_texCache.has(url)) return _texCache.get(url);
+  try {
+    const probe = await fetch(url, { method: 'HEAD' });
+    if (!probe.ok) { _texCache.set(url, null); return null; }
+  } catch { _texCache.set(url, null); return null; }
+  const ext = url.substring(url.lastIndexOf('.')).toLowerCase();
+  const tex  = ANIM_EXTS.has(ext) ? await loadAnimatedTex(url) : await loadStaticTex(url);
+  _texCache.set(url, tex);
   return tex;
 }
 
-const _spriteTexCache = new Map();
-
-function getSpriteTex(r, g, b) {
-  const key = `${(r * 15) | 0}:${(g * 15) | 0}:${(b * 15) | 0}`;
-  if (!_spriteTexCache.has(key)) _spriteTexCache.set(key, makeSpriteTexture(r, g, b));
-  return _spriteTexCache.get(key);
-}
-
-function addLightSprites(scene, lights) {
-  if (!lights?.length) return;
-  let spriteCount = 0;
-
-  for (const light of lights) {
-    const col      = new THREE.Color(light.r, light.g, light.b);
-    const range    = Math.min(20, Math.max(2, light.intensity * 0.05));
-    const ptIntens = Math.min(5, Math.max(0.2, light.intensity * 0.015));
-    const ptLight  = new THREE.PointLight(col, ptIntens, range);
-    ptLight.position.set(light.x, light.y, light.z);
-    scene.add(ptLight);
-
-    if (!light.sprite) continue;
-
-    const spriteMat = new THREE.SpriteMaterial({
-      map: getSpriteTex(light.r, light.g, light.b),
-      transparent: true, depthWrite: false,
-      blending: THREE.AdditiveBlending,
-      color: col,
-    });
-    const sprite = new THREE.Sprite(spriteMat);
-    sprite.position.set(light.x, light.y, light.z);
-    sprite.scale.setScalar(0.5);
-    sprite.userData.noclip = true;
-    scene.add(sprite);
-    spriteCount++;
-  }
-
-  console.log(`[Engine] Lights: ${lights.length} total, ${spriteCount} with sprite`);
-}
-
-// ── Fallback room ─────────────────────────────────────────────────────────────
-
-function _fallbackRoom(scene) {
-  const floorMat   = new THREE.MeshLambertMaterial({ color: 0x1a1a2e });
-  const wallMat    = new THREE.MeshLambertMaterial({ color: 0x16213e });
-  const ceilingMat = new THREE.MeshLambertMaterial({ color: 0x0a0a1a });
-
-  const floor = new THREE.Mesh(new THREE.PlaneGeometry(20, 20), floorMat);
-  floor.rotation.x = -Math.PI / 2;
-  scene.add(floor);
-
-  const ceil = new THREE.Mesh(new THREE.PlaneGeometry(20, 20), ceilingMat);
-  ceil.rotation.x = Math.PI / 2;
-  ceil.position.y = 5;
-  scene.add(ceil);
-
-  for (const [wx, wy, wz, ry] of [
-    [-10, 2.5, 0, 0], [10, 2.5, 0, Math.PI],
-    [0, 2.5, -10, Math.PI / 2], [0, 2.5, 10, -Math.PI / 2],
-  ]) {
-    const m = new THREE.Mesh(new THREE.PlaneGeometry(20, 5), wallMat);
-    m.position.set(wx, wy, wz);
-    m.rotation.y = ry;
-    scene.add(m);
-  }
-  scene.add(new THREE.AmbientLight(0x334466, 3));
-}
-
-// ── initEngine ────────────────────────────────────────────────────────────────
-
-export async function initEngine({
-  canvas,
-  mapUrl          = 'map.bsp',
-  textureBase     = 'textures/',
-  mapName         = 'MAP',
-  onReady         = null,
-  onProgress      = null,
-  physicsConfig   = {},
-  bloomStrength   = 0.4,
-  bloomRadius     = 0.4,
-  bloomThreshold  = 0.2,
-  renderDistance  = 180,
-  maxPixelRatio   = 1.0,
-  fogColor        = 0x000000,
-}) {
-  const renderer = new THREE.WebGLRenderer({
-    canvas,
-    antialias:              true,
-    powerPreference:        'high-performance',
-    logarithmicDepthBuffer: false,
-  });
-  renderer.setPixelRatio(Math.min(window.devicePixelRatio, maxPixelRatio));
-  renderer.setSize(window.innerWidth, window.innerHeight);
-  renderer.toneMapping         = THREE.ACESFilmicToneMapping;
-  renderer.toneMappingExposure = 2.0;
-
-  // One-time assignment — was incorrectly inside tick() in v7.1
-  window._rendererInfo = renderer.info;
-
-  initTexLoader(renderer);
-
-  const scene  = new THREE.Scene();
-
-  const fogDensity = 2.8 / renderDistance;
-  scene.fog        = new THREE.FogExp2(fogColor, fogDensity);
-  scene.background = new THREE.Color(fogColor);
-
-  const camera = new THREE.PerspectiveCamera(FOV, window.innerWidth / window.innerHeight, 0.01, renderDistance);
-  camera.position.set(0, PLAYER_HEIGHT * UNIT, 0);
-
-  const ambient = new THREE.AmbientLight(0xffffff, 1.0);
-  scene.add(ambient);
-
-  // ── Post-processing setup ─────────────────────────────────────────────────
-  const composer  = new EffectComposer(renderer);
-  const renderPass = new RenderPass(scene, camera);
-  composer.addPass(renderPass);
-
-  let bloomPass = null;
-  if (bloomStrength > 0) {
-    bloomPass = new UnrealBloomPass(
-      new THREE.Vector2(
-        Math.floor(window.innerWidth  / 2),
-        Math.floor(window.innerHeight / 2),
-      ),
-      bloomStrength,
-      bloomRadius,
-      bloomThreshold,
+// ── findTex — parallel HEAD probe ────────────────────────────────────────────
+async function findTex(bases, name) {
+  for (const base of bases) {
+    if (!base) continue;
+    const probes = await Promise.all(
+      TEX_EXTENSIONS.map(async ext => {
+        const url = base + name + ext;
+        try { const r = await fetch(url, { method: 'HEAD' }); return r.ok ? url : null; }
+        catch { return null; }
+      })
     );
-    composer.addPass(bloomPass);
+    const found = probes.find(u => u !== null);
+    if (!found) continue;
+    if (_texCache.has(found)) return _texCache.get(found);
+    const ext = found.substring(found.lastIndexOf('.')).toLowerCase();
+    const tex  = ANIM_EXTS.has(ext) ? await loadAnimatedTex(found) : await loadStaticTex(found);
+    _texCache.set(found, tex);
+    if (tex) return tex;
   }
+  return null;
+}
 
-  // Flag: use cheap renderer.render() until scene is fully built.
-  // Bloom on a half-built 80 MB scene was the main cause of 3 FPS during load.
-  let _sceneReady = false;
+// ── Fallback white texture ────────────────────────────────────────────────────
+const _whiteTex = (() => {
+  const c = document.createElement('canvas');
+  c.width = c.height = 1;
+  c.getContext('2d').fillStyle = '#fff';
+  c.getContext('2d').fillRect(0, 0, 1, 1);
+  const t = new THREE.CanvasTexture(c);
+  t.colorSpace = THREE.SRGBColorSpace;
+  t.minFilter = t.magFilter = THREE.LinearFilter;
+  return t;
+})();
 
-  const portals     = [];
-  let   yaw         = 0;
-  let   worldMeshes = [];
+// ── Shared invisible material for clip brushes ────────────────────────────────
+// colorWrite: false  → pixel shader writes nothing → mesh is invisible
+// depthWrite: true   → depth buffer IS written → raycasts hit the mesh
+//                      (depthWrite: false caused raycasts to miss clip walls,
+//                       making portals clickable through them)
+// opacity: 0         → no visual contribution even if colorWrite slips through
+const _invisibleMat = new THREE.MeshBasicMaterial({
+  colorWrite:  false,
+  depthWrite:  true,    // MUST be true for Raycaster to intersect clip geometry
+  transparent: false,
+  opacity:     0,
+  side:        THREE.DoubleSide,
+});
 
-  const mapBase        = mapBaseFromUrl(mapUrl);
-  const bgMusicPromise = findBackgroundMusic(mapBase);
+// ── Worker runner ─────────────────────────────────────────────────────────────
+async function fetchWorkerCode() {
+  const loaderUrl  = import.meta.url;
+  const loaderBase = loaderUrl.substring(0, loaderUrl.lastIndexOf('/') + 1);
+  const localUrl   = loaderBase + 'bsp_worker.js';
+  const remoteUrl  = 'https://spelecanton.github.io/Expore/javascript/bsp_worker.js';
+  for (const url of [localUrl, remoteUrl]) {
+    try {
+      const r = await fetch(url);
+      if (r.ok) { console.log('[BSP] Worker loaded from:', url); return await r.text(); }
+    } catch { /* try next */ }
+  }
+  throw new Error('bsp_worker.js not found');
+}
 
-  try {
-    const result = await loadBSP({
-      url:             mapUrl,
-      scene,
-      textureBase,
-      fallbackTexBase: '/explore/textures/',
-      onProgress,
-    });
+function runBSPWorker(buffer, textureBase, fallbackTexBase, onProgress) {
+  return new Promise(async (resolve, reject) => {
+    try {
+      const code    = await fetchWorkerCode();
+      const blob    = new Blob([code], { type: 'application/javascript' });
+      const blobUrl = URL.createObjectURL(blob);
+      const worker  = new Worker(blobUrl);
+      worker.onmessage = ({ data }) => {
+        if (data.type === 'progress')   { onProgress?.(data.pct); }
+        else if (data.type === 'done')  { worker.terminate(); URL.revokeObjectURL(blobUrl); resolve(data); }
+        else if (data.type === 'error') { worker.terminate(); URL.revokeObjectURL(blobUrl); reject(new Error(`[BSP Worker] ${data.message}`)); }
+      };
+      worker.onerror = err => { worker.terminate(); URL.revokeObjectURL(blobUrl); reject(err); };
+      worker.postMessage({ buffer, textureBase, fallbackTexBase }, [buffer]);
+    } catch (err) { reject(err); }
+  });
+}
 
-    if (result.ambientColor     !== undefined) ambient.color.set(result.ambientColor);
-    if (result.ambientIntensity !== undefined) ambient.intensity = result.ambientIntensity;
+// ── Geometry merging with vertex budget splits ────────────────────────────────
+const MAX_VERTS_PER_DRAW = 60000;
 
-    for (const props of result.portals) buildPortal(props, scene, portals);
-    addLightSprites(scene, result.lights ?? []);
+function buildGeometry(parts) {
+  const geos = [];
 
-    const hashState = readHashState();
-    if (hashState) {
-      camera.position.set(hashState.x, hashState.y, hashState.z);
-      yaw = hashState.yaw;
-    } else if (result.playerStart) {
-      const ps = result.playerStart;
-      camera.position.set(ps.x, ps.y + PLAYER_HEIGHT * UNIT, ps.z);
-      yaw = ps.angle * Math.PI / 180;
+  let currentParts = [];
+  let currentVerts = 0;
+
+  function flush() {
+    if (!currentParts.length) return;
+
+    let totalVerts   = 0;
+    let totalIndices = 0;
+    for (const b of currentParts) {
+      totalVerts   += new Float32Array(b.pos).length / 3;
+      totalIndices += new Uint32Array(b.idx).length;
     }
 
-    // Build worldMeshes — exclude invisible clip meshes (zero opacity, can't occlude portals)
-    const portalMeshSet = new Set(portals.map(p => p.mesh));
-    scene.traverse(obj => {
-      if (!obj.isMesh || !obj.geometry) return;
-      if (portalMeshSet.has(obj)) return;
-      if (obj.userData.invisible) return;            // clip brush — skip for portal occlusion
-      if (obj.material?.depthWrite === false) return; // other transparent — skip
-      worldMeshes.push(obj);
-    });
+    const mergedPos = new Float32Array(totalVerts * 3);
+    const mergedNrm = new Float32Array(totalVerts * 3);
+    const mergedUV1 = new Float32Array(totalVerts * 2);
+    const mergedUV2 = new Float32Array(totalVerts * 2);
+    const mergedIdx = new Uint32Array(totalIndices);
 
-    // Delay enabling bloom — give background mesh-build yields time to complete
-    setTimeout(() => {
-      _sceneReady = true;
-      console.log('[Engine] Scene ready — full render pipeline active');
-    }, 500);
+    let vOffset = 0;
+    let iOffset = 0;
 
-  } catch (err) {
-    console.error('[Engine] BSP load failed:', err);
-    _fallbackRoom(scene);
-    ambient.intensity = 3;
-    scene.traverse(obj => {
-      if (obj.isMesh && obj.geometry && !obj.userData.invisible &&
-          obj.material?.depthWrite !== false) {
-        worldMeshes.push(obj);
+    for (const b of currentParts) {
+      const pos    = new Float32Array(b.pos);
+      const nrm    = new Float32Array(b.nrm);
+      const uv1    = new Float32Array(b.uv1);
+      const uv2    = new Float32Array(b.uv2);
+      const idx    = new Uint32Array(b.idx);
+      const vCount = pos.length / 3;
+
+      mergedPos.set(pos, vOffset * 3);
+      mergedNrm.set(nrm, vOffset * 3);
+      mergedUV1.set(uv1, vOffset * 2);
+      mergedUV2.set(uv2, vOffset * 2);
+
+      for (let i = 0; i < idx.length; i++) {
+        mergedIdx[iOffset + i] = idx[i] + vOffset;
       }
-    });
-    _sceneReady = true;
+      vOffset += vCount;
+      iOffset += idx.length;
+    }
+
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.BufferAttribute(mergedPos, 3));
+    geo.setAttribute('normal',   new THREE.BufferAttribute(mergedNrm, 3));
+    geo.setAttribute('uv',       new THREE.BufferAttribute(mergedUV1, 2));
+    geo.setAttribute('uv1',      new THREE.BufferAttribute(mergedUV2, 2));
+    geo.setIndex(new THREE.BufferAttribute(mergedIdx, 1));
+    geo.computeBoundingSphere();
+    geo.computeBoundingBox();
+    buildBVH(geo);
+
+    geos.push(geo);
+    currentParts = [];
+    currentVerts = 0;
   }
 
-  const physics = createPhysics(scene, physicsConfig);
-  physics.refreshCollidables();
+  for (const b of parts) {
+    const vCount = new Float32Array(b.pos).length / 3;
+    if (currentVerts + vCount > MAX_VERTS_PER_DRAW && currentVerts > 0) {
+      flush();
+    }
+    currentParts.push(b);
+    currentVerts += vCount;
+  }
+  flush();
 
-  window._cam     = camera;
-  window._physics = physics;
-  window._scene   = scene;
+  return geos;
+}
 
-  const bgMusic = await bgMusicPromise;
-  let bgMusicStarted = false;
+function mergeBatchGeometries(batches) {
+  const groups = new Map();
 
-  function startBgMusic() {
-    if (bgMusicStarted || !bgMusic) return;
-    bgMusicStarted = true;
-    bgMusic.play().catch(err => console.warn('[Engine] BG music failed:', err));
+  for (const b of batches) {
+    const key = `${b.texIdx}|${b.lmIdx}|${b.noclip ? 1 : 0}|${b.invisible ? 1 : 0}`;
+    if (!groups.has(key)) {
+      groups.set(key, {
+        texIdx:    b.texIdx,
+        lmIdx:     b.lmIdx,
+        noclip:    b.noclip,
+        invisible: b.invisible,
+        hasLM:     b.hasLM,
+        parts:     [],
+      });
+    }
+    groups.get(key).parts.push(b);
   }
 
-  const HASH_WRITE_INTERVAL = 3000; // Increased 2000 → 3000 ms
+  const merged = [];
+  for (const [, group] of groups) {
+    const geos = buildGeometry(group.parts);
+    for (const geo of geos) {
+      merged.push({
+        geo,
+        texIdx:    group.texIdx,
+        lmIdx:     group.lmIdx,
+        noclip:    group.noclip,
+        invisible: group.invisible,
+        hasLM:     group.hasLM,
+      });
+    }
+  }
+  return merged;
+}
 
-  // Portal hover check: every 4th frame (was every 2nd in v7.1)
-  // 15Hz hover detection is imperceptible for static portals
-  let _lastPortalHoverResult = null;
-  let _portalFrameCount      = 0;
+// ── Yield helper ──────────────────────────────────────────────────────────────
+function yieldToEventLoop() {
+  return new Promise(resolve => setTimeout(resolve, 0));
+}
 
-  const portalRaycaster = new THREE.Raycaster();
-  const wallRaycaster   = new THREE.Raycaster();
-  const mouseNDC        = new THREE.Vector2(0, 0);
-  const portalMeshes    = portals.map(p => p.mesh);
+// ── Build meshes progressively ────────────────────────────────────────────────
+async function buildMeshesProgressively(mergedBatches, texNames, lmTex, albedoMap, scene, onProgress) {
+  let totalMeshes = 0, meshesWithLM = 0, noclipMeshes = 0, invisibleMeshes = 0;
+  const pendingSwap = new Map();
 
-  window.addEventListener('mousemove', e => {
-    mouseNDC.x =  (e.clientX / window.innerWidth)  * 2 - 1;
-    mouseNDC.y = -(e.clientY / window.innerHeight) * 2 + 1;
-  });
+  for (let i = 0; i < mergedBatches.length; i++) {
+    if (i > 0 && i % MESH_YIELD_EVERY === 0) {
+      onProgress?.(90 + (i / mergedBatches.length) * 10);
+      await yieldToEventLoop();
+    }
 
-  function getHoveredPortal() {
-    if (!portalMeshes.length) return null;
+    const b    = mergedBatches[i];
+    const name = texNames[b.texIdx] || 'default';
+    let mat;
 
-    _portalFrameCount++;
-    // Only recompute every 4th frame — cache result otherwise
-    if (_portalFrameCount % 4 !== 0) return _lastPortalHoverResult;
+    if (b.invisible) {
+      mat = _invisibleMat;
+    } else {
+      const tex = albedoMap.get(name) ?? null;
+      mat = new THREE.MeshLambertMaterial({
+        map:       tex ?? _whiteTex,
+        side:      THREE.DoubleSide,
+        alphaTest: 0.5,
+      });
+      if (!tex) {
+        if (!pendingSwap.has(name)) pendingSwap.set(name, []);
+        pendingSwap.get(name).push(mat);
+      }
+    }
 
-    portalRaycaster.setFromCamera(mouseNDC, camera);
-    const portalHits = portalRaycaster.intersectObjects(portalMeshes, false);
-    if (!portalHits.length) { _lastPortalHoverResult = null; return null; }
+    const mesh = new THREE.Mesh(b.geo, mat);
+    mesh.matrixAutoUpdate = false;
+    mesh.updateMatrix();
+    mesh.frustumCulled = true;
 
-    const portalDist = portalHits[0].distance;
-    wallRaycaster.ray.copy(portalRaycaster.ray);
-    wallRaycaster.near = portalRaycaster.near;
-    wallRaycaster.far  = portalDist - 0.05;
-    const wallHits = wallRaycaster.intersectObjects(worldMeshes, false);
-    if (wallHits.length > 0) { _lastPortalHoverResult = null; return null; }
+    if (b.invisible) {
+      mesh.userData.invisible = true;
+      invisibleMeshes++;
+    }
+    if (b.noclip) {
+      mesh.userData.noclip = true;
+      noclipMeshes++;
+    }
+    if (b.hasLM && lmTex && !b.invisible) {
+      mat.lightMap          = lmTex;
+      mat.lightMapIntensity = 1.0;
+      meshesWithLM++;
+    }
 
-    _lastPortalHoverResult = portals.find(p => p.mesh === portalHits[0].object) ?? null;
-    return _lastPortalHoverResult;
+    scene.add(mesh);
+    totalMeshes++;
   }
 
-  // ── DEBUG: Press F → ground debug, Press P → renderer stats ──────────────
-  window.addEventListener('keydown', e => {
-    if (e.key.toLowerCase() === 'f') {
-      const pos = camera.position;
-      console.log('=== GROUND DEBUG ===');
-      console.log('Camera pos:', `(${pos.x.toFixed(4)}, ${pos.y.toFixed(4)}, ${pos.z.toFixed(4)})`);
+  console.log(
+    `[BSP] Meshes: ${totalMeshes} total, with lightmap: ${meshesWithLM},` +
+    ` noclip: ${noclipMeshes}, invisible clip: ${invisibleMeshes}`
+  );
 
-      const debugMeshes = worldMeshes.filter(obj => !obj.userData.noclip);
-      const ray     = new THREE.Raycaster();
-      ray.firstHitOnly = true;
-      const offsets = [[0,0],[0.2,0],[-0.2,0],[0,0.2],[0,-0.2]];
+  return { totalMeshes, pendingSwap };
+}
 
-      for (const [ox, oz] of offsets) {
-        const origin = new THREE.Vector3(pos.x + ox, pos.y + 0.25, pos.z + oz);
-        ray.set(origin, new THREE.Vector3(0, -1, 0));
-        ray.far = 5.0;
+// ── Batch texture loader ──────────────────────────────────────────────────────
+const INITIAL_BATCHES = 2;
 
-        const hits = ray.intersectObjects(debugMeshes, false);
-        if (hits.length > 0) {
-          const h = hits[0];
-          const n = h.face?.normal ? h.face.normal.clone().transformDirection(h.object.matrixWorld) : null;
-          console.log(
-            `  offset[${ox.toFixed(1)},${oz.toFixed(1)}]:`,
-            'dist=' + h.distance.toFixed(3),
-            'hitY=' + h.point.y.toFixed(3),
-            'normal=' + (n ? `(${n.x.toFixed(2)},${n.y.toFixed(2)},${n.z.toFixed(2)})` : 'N/A'),
-            'mesh=' + (h.object.name || h.object.uuid.slice(0, 8)),
-          );
-        } else {
-          console.log(`  offset[${ox.toFixed(1)},${oz.toFixed(1)}]: NO HIT`);
+async function loadTexturesInBatches(uniqueNames, texBases, onProgress, pendingSwapRef) {
+  const albedoMap = new Map();
+  const total     = uniqueNames.length;
+
+  for (let i = 0; i < total; i += TEXTURE_BATCH_SIZE) {
+    const chunk = uniqueNames.slice(i, i + TEXTURE_BATCH_SIZE);
+    await Promise.all(chunk.map(async name => {
+      const tex = await findTex(texBases, name);
+      albedoMap.set(name, tex || _whiteTex);
+
+      if (pendingSwapRef && tex) {
+        const mats = pendingSwapRef.get(name);
+        if (mats) {
+          for (const mat of mats) {
+            mat.map = tex;
+            mat.needsUpdate = true;
+          }
+          pendingSwapRef.delete(name);
         }
       }
-      console.log('World meshes:', worldMeshes.length);
-      console.log('====================');
-    }
+    }));
+    onProgress?.(82 + ((i + chunk.length) / total) * 8);
+  }
 
-    if (e.key.toLowerCase() === 'p') {
-      const info = renderer.info;
-      console.log('=== RENDERER STATS ===');
-      console.log(`Draw calls:  ${info.render.calls}`);
-      console.log(`Triangles:   ${info.render.triangles}`);
-      console.log(`Geometries:  ${info.memory.geometries}`);
-      console.log(`Textures:    ${info.memory.textures}`);
-      console.log(`Programs:    ${info.programs?.length ?? 'N/A'}`);
-      console.log('======================');
-    }
-  }, { passive: true });
+  return albedoMap;
+}
 
-  const keys = {};
+// ── Main loader ───────────────────────────────────────────────────────────────
+export async function loadBSP({
+  url,
+  scene,
+  textureBase     = '',
+  fallbackTexBase = '',
+  onProgress      = null,
+}) {
+  onProgress?.(0);
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`BSP fetch failed: ${url} (${res.status})`);
+  const buffer = await res.arrayBuffer();
+  onProgress?.(5);
 
-  window.addEventListener('keydown', e => {
-    keys[e.key.toLowerCase()] = true;
-    if (e.key === ' ') e.preventDefault();
-    startBgMusic();
-    document.querySelectorAll('video').forEach(v => v.play().catch(() => {}));
-  });
+  const parsed = await runBSPWorker(
+    buffer, textureBase, fallbackTexBase,
+    pct => onProgress?.(5 + pct * 0.75)
+  );
 
-  window.addEventListener('keyup', e => { keys[e.key.toLowerCase()] = false; });
+  const { portals, playerStart, ambientIntensity, ambientColorArr, texNames, lmAtlas, batches } = parsed;
 
-  window.addEventListener('click', () => {
-    startBgMusic();
-    const portal = getHoveredPortal();
-    if (!portal) return;
-    if (isAudioUrl(portal.url)) { playPortalAudio(portal.url); return; }
-    document.getElementById('fade')?.classList.add('out');
-    setTimeout(() => { window.location.href = portal.url; }, 350);
-  });
-
-  // Debounced resize — avoids mid-frame FBO reallocation
-  let _resizeTimer = null;
-  window.addEventListener('resize', () => {
-    clearTimeout(_resizeTimer);
-    _resizeTimer = setTimeout(() => {
-      camera.aspect = window.innerWidth / window.innerHeight;
-      camera.updateProjectionMatrix();
-      renderer.setSize(window.innerWidth, window.innerHeight);
-      composer.setSize(window.innerWidth, window.innerHeight);
-      if (bloomPass) {
-        bloomPass.resolution.set(
-          Math.floor(window.innerWidth  / 2),
-          Math.floor(window.innerHeight / 2),
-        );
-      }
-    }, 150);
-  });
-
-  if (onReady) onReady();
-
-  const clock = new THREE.Clock();
-  let _lastHashWrite = 0;
-  let _tickFrame     = 0;
-
-  (function tick() {
-    requestAnimationFrame(tick);
-    _tickFrame++;
-
-    let dt = clock.getDelta();
-    if (dt > 0.1) dt = 0.1;
-
-    yaw = physics.update(camera, keys, yaw, dt);
-
-    // Animated textures at ~20 Hz instead of 60 Hz
-    if (_tickFrame % 3 === 0) tickAnimatedTextures();
-
-    for (const p of portals) {
-      p.mesh.material.opacity = p.opacity;
-      p.ptLight.intensity     = 3.0;
-    }
-
-    const now = performance.now();
-    if (now - _lastHashWrite >= HASH_WRITE_INTERVAL) {
-      _lastHashWrite = now;
-      writeHashState(camera.position.x, camera.position.y, camera.position.z, yaw);
-    }
-
-    canvas.style.cursor = getHoveredPortal() ? 'pointer' : 'default';
-
-    // Use cheap render until scene is fully built; bloom on a half-built
-    // 80 MB scene was the primary cause of 3 FPS during load.
-    if (_sceneReady) {
-      composer.render();
+  // ── Lightmap ──────────────────────────────────────────────────────────────
+  let lmTex = null;
+  if (lmAtlas) {
+    if (lmAtlas.nonZero === 0) {
+      console.warn('[BSP] No lightmap — baked light missing.');
     } else {
-      renderer.render(scene, camera);
+      console.log(`[BSP] Lightmap atlas ${lmAtlas.W}×${lmAtlas.H}, non-zero: ${lmAtlas.nonZero}`);
     }
-  })();
+
+    const atlasArr   = new Uint8Array(lmAtlas.data);
+    lmTex            = new THREE.DataTexture(atlasArr, lmAtlas.W, lmAtlas.H, THREE.RGBAFormat);
+    lmTex.colorSpace = THREE.SRGBColorSpace;
+    lmTex.channel    = 1;
+
+    const atlasTooBig = lmAtlas.W > MAX_ATLAS_MIPMAP || lmAtlas.H > MAX_ATLAS_MIPMAP;
+    if (atlasTooBig) {
+      console.warn(
+        `[BSP] Atlas ${lmAtlas.W}×${lmAtlas.H} exceeds ${MAX_ATLAS_MIPMAP}px — mipmaps disabled.` +
+        ` Consider -lightmapsize 128 in q3map2.`
+      );
+      lmTex.generateMipmaps = false;
+      lmTex.minFilter       = THREE.LinearFilter;
+    } else {
+      lmTex.generateMipmaps = true;
+      lmTex.minFilter       = THREE.LinearMipmapLinearFilter;
+    }
+
+    lmTex.magFilter  = THREE.LinearFilter;
+    lmTex.anisotropy = _maxAniso;
+    lmTex.wrapS = lmTex.wrapT = THREE.ClampToEdgeWrapping;
+
+    setTimeout(() => { lmTex.needsUpdate = true; }, 0);
+  }
+
+  // ── Merge geometries ──────────────────────────────────────────────────────
+  console.log(`[BSP] Merging ${batches.length} batches (vertex budget: ${MAX_VERTS_PER_DRAW})...`);
+  const mergedBatches = mergeBatchGeometries(batches);
+  console.log(`[BSP] After merge: ${mergedBatches.length} draw calls`);
+
+  // ── Load initial textures before first mesh ───────────────────────────────
+  const texBases    = [textureBase, fallbackTexBase];
+  const uniqueNames = [...new Set(batches.filter(b => !b.invisible).map(b => texNames[b.texIdx] || 'default'))];
+
+  console.log(`[BSP] Loading ${uniqueNames.length} unique textures (${TEXTURE_BATCH_SIZE}/batch)...`);
+
+  const initialNames = uniqueNames.slice(0, INITIAL_BATCHES * TEXTURE_BATCH_SIZE);
+  const albedoMap    = new Map();
+
+  await Promise.all(initialNames.map(async name => {
+    const tex = await findTex(texBases, name);
+    albedoMap.set(name, tex || _whiteTex);
+  }));
+
+  onProgress?.(82);
+
+  // ── Build meshes progressively ────────────────────────────────────────────
+  const { pendingSwap } = await buildMeshesProgressively(
+    mergedBatches, texNames, lmTex, albedoMap, scene, onProgress
+  );
+
+  onProgress?.(100);
+
+  // ── Load remaining textures in background ─────────────────────────────────
+  const remainingNames = uniqueNames.slice(initialNames.length);
+  if (remainingNames.length > 0) {
+    console.log(`[BSP] Background-loading ${remainingNames.length} remaining textures...`);
+    loadTexturesInBatches(remainingNames, texBases, null, pendingSwap).catch(err => {
+      console.warn('[BSP] Background texture load error:', err);
+    });
+  }
+
+  const result = { portals, playerStart };
+  if (ambientIntensity !== undefined) result.ambientIntensity = ambientIntensity;
+  if (ambientColorArr)  result.ambientColor = new THREE.Color(...ambientColorArr);
+  result.lights = parsed.lights ?? [];
+
+  return result;
 }
