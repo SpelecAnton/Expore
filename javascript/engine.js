@@ -1,35 +1,43 @@
 /**
- * SPELEC EXPLORE ENGINE v7.0 — PERFORMANCE EDITION
+ * SPELEC EXPLORE ENGINE v7.1 — LARGE MAP EDITION
  *
- * Changes over v6.10:
+ * Changes over v7.0:
  *
- * 1. RENDER DISTANCE CONTROL:
- *    - camera.far reduced from 120 → 60 units (default).
- *    - Configurable via renderDistance parameter in initEngine().
- *    - Fog density tied to renderDistance so geometry never pops in before fog.
- *    - Anything outside the fog is not rasterized — free GPU win.
+ * 1. WORLD MESH COLLECTION FIXED:
+ *    - v7.0 used scene.traverse() inside the debug F-key handler on every press.
+ *    - worldMeshes list is now always built from the pre-collected list, not
+ *      via a fresh traverse inside the keydown handler.
+ *    - The portal wall-occlusion raycaster also uses the pre-built worldMeshes
+ *      (was already correct in v7.0, kept).
  *
- * 2. RENDERER OPTIMIZATIONS:
- *    - powerPreference: 'high-performance' hint to GPU driver.
- *    - logarithmicDepthBuffer: false (saves per-fragment cost on large maps).
- *    - renderer.info tracking via window._rendererInfo for debugging.
+ * 2. PORTAL HOVER THROTTLED:
+ *    - getHoveredPortal() ran every frame even when there are no portals.
+ *    - Now skips entirely if portals array is empty.
+ *    - When portals exist, only runs every OTHER frame (cursor update still
+ *      runs every frame but uses the cached result).
  *
- * 3. WORLD MESH LIST — no traverse every frame:
- *    - worldMeshes built once after load (unchanged from v6.x).
- *    - Portal raycaster still uses pre-built list.
+ * 3. HASH WRITE INTERVAL increased 1000 ms → 2000 ms:
+ *    - history.replaceState() is surprisingly expensive on some browsers.
+ *    - 2 second granularity is still fine for URL state persistence.
  *
- * 4. STATS (optional):
- *    - Press P to log renderer stats: draw calls, triangles, textures.
- *    - Useful for spotting batching problems after load.
+ * 4. CLOCK.getDelta() GUARD:
+ *    - If the tab was hidden and then restored, getDelta() returns a huge
+ *      value (5–30 seconds). This causes physics to teleport the player.
+ *    - Clamped to 0.1 s max at the engine level (physics also clamps to 0.05).
  *
- * 5. BLOOM PASS — default values lowered for performance:
- *    - bloomStrength default 0.4 (was 0.9) — full-screen pass is expensive.
- *    - Can be raised per-map in index.html physicsConfig block.
+ * 5. ANIMATED TEXTURE TICK — ALREADY FAST:
+ *    - tickAnimatedTextures() in bsp_loader v5.1 has a zero-cost early-out
+ *      when _animList is empty. No change needed here.
  *
- * 6. PIXEL RATIO CAPPED at 1.5 (was 2.0):
- *    - On Retina/4K screens the BSP map is not detailed enough to warrant
- *      full native res. 1.5 saves ~44% fragment shader work on those screens.
- *    - Configurable via maxPixelRatio parameter.
+ * 6. RENDERER PIXEL RATIO — DEFAULT LOWERED:
+ *    - maxPixelRatio default 1.5 → 1.0 for large maps.
+ *    - On an 80 MB map the geometry complexity is the bottleneck, not texel
+ *      density. Authors can raise it in index.html if needed.
+ *
+ * 7. BLOOM PASS — RESOLUTION HALVED:
+ *    - UnrealBloomPass now uses half the renderer resolution.
+ *    - Bloom quality is perceptually unchanged at half res but ~4× cheaper
+ *      (two passes on a quarter the pixels).
  */
 
 import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.165.0/build/three.module.js';
@@ -54,7 +62,7 @@ function readHashState() {
 }
 
 function writeHashState(x, y, z, yaw) {
-  const r    = v => Math.round(v * 1000) / 1000;
+  const r = v => Math.round(v * 1000) / 1000;
   history.replaceState(null, '', '#' + `${r(x)},${r(y)},${r(z)},${r(yaw)}`);
 }
 
@@ -148,8 +156,8 @@ function buildPortal(props, scene, portals) {
   const angle = parseFloat(props.angle || '0') * Math.PI / 180;
 
   const defaultSize = props.size || '110';
-  const w = parseFloat(props.width  || defaultSize) * UNIT;
-  const h = parseFloat(props.height || defaultSize) * UNIT;
+  const w       = parseFloat(props.width  || defaultSize) * UNIT;
+  const h       = parseFloat(props.height || defaultSize) * UNIT;
   const opacity = Math.max(0, Math.min(1, parseFloat(props.opacity ?? '0.78')));
   const x = ox * UNIT, y = oz * UNIT, z = -oy * UNIT;
 
@@ -217,10 +225,10 @@ function addLightSprites(scene, lights) {
   let spriteCount = 0;
 
   for (const light of lights) {
-    const col       = new THREE.Color(light.r, light.g, light.b);
-    const range     = Math.min(20, Math.max(2, light.intensity * 0.05));
-    const ptIntens  = Math.min(5, Math.max(0.2, light.intensity * 0.015));
-    const ptLight   = new THREE.PointLight(col, ptIntens, range);
+    const col      = new THREE.Color(light.r, light.g, light.b);
+    const range    = Math.min(20, Math.max(2, light.intensity * 0.05));
+    const ptIntens = Math.min(5, Math.max(0.2, light.intensity * 0.015));
+    const ptLight  = new THREE.PointLight(col, ptIntens, range);
     ptLight.position.set(light.x, light.y, light.z);
     scene.add(ptLight);
 
@@ -259,7 +267,10 @@ function _fallbackRoom(scene) {
   ceil.position.y = 5;
   scene.add(ceil);
 
-  for (const [wx, wy, wz, ry] of [[-10, 2.5, 0, 0], [10, 2.5, 0, Math.PI], [0, 2.5, -10, Math.PI / 2], [0, 2.5, 10, -Math.PI / 2]]) {
+  for (const [wx, wy, wz, ry] of [
+    [-10, 2.5, 0, 0], [10, 2.5, 0, Math.PI],
+    [0, 2.5, -10, Math.PI / 2], [0, 2.5, 10, -Math.PI / 2],
+  ]) {
     const m = new THREE.Mesh(new THREE.PlaneGeometry(20, 5), wallMat);
     m.position.set(wx, wy, wz);
     m.rotation.y = ry;
@@ -272,39 +283,36 @@ function _fallbackRoom(scene) {
 
 export async function initEngine({
   canvas,
-  mapUrl          = '/explore/hub/maps/hub.bsp',
-  textureBase     = '/explore/hub/textures/',
+  mapUrl          = 'map.bsp',
+  textureBase     = 'textures/',
   mapName         = 'MAP',
   onReady         = null,
   onProgress      = null,
   physicsConfig   = {},
-  bloomStrength   = 0.4,   // Lowered default: full-screen bloom pass is expensive
+  bloomStrength   = 0.4,
   bloomRadius     = 0.4,
   bloomThreshold  = 0.2,
-  renderDistance  = 180,    // camera.far in Three.js units (default 60 ≈ 3000 Quake units)
-  maxPixelRatio   = 1.5,   // Cap pixel ratio — saves ~44% on Retina/4K vs 2.0
-  fogColor        = 0x000000, // Fog + scene background color
+  renderDistance  = 180,
+  maxPixelRatio   = 1.0,   // Lowered default: 1.0 for large maps (was 1.5)
+  fogColor        = 0x000000,
 }) {
   const renderer = new THREE.WebGLRenderer({
     canvas,
-    antialias:            true,
-    powerPreference:      'high-performance',   // Hint GPU driver to use discrete GPU
-    logarithmicDepthBuffer: false,              // Save per-fragment cost
+    antialias:              true,
+    powerPreference:        'high-performance',
+    logarithmicDepthBuffer: false,
   });
   renderer.setPixelRatio(Math.min(window.devicePixelRatio, maxPixelRatio));
   renderer.setSize(window.innerWidth, window.innerHeight);
   renderer.toneMapping         = THREE.ACESFilmicToneMapping;
   renderer.toneMappingExposure = 2.0;
 
-  // Expose renderer info for debug (press P)
   window._rendererInfo = renderer.info;
 
   initTexLoader(renderer);
 
   const scene  = new THREE.Scene();
 
-  // Fog density derived from renderDistance: objects at renderDistance * 0.7 start fading
-  // This prevents geometry from "popping" at the far clip plane
   const fogDensity = 2.8 / renderDistance;
   scene.fog        = new THREE.FogExp2(fogColor, fogDensity);
   scene.background = new THREE.Color(fogColor);
@@ -318,16 +326,20 @@ export async function initEngine({
   const composer = new EffectComposer(renderer);
   composer.addPass(new RenderPass(scene, camera));
 
+  // Bloom at half resolution — perceptually equivalent, ~4× cheaper
   const bloomPass = new UnrealBloomPass(
-    new THREE.Vector2(window.innerWidth, window.innerHeight),
+    new THREE.Vector2(
+      Math.floor(window.innerWidth  / 2),
+      Math.floor(window.innerHeight / 2),
+    ),
     bloomStrength,
     bloomRadius,
     bloomThreshold,
   );
   composer.addPass(bloomPass);
 
-  const portals    = [];
-  let   yaw        = 0;
+  const portals     = [];
+  let   yaw         = 0;
   let   worldMeshes = [];
 
   const mapBase        = mapBaseFromUrl(mapUrl);
@@ -358,6 +370,7 @@ export async function initEngine({
       yaw = ps.angle * Math.PI / 180;
     }
 
+    // Build worldMeshes once — never traverse again at runtime
     const portalMeshSet = new Set(portals.map(p => p.mesh));
     scene.traverse(obj => {
       if (
@@ -396,8 +409,13 @@ export async function initEngine({
     bgMusic.play().catch(err => console.warn('[Engine] BG music failed:', err));
   }
 
-  let _lastHashWrite = 0;
-  const HASH_WRITE_INTERVAL = 1000;
+  // Hash write every 2 s (was 1 s) — history.replaceState is expensive
+  let _lastHashWrite       = 0;
+  const HASH_WRITE_INTERVAL = 2000;
+
+  // Portal hover check: cached result reused on odd frames
+  let _lastPortalHoverResult = null;
+  let _portalFrameCount      = 0;
 
   const portalRaycaster = new THREE.Raycaster();
   const wallRaycaster   = new THREE.Raycaster();
@@ -410,26 +428,37 @@ export async function initEngine({
   });
 
   function getHoveredPortal() {
+    // Fast exit if no portals in scene
     if (!portalMeshes.length) return null;
+
+    // Run expensive check only every other frame; reuse cached on odd frames
+    _portalFrameCount++;
+    if (_portalFrameCount % 2 !== 0) return _lastPortalHoverResult;
+
     portalRaycaster.setFromCamera(mouseNDC, camera);
     const portalHits = portalRaycaster.intersectObjects(portalMeshes, false);
-    if (!portalHits.length) return null;
+    if (!portalHits.length) { _lastPortalHoverResult = null; return null; }
+
     const portalDist = portalHits[0].distance;
     wallRaycaster.ray.copy(portalRaycaster.ray);
     wallRaycaster.near = portalRaycaster.near;
     wallRaycaster.far  = portalDist - 0.05;
     const wallHits = wallRaycaster.intersectObjects(worldMeshes, false);
-    if (wallHits.length > 0) return null;
-    return portals.find(p => p.mesh === portalHits[0].object) ?? null;
+    if (wallHits.length > 0) { _lastPortalHoverResult = null; return null; }
+
+    _lastPortalHoverResult = portals.find(p => p.mesh === portalHits[0].object) ?? null;
+    return _lastPortalHoverResult;
   }
 
-  // ── DEBUG: Press F → ground raycast debug, Press P → renderer stats ──────
+  // ── DEBUG: Press F → ground debug, Press P → renderer stats ──────────────
   window.addEventListener('keydown', e => {
-    // F key — ground check debug
     if (e.key.toLowerCase() === 'f') {
       const pos = camera.position;
       console.log('=== GROUND DEBUG ===');
       console.log('Camera pos:', `(${pos.x.toFixed(4)}, ${pos.y.toFixed(4)}, ${pos.z.toFixed(4)})`);
+
+      // Use pre-built worldMeshes — no traverse needed
+      const debugMeshes = worldMeshes.filter(obj => !obj.userData.noclip);
 
       const ray     = new THREE.Raycaster();
       ray.firstHitOnly = true;
@@ -440,15 +469,7 @@ export async function initEngine({
         ray.set(origin, new THREE.Vector3(0, -1, 0));
         ray.far = 5.0;
 
-        const meshes = [];
-        scene.traverse(obj => {
-          if (obj.isMesh && obj.geometry && !obj.userData.noclip &&
-              (obj.material?.depthWrite !== false || obj.userData.invisible)) {
-            meshes.push(obj);
-          }
-        });
-
-        const hits = ray.intersectObjects(meshes, false);
+        const hits = ray.intersectObjects(debugMeshes, false);
         if (hits.length > 0) {
           const h = hits[0];
           const n = h.face?.normal ? h.face.normal.clone().transformDirection(h.object.matrixWorld) : null;
@@ -467,7 +488,6 @@ export async function initEngine({
       console.log('====================');
     }
 
-    // P key — renderer stats
     if (e.key.toLowerCase() === 'p') {
       const info = renderer.info;
       console.log('=== RENDERER STATS ===');
@@ -489,7 +509,7 @@ export async function initEngine({
     document.querySelectorAll('video').forEach(v => v.play().catch(() => {}));
   });
 
-  window.addEventListener('keyup',   e => { keys[e.key.toLowerCase()] = false; });
+  window.addEventListener('keyup', e => { keys[e.key.toLowerCase()] = false; });
 
   window.addEventListener('click', () => {
     startBgMusic();
@@ -505,6 +525,11 @@ export async function initEngine({
     camera.updateProjectionMatrix();
     renderer.setSize(window.innerWidth, window.innerHeight);
     composer.setSize(window.innerWidth, window.innerHeight);
+    // Also update bloom pass resolution on resize
+    bloomPass.resolution.set(
+      Math.floor(window.innerWidth  / 2),
+      Math.floor(window.innerHeight / 2),
+    );
   });
 
   if (onReady) onReady();
@@ -513,7 +538,10 @@ export async function initEngine({
 
   (function tick() {
     requestAnimationFrame(tick);
-    const dt = clock.getDelta();
+
+    // Guard against huge dt after tab switch / focus loss
+    let dt = clock.getDelta();
+    if (dt > 0.1) dt = 0.1;
 
     yaw = physics.update(camera, keys, yaw, dt);
     tickAnimatedTextures();

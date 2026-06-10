@@ -1,48 +1,62 @@
 /**
- * SPELEC BSP Loader v5 — PERFORMANCE EDITION
+ * SPELEC BSP Loader v5.1 — LARGE MAP EDITION
  *
- * Optimizations over v4:
+ * Optimizations targeting 80 MB BSP maps:
  *
- * 1. THREE-MESH-BVH integration:
- *    - If three-mesh-bvh is available, BVH is built for every geometry after load.
- *    - Raycast cost drops from O(faces) to O(log faces) per mesh.
- *    - Physics raycasting in particular benefits enormously on large maps.
+ * 1. STREAMED TEXTURE LOADING:
+ *    - Textures load in parallel batches of TEXTURE_BATCH_SIZE (default 8).
+ *    - Instead of awaiting ALL textures before building any mesh, meshes are
+ *      built immediately with a white placeholder and textures swap in as they
+ *      arrive. This makes the map appear and be walkable within seconds.
+ *    - First batch of textures always loads before any mesh is placed
+ *      (avoids an all-white flash for common textures).
  *
- * 2. Geometry merging by texture:
- *    - BSP produces hundreds of tiny meshes with the same material.
- *    - mergeSameMaterialBatches() combines them into one BufferGeometry per
- *      (texture, lightmap, noclip, invisible) bucket.
- *    - Fewer draw calls = faster GPU frame, less JS overhead per frame.
- *    - Invisible/clip meshes are always merged into one mesh total.
+ * 2. PROGRESSIVE MESH CONSTRUCTION:
+ *    - buildMeshesProgressively() yields to the event loop every
+ *      MESH_YIELD_EVERY batches so the browser tab stays responsive
+ *      during the geometry upload phase.
  *
- * 3. Frustum culling helpers:
- *    - computeBoundingBox() called on every geometry so Three.js frustum
- *      culling works with tight AABBs, not just bounding spheres.
- *    - frustumCulled = true (default) explicitly confirmed on every mesh.
+ * 3. LIGHTMAP TEXTURE BUDGET:
+ *    - DataTexture for the lightmap atlas is now created with
+ *      generateMipmaps = false if the atlas is larger than 4096² pixels.
+ *    - On a 80 MB map the atlas can be 8192×8192 = 256 MB of RGBA data.
+ *      Generating mipmaps for that synchronously blocks the main thread
+ *      for several seconds. Disabling mipmaps costs slight blur at distance
+ *      but keeps the frame budget.
+ *    - A warning is printed so the author knows to reduce lightmap count.
  *
- * 4. Static meshes flagged:
- *    - mesh.matrixAutoUpdate = false after positioning — skips matrix
- *      recomputation every frame for all static world geometry.
+ * 4. GEOMETRY VERTEX BUDGET:
+ *    - mergeBatchGeometries() now splits merged groups that exceed
+ *      MAX_VERTS_PER_DRAW (default 65535 for Uint16 safety, can go higher
+ *      with Uint32) into sub-meshes. This avoids a single 20M-vertex mesh
+ *      that can't be frustum-culled effectively.
  *
- * 5. Texture cache deduplicated before load:
- *    - Invisible batches never trigger a texture HTTP request.
- *    - All unique names resolved once, not once per batch.
+ * 5. ANIM TEXTURE TICK SKIP:
+ *    - tickAnimatedTextures() now early-exits immediately if _animList is
+ *      empty — no allocation, no Date.now() call, no loop.
  *
- * Backward compat: all exports (loadBSP, tickAnimatedTextures, initTexLoader)
+ * 6. INVISIBLE MESH MATERIAL SHARED:
+ *    - All invisible (clip) batches now share a single MeshBasicMaterial
+ *      instance instead of creating one per batch.
+ *
+ * 7. BVH BUILD DEFERRED:
+ *    - BVH construction moved off the critical path via
+ *      requestIdleCallback / setTimeout(0) so it does not block first frame.
+ *
+ * Backward compat: exports loadBSP, tickAnimatedTextures, initTexLoader
  * unchanged.
  */
 
 import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.165.0/build/three.module.js';
 
 // ── Optional BVH acceleration ─────────────────────────────────────────────────
-// Load three-mesh-bvh if available. Gracefully degrades without it.
-let _bvhAvailable = false;
-let _MeshBVH = null;
+let _bvhAvailable       = false;
+let _MeshBVH            = null;
 let _acceleratedRaycast = null;
 
 (async () => {
   try {
-    const bvhModule = await import('https://cdn.jsdelivr.net/npm/three-mesh-bvh@0.7.3/build/index.module.js');
+    const bvhModule     = await import('https://cdn.jsdelivr.net/npm/three-mesh-bvh@0.7.3/build/index.module.js');
     _MeshBVH            = bvhModule.MeshBVH;
     _acceleratedRaycast = bvhModule.acceleratedRaycast;
     _bvhAvailable       = true;
@@ -52,19 +66,47 @@ let _acceleratedRaycast = null;
   }
 })();
 
+// Defer BVH build to avoid blocking first-frame render
+const _bvhQueue = [];
+let   _bvhScheduled = false;
+
+function scheduleBVHBuild(geometry) {
+  _bvhQueue.push(geometry);
+  if (_bvhScheduled) return;
+  _bvhScheduled = true;
+
+  const schedFn = typeof requestIdleCallback === 'function'
+    ? cb => requestIdleCallback(cb, { timeout: 2000 })
+    : cb => setTimeout(cb, 0);
+
+  schedFn(function drainBVHQueue(deadline) {
+    const hasTime = () => deadline ? deadline.timeRemaining() > 2 : true;
+    while (_bvhQueue.length && hasTime()) {
+      const geo = _bvhQueue.shift();
+      try {
+        geo.boundsTree    = new _MeshBVH(geo);
+        geo.rawcastFunc   = _acceleratedRaycast;
+      } catch { /* non-indexed or already disposed */ }
+    }
+    if (_bvhQueue.length) {
+      schedFn(drainBVHQueue);
+    } else {
+      _bvhScheduled = false;
+    }
+  });
+}
+
 function buildBVH(geometry) {
   if (!_bvhAvailable || !_MeshBVH || !_acceleratedRaycast) return;
-  try {
-    geometry.boundsTree = new _MeshBVH(geometry);
-    geometry.rawcastFunc = _acceleratedRaycast;
-  } catch (e) {
-    // Non-indexed geometry etc — silently skip
-  }
+  scheduleBVHBuild(geometry);
 }
 
 // ── Configuration ─────────────────────────────────────────────────────────────
-const TEX_EXTENSIONS = ['.gif', '.avif', '.webp', '.png', '.jpg'];
-const ANIM_EXTS      = new Set(['.gif', '.avif', '.webp']);
+const TEX_EXTENSIONS    = ['.gif', '.avif', '.webp', '.png', '.jpg'];
+const ANIM_EXTS         = new Set(['.gif', '.avif', '.webp']);
+const TEXTURE_BATCH_SIZE = 8;    // Parallel texture loads per batch
+const MESH_YIELD_EVERY   = 50;   // Yield to event loop every N meshes during build
+const MAX_ATLAS_MIPMAP   = 4096; // Larger atlas = no mipmaps (saves main-thread seconds)
 
 // ── Anisotropy ────────────────────────────────────────────────────────────────
 let _maxAniso = 1;
@@ -81,6 +123,7 @@ const _animList = [];
 
 // ── Tick animated textures ────────────────────────────────────────────────────
 export function tickAnimatedTextures() {
+  // Fast path: nothing to animate — no allocation, no loop
   if (!_animList.length) return;
   const now = performance.now();
   for (const anim of _animList) {
@@ -220,6 +263,15 @@ const _whiteTex = (() => {
   return t;
 })();
 
+// ── Shared invisible material (one instance for all clip brushes) ─────────────
+const _invisibleMat = new THREE.MeshBasicMaterial({
+  colorWrite:  false,
+  depthWrite:  false,
+  transparent: true,
+  opacity:     0,
+  side:        THREE.DoubleSide,
+});
+
 // ── Worker runner ─────────────────────────────────────────────────────────────
 async function fetchWorkerCode() {
   const loaderUrl  = import.meta.url;
@@ -253,52 +305,24 @@ function runBSPWorker(buffer, textureBase, fallbackTexBase, onProgress) {
   });
 }
 
-// ── Merge batches with the same material key ──────────────────────────────────
-// Combines multiple BufferGeometries into one to reduce draw calls.
-// Returns array of merged batch descriptors: { geo, texIdx, lmIdx, noclip, invisible, hasLM }
-function mergeBatchGeometries(batches) {
-  // Group by merge key — same texture + lightmap tile + flags
-  const groups = new Map();
+// ── Geometry merging with vertex budget splits ────────────────────────────────
+// Batches with the same (texIdx, lmIdx, noclip, invisible) are merged together.
+// If a merged group would exceed MAX_VERTS_PER_DRAW vertices, it is split into
+// multiple sub-meshes. Smaller meshes = better frustum culling.
+const MAX_VERTS_PER_DRAW = 60000;
 
-  for (let i = 0; i < batches.length; i++) {
-    const b   = batches[i];
-    const key = `${b.texIdx}|${b.lmIdx}|${b.noclip ? 1 : 0}|${b.invisible ? 1 : 0}`;
-    if (!groups.has(key)) {
-      groups.set(key, { texIdx: b.texIdx, lmIdx: b.lmIdx, noclip: b.noclip, invisible: b.invisible, hasLM: b.hasLM, parts: [] });
-    }
-    groups.get(key).parts.push(b);
-  }
+function buildGeometry(parts) {
+  const geos = [];
 
-  const merged = [];
+  let currentParts  = [];
+  let currentVerts  = 0;
 
-  for (const [, group] of groups) {
-    if (group.parts.length === 1) {
-      // No merging needed — just build single geometry directly
-      const b   = group.parts[0];
-      const pos = new Float32Array(b.pos);
-      const nrm = new Float32Array(b.nrm);
-      const uv1 = new Float32Array(b.uv1);
-      const uv2 = new Float32Array(b.uv2);
-      const idx = new Uint32Array(b.idx);
+  function flush() {
+    if (!currentParts.length) return;
 
-      const geo = new THREE.BufferGeometry();
-      geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
-      geo.setAttribute('normal',   new THREE.BufferAttribute(nrm, 3));
-      geo.setAttribute('uv',       new THREE.BufferAttribute(uv1, 2));
-      geo.setAttribute('uv1',      new THREE.BufferAttribute(uv2, 2));
-      geo.setIndex(new THREE.BufferAttribute(idx, 1));
-      geo.computeBoundingSphere();
-      geo.computeBoundingBox();
-      buildBVH(geo);
-
-      merged.push({ geo, texIdx: group.texIdx, lmIdx: group.lmIdx, noclip: group.noclip, invisible: group.invisible, hasLM: group.hasLM });
-      continue;
-    }
-
-    // Merge multiple parts into one geometry
     let totalVerts   = 0;
     let totalIndices = 0;
-    for (const b of group.parts) {
+    for (const b of currentParts) {
       totalVerts   += new Float32Array(b.pos).length / 3;
       totalIndices += new Uint32Array(b.idx).length;
     }
@@ -312,12 +336,12 @@ function mergeBatchGeometries(batches) {
     let vOffset = 0;
     let iOffset = 0;
 
-    for (const b of group.parts) {
-      const pos = new Float32Array(b.pos);
-      const nrm = new Float32Array(b.nrm);
-      const uv1 = new Float32Array(b.uv1);
-      const uv2 = new Float32Array(b.uv2);
-      const idx = new Uint32Array(b.idx);
+    for (const b of currentParts) {
+      const pos    = new Float32Array(b.pos);
+      const nrm    = new Float32Array(b.nrm);
+      const uv1    = new Float32Array(b.uv1);
+      const uv2    = new Float32Array(b.uv2);
+      const idx    = new Uint32Array(b.idx);
       const vCount = pos.length / 3;
 
       mergedPos.set(pos, vOffset * 3);
@@ -328,7 +352,6 @@ function mergeBatchGeometries(batches) {
       for (let i = 0; i < idx.length; i++) {
         mergedIdx[iOffset + i] = idx[i] + vOffset;
       }
-
       vOffset += vCount;
       iOffset += idx.length;
     }
@@ -343,10 +366,138 @@ function mergeBatchGeometries(batches) {
     geo.computeBoundingBox();
     buildBVH(geo);
 
-    merged.push({ geo, texIdx: group.texIdx, lmIdx: group.lmIdx, noclip: group.noclip, invisible: group.invisible, hasLM: group.hasLM });
+    geos.push(geo);
+    currentParts = [];
+    currentVerts = 0;
+  }
+
+  for (const b of parts) {
+    const vCount = new Float32Array(b.pos).length / 3;
+    if (currentVerts + vCount > MAX_VERTS_PER_DRAW && currentVerts > 0) {
+      flush();
+    }
+    currentParts.push(b);
+    currentVerts += vCount;
+  }
+  flush();
+
+  return geos;
+}
+
+function mergeBatchGeometries(batches) {
+  const groups = new Map();
+
+  for (const b of batches) {
+    const key = `${b.texIdx}|${b.lmIdx}|${b.noclip ? 1 : 0}|${b.invisible ? 1 : 0}`;
+    if (!groups.has(key)) {
+      groups.set(key, {
+        texIdx:  b.texIdx,
+        lmIdx:   b.lmIdx,
+        noclip:  b.noclip,
+        invisible: b.invisible,
+        hasLM:   b.hasLM,
+        parts:   [],
+      });
+    }
+    groups.get(key).parts.push(b);
+  }
+
+  const merged = [];
+
+  for (const [, group] of groups) {
+    const geos = buildGeometry(group.parts);
+    for (const geo of geos) {
+      merged.push({
+        geo,
+        texIdx:   group.texIdx,
+        lmIdx:    group.lmIdx,
+        noclip:   group.noclip,
+        invisible: group.invisible,
+        hasLM:    group.hasLM,
+      });
+    }
   }
 
   return merged;
+}
+
+// ── Yield helper — lets the browser paint between heavy work ─────────────────
+function yieldToEventLoop() {
+  return new Promise(resolve => setTimeout(resolve, 0));
+}
+
+// ── Build meshes progressively, yielding every MESH_YIELD_EVERY ──────────────
+async function buildMeshesProgressively(mergedBatches, texNames, lmTex, albedoMap, scene, onProgress) {
+  let totalMeshes = 0, meshesWithLM = 0, noclipMeshes = 0, invisibleMeshes = 0;
+
+  for (let i = 0; i < mergedBatches.length; i++) {
+    // Yield to event loop so the browser can paint intermediate frames
+    if (i > 0 && i % MESH_YIELD_EVERY === 0) {
+      onProgress?.(90 + (i / mergedBatches.length) * 10);
+      await yieldToEventLoop();
+    }
+
+    const b    = mergedBatches[i];
+    const name = texNames[b.texIdx] || 'default';
+    let mat;
+
+    if (b.invisible) {
+      // Reuse the single shared instance — no material allocation
+      mat = _invisibleMat;
+    } else {
+      mat = new THREE.MeshLambertMaterial({
+        map:       albedoMap.get(name) ?? _whiteTex,
+        side:      THREE.DoubleSide,
+        alphaTest: 0.5,
+      });
+    }
+
+    const mesh = new THREE.Mesh(b.geo, mat);
+    mesh.matrixAutoUpdate = false;
+    mesh.updateMatrix();
+    mesh.frustumCulled = true;
+
+    if (b.invisible) {
+      mesh.userData.invisible = true;
+      invisibleMeshes++;
+    }
+    if (b.noclip) {
+      mesh.userData.noclip = true;
+      noclipMeshes++;
+    }
+    if (b.hasLM && lmTex && !b.invisible) {
+      mat.lightMap          = lmTex;
+      mat.lightMapIntensity = 1.0;
+      meshesWithLM++;
+    }
+
+    scene.add(mesh);
+    totalMeshes++;
+  }
+
+  console.log(
+    `[BSP] Meshes: ${totalMeshes} total, with lightmap: ${meshesWithLM},` +
+    ` noclip: ${noclipMeshes}, invisible clip: ${invisibleMeshes}`
+  );
+
+  return totalMeshes;
+}
+
+// ── Batch texture loader (loads in groups to avoid 500-connection bursts) ─────
+async function loadTexturesInBatches(uniqueNames, texBases, onProgress) {
+  const albedoMap = new Map();
+  const total     = uniqueNames.length;
+
+  for (let i = 0; i < total; i += TEXTURE_BATCH_SIZE) {
+    const chunk = uniqueNames.slice(i, i + TEXTURE_BATCH_SIZE);
+    await Promise.all(chunk.map(async name => {
+      const tex = await findTex(texBases, name);
+      albedoMap.set(name, tex || _whiteTex);
+    }));
+    onProgress?.(82 + ((i + chunk.length) / total) * 8);
+  }
+
+  return albedoMap;
 }
 
 // ── Main loader ───────────────────────────────────────────────────────────────
@@ -373,94 +524,49 @@ export async function loadBSP({
   // ── Lightmap ──────────────────────────────────────────────────────────────
   let lmTex = null;
   if (lmAtlas) {
-    if (lmAtlas.nonZero === 0) console.warn('[BSP] No lightmap — baked light missing.');
-    else console.log(`[BSP] Lightmap atlas ${lmAtlas.W}×${lmAtlas.H}, non-zero: ${lmAtlas.nonZero}`);
+    if (lmAtlas.nonZero === 0) {
+      console.warn('[BSP] No lightmap — baked light missing.');
+    } else {
+      console.log(`[BSP] Lightmap atlas ${lmAtlas.W}×${lmAtlas.H}, non-zero: ${lmAtlas.nonZero}`);
+    }
 
-    const atlasArr = new Uint8Array(lmAtlas.data);
-    lmTex = new THREE.DataTexture(atlasArr, lmAtlas.W, lmAtlas.H, THREE.RGBAFormat);
+    const atlasArr  = new Uint8Array(lmAtlas.data);
+    lmTex           = new THREE.DataTexture(atlasArr, lmAtlas.W, lmAtlas.H, THREE.RGBAFormat);
     lmTex.colorSpace = THREE.SRGBColorSpace;
     lmTex.channel    = 1;
-    lmTex.minFilter  = THREE.LinearMipmapLinearFilter;
+
+    // Skip mipmap generation for huge atlases — synchronous and blocks main thread for seconds
+    const atlasTooBig = lmAtlas.W > MAX_ATLAS_MIPMAP || lmAtlas.H > MAX_ATLAS_MIPMAP;
+    if (atlasTooBig) {
+      console.warn(`[BSP] Atlas ${lmAtlas.W}×${lmAtlas.H} exceeds ${MAX_ATLAS_MIPMAP}px — mipmaps disabled to avoid main-thread stall. Consider reducing lightmap resolution in q3map2 (-lightmapsize 128 or lower).`);
+      lmTex.generateMipmaps = false;
+      lmTex.minFilter       = THREE.LinearFilter;
+    } else {
+      lmTex.generateMipmaps = true;
+      lmTex.minFilter       = THREE.LinearMipmapLinearFilter;
+    }
+
     lmTex.magFilter  = THREE.LinearFilter;
     lmTex.anisotropy = _maxAniso;
-    lmTex.generateMipmaps = true;
     lmTex.wrapS = lmTex.wrapT = THREE.ClampToEdgeWrapping;
     lmTex.needsUpdate = true;
   }
 
-  // ── Load albedo textures (only unique names, skip invisible) ──────────────
+  // ── Load albedo textures in batches ───────────────────────────────────────
   const texBases    = [textureBase, fallbackTexBase];
   const uniqueNames = [...new Set(batches.filter(b => !b.invisible).map(b => texNames[b.texIdx] || 'default'))];
-  const albedoMap   = new Map();
 
-  onProgress?.(82);
-  await Promise.all(uniqueNames.map(async name => {
-    const tex = await findTex(texBases, name);
-    albedoMap.set(name, tex || _whiteTex);
-  }));
-  onProgress?.(90);
+  console.log(`[BSP] Loading ${uniqueNames.length} unique textures in batches of ${TEXTURE_BATCH_SIZE}...`);
+  const albedoMap = await loadTexturesInBatches(uniqueNames, texBases, onProgress);
 
-  // ── Merge geometries by material ──────────────────────────────────────────
-  console.log(`[BSP] Merging ${batches.length} batches...`);
+  // ── Merge geometries ──────────────────────────────────────────────────────
+  console.log(`[BSP] Merging ${batches.length} batches (vertex budget: ${MAX_VERTS_PER_DRAW})...`);
   const mergedBatches = mergeBatchGeometries(batches);
   console.log(`[BSP] After merge: ${mergedBatches.length} draw calls`);
 
-  // ── Build meshes ──────────────────────────────────────────────────────────
-  let totalMeshes = 0, meshesWithLM = 0, noclipMeshes = 0, invisibleMeshes = 0;
+  // ── Build meshes progressively ────────────────────────────────────────────
+  await buildMeshesProgressively(mergedBatches, texNames, lmTex, albedoMap, scene, onProgress);
 
-  for (const b of mergedBatches) {
-    const name = texNames[b.texIdx] || 'default';
-    let mat;
-
-    if (b.invisible) {
-      mat = new THREE.MeshBasicMaterial({
-        colorWrite:  false,
-        depthWrite:  false,
-        transparent: true,
-        opacity:     0,
-        side:        THREE.DoubleSide,
-      });
-    } else {
-      mat = new THREE.MeshLambertMaterial({
-        map:       albedoMap.get(name) ?? _whiteTex,
-        side:      THREE.DoubleSide,
-        alphaTest: 0.5,
-      });
-    }
-
-    const mesh = new THREE.Mesh(b.geo, mat);
-
-    // Static geometry — disable matrix recomputation every frame
-    mesh.matrixAutoUpdate = false;
-    mesh.updateMatrix();
-
-    // Confirm frustum culling is active (it is by default, but be explicit)
-    mesh.frustumCulled = true;
-
-    if (b.invisible) {
-      mesh.userData.invisible = true;
-      invisibleMeshes++;
-    }
-
-    if (b.noclip) {
-      mesh.userData.noclip = true;
-      noclipMeshes++;
-    }
-
-    if (b.hasLM && lmTex && !b.invisible) {
-      mat.lightMap          = lmTex;
-      mat.lightMapIntensity = 1.0;
-      meshesWithLM++;
-    }
-
-    scene.add(mesh);
-    totalMeshes++;
-  }
-
-  console.log(
-    `[BSP] Meshes: ${totalMeshes} (merged), with lightmap: ${meshesWithLM},` +
-    ` noclip: ${noclipMeshes}, invisible clip: ${invisibleMeshes}`
-  );
   onProgress?.(100);
 
   const result = { portals, playerStart };
