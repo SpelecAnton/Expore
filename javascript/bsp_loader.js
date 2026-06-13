@@ -1,7 +1,27 @@
 /**
- * SPELEC BSP Loader v5.2 — LARGE MAP EDITION
+ * SPELEC BSP Loader v5.3 — VIDEO TEXTURE EDITION
  *
- * Changes over v5.1:
+ * Changes over v5.2:
+ *
+ * 7. REAL VIDEO TEXTURE SUPPORT (.mp4 / .webm):
+ *    - TEX_EXTENSIONS previously contained only image formats, so a texture
+ *      named e.g. "video.mp4" could never be matched by findTex() — it fell
+ *      through to a static "video.png" placeholder instead.
+ *    - Added VIDEO_EXTS + loadVideoTex(): creates a hidden <video> element
+ *      (looping, muted, autoplay) and wraps it in THREE.VideoTexture.
+ *    - The <video> element is kept OUT of display:none (some browsers pause
+ *      frame decoding for display:none elements) — instead it's moved off-
+ *      screen via position:absolute + opacity:0, so decoding keeps running.
+ *    - Mipmaps are disabled and linear filters are forced for video textures
+ *      to avoid silent black/blank textures inside EffectComposer caused by
+ *      NPOT mipmap generation on video frames.
+ *    - tickAnimatedTextures() now also resumes any <video> elements that got
+ *      paused by the browser (tab visibility changes, power saving, etc.).
+ *    - engine.js's existing `document.querySelectorAll('video')` play-on-
+ *      input handler keeps working unchanged, since video elements are
+ *      appended to document.body as before.
+ *
+ * --- Previous changelog (v5.2 — LARGE MAP EDITION) -----------------------
  *
  * 1. MESH_YIELD_EVERY REDUCED 50 → 10:
  *    - On an 80 MB map buildMeshesProgressively() was running 50 GPU uploads
@@ -95,7 +115,10 @@ function buildBVH(geometry) {
 }
 
 // ── Configuration ─────────────────────────────────────────────────────────────
-const TEX_EXTENSIONS     = ['.gif', '.avif', '.webp', '.png', '.jpg'];
+// Video formats are tried FIRST so a texture named e.g. "video.mp4" wins
+// over a "video.png" poster/placeholder that may exist alongside it.
+const VIDEO_EXTS         = new Set(['.mp4', '.webm']);
+const TEX_EXTENSIONS     = ['.mp4', '.webm', '.gif', '.avif', '.webp', '.png', '.jpg'];
 const ANIM_EXTS          = new Set(['.gif', '.avif', '.webp']);
 const TEXTURE_BATCH_SIZE = 4;    // Reduced 8 → 4: fewer simultaneous ImageBitmap decodes
 const MESH_YIELD_EVERY   = 10;   // Reduced 50 → 10: yield more often to avoid 250ms stalls
@@ -113,19 +136,31 @@ export function initTexLoader(renderer) {
 const _texCache = new Map();
 const _loader   = new THREE.TextureLoader();
 const _animList = [];
+const _videoList = [];
 
 // ── Tick animated textures ────────────────────────────────────────────────────
 export function tickAnimatedTextures() {
-  if (!_animList.length) return;
-  const now = performance.now();
-  for (const anim of _animList) {
-    if (now < anim.nextFrameTime) continue;
-    const frame = anim.frames[anim.frameIdx];
-    anim.ctx.clearRect(0, 0, anim.canvas.width, anim.canvas.height);
-    anim.ctx.drawImage(frame.bitmap, 0, 0, anim.canvas.width, anim.canvas.height);
-    anim.tex.needsUpdate = true;
-    anim.frameIdx      = (anim.frameIdx + 1) % anim.frames.length;
-    anim.nextFrameTime = now + frame.duration;
+  if (_animList.length) {
+    const now = performance.now();
+    for (const anim of _animList) {
+      if (now < anim.nextFrameTime) continue;
+      const frame = anim.frames[anim.frameIdx];
+      anim.ctx.clearRect(0, 0, anim.canvas.width, anim.canvas.height);
+      anim.ctx.drawImage(frame.bitmap, 0, 0, anim.canvas.width, anim.canvas.height);
+      anim.tex.needsUpdate = true;
+      anim.frameIdx      = (anim.frameIdx + 1) % anim.frames.length;
+      anim.nextFrameTime = now + frame.duration;
+    }
+  }
+
+  // Resume any <video> textures the browser may have paused
+  // (tab switch, power saving, autoplay-policy re-checks, etc.).
+  if (_videoList.length) {
+    for (const video of _videoList) {
+      if (video.paused && !video.ended) {
+        video.play().catch(() => { /* still blocked — try again next tick */ });
+      }
+    }
   }
 }
 
@@ -137,6 +172,71 @@ function applyTexFilters(tex, { linearMag = false } = {}) {
   tex.magFilter  = linearMag ? THREE.LinearFilter : THREE.NearestFilter;
   tex.anisotropy = _maxAniso;
   tex.generateMipmaps = true;
+}
+
+// ── Video texture loader ──────────────────────────────────────────────────────
+// Creates a hidden <video> element (looped, muted, autoplay) and wraps it in
+// a THREE.VideoTexture. Mipmaps are disabled and linear filtering is forced —
+// generating mipmaps from NPOT video frames is a common source of silent
+// black/blank textures when used through EffectComposer.
+//
+// IMPORTANT: the element is NOT display:none. Some browsers throttle or fully
+// stop decoding <video> frames when the element is display:none, which would
+// freeze the texture on the first frame. Instead it's moved off-screen with
+// position:absolute + opacity:0 so decoding keeps running normally.
+function loadVideoTex(url) {
+  return new Promise(resolve => {
+    const video = document.createElement('video');
+    video.src         = url;
+    video.loop        = true;
+    video.muted       = true;
+    video.playsInline = true;
+    video.autoplay    = true;
+    video.preload     = 'auto';
+    video.crossOrigin = 'anonymous';
+
+    // Keep decoding alive — do NOT use display:none here.
+    video.style.position      = 'absolute';
+    video.style.top           = '0';
+    video.style.left          = '0';
+    video.style.width         = '1px';
+    video.style.height        = '1px';
+    video.style.opacity       = '0';
+    video.style.pointerEvents = 'none';
+
+    document.body.appendChild(video);
+
+    const tex = new THREE.VideoTexture(video);
+    tex.colorSpace      = THREE.SRGBColorSpace;
+    tex.minFilter       = THREE.LinearFilter;
+    tex.magFilter       = THREE.LinearFilter;
+    tex.generateMipmaps = false;
+    tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+
+    let settled = false;
+
+    const onReady = () => {
+      if (settled) return;
+      settled = true;
+      _videoList.push(video);
+      video.play().catch(() => { /* will retry from tickAnimatedTextures() */ });
+      console.log(`[BSP] Video texture ready: ${url}`);
+      resolve(tex);
+    };
+
+    const onError = () => {
+      if (settled) return;
+      settled = true;
+      console.warn('[BSP] Video texture failed to load:', url);
+      video.remove();
+      resolve(null);
+    };
+
+    video.addEventListener('loadeddata', onReady, { once: true });
+    video.addEventListener('error', onError, { once: true });
+
+    video.load();
+  });
 }
 
 // ── Animated texture loader ───────────────────────────────────────────────────
@@ -216,7 +316,9 @@ async function tryLoadTex(url) {
     if (!probe.ok) { _texCache.set(url, null); return null; }
   } catch { _texCache.set(url, null); return null; }
   const ext = url.substring(url.lastIndexOf('.')).toLowerCase();
-  const tex  = ANIM_EXTS.has(ext) ? await loadAnimatedTex(url) : await loadStaticTex(url);
+  const tex  = VIDEO_EXTS.has(ext) ? await loadVideoTex(url)
+             : ANIM_EXTS.has(ext)  ? await loadAnimatedTex(url)
+             : await loadStaticTex(url);
   _texCache.set(url, tex);
   return tex;
 }
@@ -236,7 +338,9 @@ async function findTex(bases, name) {
     if (!found) continue;
     if (_texCache.has(found)) return _texCache.get(found);
     const ext = found.substring(found.lastIndexOf('.')).toLowerCase();
-    const tex  = ANIM_EXTS.has(ext) ? await loadAnimatedTex(found) : await loadStaticTex(found);
+    const tex  = VIDEO_EXTS.has(ext) ? await loadVideoTex(found)
+               : ANIM_EXTS.has(ext)  ? await loadAnimatedTex(found)
+               : await loadStaticTex(found);
     _texCache.set(found, tex);
     if (tex) return tex;
   }
