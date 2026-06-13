@@ -1,7 +1,17 @@
 /**
- * SPELEC EXPLORE ENGINE v7.2 — PERFORMANCE EDITION
+ * SPELEC EXPLORE ENGINE v7.3 — VIDEO AUDIO EDITION
  *
- * Changes over v7.1:
+ * Changes over v7.2:
+ *
+ * 1. VIDEO TEXTURE AUDIO UNLOCK:
+ *    - bsp_loader.js v5.4 creates <video> textures muted so autoplay works
+ *      without a gesture (browser autoplay policy).
+ *    - unmuteVideos() is now imported and called from the same first-
+ *      interaction handlers that already unlock background music
+ *      (keydown / click), so video texture audio becomes audible as soon
+ *      as the player starts interacting.
+ *
+ * --- Previous changelog (v7.2 — PERFORMANCE EDITION) -----------------------
  *
  * 1. COMPOSER RENDER THROTTLED DURING TEXTURE LOAD:
  *    - composer.render() was called every frame even while the map was still
@@ -50,7 +60,7 @@ import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.165.0/build/three.m
 import { EffectComposer }  from 'https://cdn.jsdelivr.net/npm/three@0.165.0/examples/jsm/postprocessing/EffectComposer.js';
 import { RenderPass }      from 'https://cdn.jsdelivr.net/npm/three@0.165.0/examples/jsm/postprocessing/RenderPass.js';
 import { UnrealBloomPass } from 'https://cdn.jsdelivr.net/npm/three@0.165.0/examples/jsm/postprocessing/UnrealBloomPass.js';
-import { loadBSP, tickAnimatedTextures, initTexLoader } from 'https://spelecanton.github.io/Expore/javascript/bsp_loader.js';
+import { loadBSP, tickAnimatedTextures, initTexLoader, unmuteVideos } from 'https://spelecanton.github.io/Expore/javascript/bsp_loader.js';
 import { createPhysics } from 'https://spelecanton.github.io/Expore/javascript/physics.js';
 
 const PLAYER_HEIGHT = 80;
@@ -545,6 +555,7 @@ export async function initEngine({
     keys[e.key.toLowerCase()] = true;
     if (e.key === ' ') e.preventDefault();
     startBgMusic();
+    unmuteVideos();
     document.querySelectorAll('video').forEach(v => v.play().catch(() => {}));
   });
 
@@ -552,6 +563,7 @@ export async function initEngine({
 
   window.addEventListener('click', () => {
     startBgMusic();
+    unmuteVideos();
     const portal = getHoveredPortal();
     if (!portal) return;
     if (isAudioUrl(portal.url)) { playPortalAudio(portal.url); return; }

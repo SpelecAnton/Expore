@@ -1,7 +1,16 @@
 /**
- * SPELEC BSP Loader v5.3 — VIDEO TEXTURE EDITION
+ * SPELEC BSP Loader v5.4 — VIDEO TEXTURE EDITION
  *
- * Changes over v5.2:
+ * Changes over v5.3:
+ *
+ * 8. AUDIO UNMUTE ON USER GESTURE:
+ *    - Video textures are created with muted = true so autoplay works
+ *      without a user gesture (browser autoplay policy).
+ *    - New export unmuteVideos() unmutes all active <video> textures —
+ *      call it from engine.js on the same first-interaction gesture that
+ *      already unlocks background music (click / keydown).
+ *
+ * --- Previous changelog (v5.3 — VIDEO TEXTURE EDITION) --------------------
  *
  * 7. REAL VIDEO TEXTURE SUPPORT (.mp4 / .webm):
  *    - TEX_EXTENSIONS previously contained only image formats, so a texture
@@ -160,6 +169,19 @@ export function tickAnimatedTextures() {
       if (video.paused && !video.ended) {
         video.play().catch(() => { /* still blocked — try again next tick */ });
       }
+    }
+  }
+}
+
+// ── Unmute video textures (call on first user gesture) ───────────────────────
+// Browsers require a user gesture before audio can play. Video textures are
+// created muted so autoplay starts immediately; call this from engine.js's
+// existing first-interaction handler (click / keydown) to enable audio.
+export function unmuteVideos() {
+  for (const video of _videoList) {
+    if (video.muted) {
+      video.muted = false;
+      video.play().catch(() => { /* still blocked — tickAnimatedTextures retries */ });
     }
   }
 }
