@@ -58,38 +58,36 @@
 <canvas id="c"></canvas>
 
 <script type="module">
-  import { initEngine } from 'https://spelecanton.github.io/Expore/javascript/engine.js';
+  import { initEngine }       from 'https://spelecanton.github.io/Expore/javascript/engine.js';
+  import { createMultiplayer } from 'https://spelecanton.github.io/Expore/javascript/multiplayer.js';
+  import { createChatOverlay } from 'https://spelecanton.github.io/Expore/javascript/chat_overlay.js';
 
-  initEngine({
+  // ── 3D engine ─────────────────────────────────────────────────────────────
+  // await: after this returns, window._scene / _cam / _physics are all set.
+  await initEngine({
     canvas:      document.getElementById('c'),
     mapUrl:      'map.bsp',
     textureBase: 'textures/',
-    mapName:     'MAP',
+    mapName:     'MAP',          // ← unique per map — used to group players
 
-    // ── Fog ───────────────────────────────────────────────────────────────
-    fogColor:       0x000000,   // fog + background color (hex)
-    renderDistance: 180,         // camera far plane in Three.js units
+    fogColor:       0x000000,
+    renderDistance: 180,
 
-    // ── Post-processing ───────────────────────────────────────────────────
     bloomStrength:  0.1,
     bloomRadius:    0.4,
     bloomThreshold: 0.2,
     maxPixelRatio:  1.5,
 
-    // ── Physics (Octree Capsule) ──────────────────────────────────────────
     physicsConfig: {
       MOVE_SPEED:      280 * 0.02,
       TURN_SPEED:      2.5,
       LOOK_SPEED:      2.5,
       RETURN_SPEED:    5.0,
-
       GRAVITY:        -28.0,
       JUMP_SPEED:      3.0,
       TERMINAL_VEL:  -30.0,
-
       PLAYER_HEIGHT:  80 * 0.02,
       PLAYER_RADIUS:   0.28,
-
       STEP_HEIGHT:     0.45,
       SLOPE_MAX_ANGLE: 50,
       SKIN_WIDTH:      0.02,
@@ -102,6 +100,30 @@
       const el = document.getElementById('loading');
       el.classList.add('hidden');
       setTimeout(() => el.remove(), 500);
+    },
+  });
+
+  // ── Multiplayer ────────────────────────────────────────────────────────────
+  // Broadcasts own position every 300 ms and receives other players on the
+  // same mapName.  Silently does nothing when spelec.cz is unreachable.
+  const mp = createMultiplayer(window._scene, {
+    mapName:    'MAP',           // must match mapName above
+    playersUrl: 'https://spelec.cz/chat/players.php',
+  });
+
+  // ── Chat overlay ───────────────────────────────────────────────────────────
+  // Ticker: last 60 s of messages, always visible, non-interactive.
+  // Full panel: [Tab] or click [CHAT] button — shows full history + player strip.
+  createChatOverlay({
+    apiUrl:    'https://spelec.cz/chat/api.php',
+    onlineUrl: 'https://spelec.cz/chat/online.php',
+
+    // Supply live player list so the chat panel shows a teleport strip
+    getPlayers: () => mp.getPlayers(),
+
+    // Teleport — uses the Rapier KCC already set up by engine.js
+    onTeleport: (x, y, z) => {
+      window._physics?.teleport(window._cam, x, y, z);
     },
   });
 </script>
