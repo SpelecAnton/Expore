@@ -284,6 +284,11 @@ export function createChatOverlay({
             _updatePlayerStrip();
             if (_plyrStrip) _plyrIv = setInterval(_updatePlayerStrip, 1000);
 
+            // Trigger an immediate poll so the panel is always up-to-date the
+            // moment it opens — don't wait for the next scheduled timeout.
+            clearTimeout(_pollTo);
+            _poll();
+
             _msgInput.focus();
         } else {
             clearInterval(_plyrIv);

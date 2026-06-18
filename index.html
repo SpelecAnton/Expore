@@ -68,7 +68,6 @@
     canvas:      document.getElementById('c'),
     mapUrl:      'teaching.bsp',
     textureBase: 'textures/',
-    mapName:     'MAP',          // ← unique per map — used to group players
 
     fogColor:       0x000000,
     renderDistance: 180,
@@ -106,8 +105,10 @@
   // ── Multiplayer ────────────────────────────────────────────────────────────
   // Broadcasts own position every 300 ms and receives other players on the
   // same mapName.  Silently does nothing when spelec.cz is unreachable.
+  // mapName is intentionally omitted — multiplayer.js auto-detects it from
+  // window.location.pathname and deliberately ignores the hash (coordinates).
+  // Example: https://spelec.cz/expore/#6.3,1.6,−1.9,−14.6  →  map = "expore"
   const mp = createMultiplayer(window._scene, {
-    mapName:    'teaching',           // must match mapName above
     playersUrl: 'https://spelec.cz/chat/players.php',
   });
 
