@@ -118,19 +118,17 @@ export function createChatOverlay({
     }
 
     // ── State ─────────────────────────────────────────────────────────────────
-    let _isOpen       = false;
+    let _isOpen       = true;    // panel is open by default on page load
     let _allMsgs      = [];       // chronological, newest last
     const _seen       = new Set();
     let _lastTs       = 0;
     let _hasMoreOlder = false;
     let _oldestTs     = 0;
     let _firstLoad    = true;
-    // True once the first poll batch has been fully processed — messages received
-    // before this point are NOT counted as unread (they were already there on load).
     let _firstLoadDone = false;
     let _unread       = 0;
     let _pollTo       = null;
-    let _polling      = false;    // guard: only one in-flight poll at a time
+    let _polling      = false;
     let _pingIv       = null;
     let _tickerIv     = null;
     let _plyrIv       = null;
@@ -156,7 +154,7 @@ export function createChatOverlay({
 
     // Panel
     const _panel = _el('div', { id: 'co-panel' });
-    _panel.hidden = true;
+    // Panel starts visible — matches Consul chat behaviour where chat is always shown.
 
     //   Header
     const _header   = _el('div', { id: 'co-header' });
@@ -268,13 +266,13 @@ export function createChatOverlay({
     function _setOpen(open) {
         _isOpen = open;
         _panel.hidden  = !open;
-        _ticker.hidden = open;   // ticker only shows while panel is closed
+        _ticker.hidden = open;
 
         if (open) {
             _unread       = 0;
             _badge.hidden = true;
 
-            // Populate panel from in-memory cache
+            // Populate panel from in-memory cache (messages already loaded)
             _msgDiv.innerHTML = '';
             for (const msg of _allMsgs) _msgDiv.appendChild(_renderMsg(msg));
             _lmBanner.hidden = !_hasMoreOlder;
@@ -290,6 +288,12 @@ export function createChatOverlay({
             clearInterval(_plyrIv);
             _plyrIv = null;
         }
+    }
+
+    // Called once at startup to set up the open panel's player strip interval
+    function _initOpenPanel() {
+        _updatePlayerStrip();
+        if (_plyrStrip) _plyrIv = setInterval(_updatePlayerStrip, 1000);
     }
 
     // ── Polling ───────────────────────────────────────────────────────────────
