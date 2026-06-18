@@ -130,6 +130,7 @@ export function createChatOverlay({
     let _firstLoadDone = false;
     let _unread       = 0;
     let _pollTo       = null;
+    let _polling      = false;    // guard: only one in-flight poll at a time
     let _pingIv       = null;
     let _tickerIv     = null;
     let _plyrIv       = null;
@@ -284,11 +285,6 @@ export function createChatOverlay({
             _updatePlayerStrip();
             if (_plyrStrip) _plyrIv = setInterval(_updatePlayerStrip, 1000);
 
-            // Trigger an immediate poll so the panel is always up-to-date the
-            // moment it opens — don't wait for the next scheduled timeout.
-            clearTimeout(_pollTo);
-            _poll();
-
             _msgInput.focus();
         } else {
             clearInterval(_plyrIv);
@@ -299,6 +295,8 @@ export function createChatOverlay({
     // ── Polling ───────────────────────────────────────────────────────────────
 
     async function _poll() {
+        if (_polling) return;   // never run two polls concurrently
+        _polling = true;
         try {
             const res = await fetch(`${apiUrl}?action=get&since=${_lastTs}`, {
                 signal: _abortFor(5000),
@@ -307,6 +305,7 @@ export function createChatOverlay({
             const data = await res.json();
 
             if (data.messages?.length) {
+                const isFirstLoad = _firstLoad;
                 if (_firstLoad) {
                     _firstLoad    = false;
                     _hasMoreOlder = data.has_more ?? false;
@@ -333,13 +332,22 @@ export function createChatOverlay({
                 // Cap in-memory store
                 if (_allMsgs.length > MSG_CAP) _allMsgs = _allMsgs.slice(-MSG_CAP);
 
-                // Append new messages to the open panel
                 if (_isOpen && newMsgs.length) {
-                    for (const msg of newMsgs) {
-                        if (!_msgDiv.querySelector(`[data-id="${msg.id}"]`))
-                            _msgDiv.appendChild(_renderMsg(msg));
+                    if (isFirstLoad) {
+                        // First poll with panel already open (auto-open case):
+                        // rebuild the whole DOM so all messages appear at once.
+                        _msgDiv.innerHTML = '';
+                        for (const msg of _allMsgs) _msgDiv.appendChild(_renderMsg(msg));
+                        _lmBanner.hidden = !_hasMoreOlder;
+                        requestAnimationFrame(() => { _msgDiv.scrollTop = _msgDiv.scrollHeight; });
+                    } else {
+                        // Subsequent polls: append only truly new messages.
+                        for (const msg of newMsgs) {
+                            if (!_msgDiv.querySelector(`[data-id="${msg.id}"]`))
+                                _msgDiv.appendChild(_renderMsg(msg));
+                        }
+                        if (_atBottom) _msgDiv.scrollTop = _msgDiv.scrollHeight;
                     }
-                    if (_atBottom) _msgDiv.scrollTop = _msgDiv.scrollHeight;
                 }
 
             } else if (_firstLoad) {
@@ -353,6 +361,7 @@ export function createChatOverlay({
         } catch {
             _pollMs = Math.min(_pollMs * 1.5, POLL_MAX);
         } finally {
+            _polling = false;
             // Always refresh ticker after each poll — keeps it in sync even when
             // no new messages arrived and the periodic setInterval hasn't fired yet.
             _refreshTicker();

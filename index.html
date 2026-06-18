@@ -115,7 +115,7 @@
   // ── Chat overlay ───────────────────────────────────────────────────────────
   // Ticker: last 60 s of messages, always visible, non-interactive.
   // Full panel: [Tab] or click [CHAT] button — shows full history + player strip.
-  createChatOverlay({
+  const chat = createChatOverlay({
     apiUrl:    'https://spelec.cz/chat/api.php',
     onlineUrl: 'https://spelec.cz/chat/online.php',
 
@@ -127,6 +127,10 @@
       window._physics?.teleport(window._cam, x, y, z);
     },
   });
+
+  // Open chat panel automatically on page load.
+  // The first poll will populate it with messages as soon as it returns.
+  chat.open();
 </script>
 
 </body>

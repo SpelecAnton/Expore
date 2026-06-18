@@ -103,7 +103,8 @@ function _makeBodyTex(hue) {
 
 function _makeLabelTex(nick, hue) {
     // Canvas is 512×56 px — wide enough for up to 128-char nicks.
-    // Background is drawn ONLY around the text (tight fit), not the full canvas.
+    // Background is drawn tightly around the text but with a guaranteed minimum
+    // width so short nicks (1–3 chars) never become an unreadable sliver.
     // Returns { tex, aspectRatio } so the caller can size the sprite correctly.
     const W = 512, H = 56;
     const canvas = document.createElement('canvas');
@@ -121,14 +122,16 @@ function _makeLabelTex(nick, hue) {
         ctx.font = `bold ${fontSize}px "Share Tech Mono","Courier New",monospace`;
     }
 
-    // Measure actual text width and build a tight background rect.
-    const pad  = 14;   // horizontal padding on each side
-    const textW = Math.min(ctx.measureText(nick).width, W - 2 * pad);
-    const bgW  = textW + pad * 2;
-    const bgX  = (W - bgW) / 2;
-    const r    = 8;
+    // Build background rect: tight around text but never narrower than MIN_BGW.
+    // MIN_BGW = 200 px ≈ 6 monospace characters — keeps short nicks readable.
+    const pad     = 16;    // horizontal padding on each side
+    const MIN_BGW = 200;   // minimum background width in canvas pixels
+    const textW   = ctx.measureText(nick).width;
+    const bgW     = Math.max(textW + pad * 2, MIN_BGW);
+    const bgX     = (W - bgW) / 2;
+    const r       = 8;
 
-    // Rounded-rect background — exactly as wide/tall as the nick label.
+    // Rounded-rect background.
     ctx.fillStyle = 'rgba(0,0,0,0.72)';
     ctx.beginPath();
     ctx.roundRect(bgX, 0, bgW, H, r);
@@ -142,9 +145,8 @@ function _makeLabelTex(nick, hue) {
     const tex = new THREE.CanvasTexture(canvas);
     tex.needsUpdate = true;
 
-    // aspectRatio = (bgW / W) * (W / H) — the fraction of the canvas that is
-    // occupied by the background, scaled to the correct world-space ratio.
-    const aspectRatio = bgW / H;   // world width = LABEL_H * aspectRatio
+    // aspectRatio drives the sprite's world-space width: width = LABEL_H * aspectRatio.
+    const aspectRatio = bgW / H;
     return { tex, aspectRatio };
 }
 
