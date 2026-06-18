@@ -17,7 +17,7 @@
 
 import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.165.0/build/three.module.js';
 
-const BROADCAST_MS  = 50;    // combined broadcast + poll interval
+const BROADCAST_MS  = 150;    // combined broadcast + poll interval
 const REQ_TIMEOUT   = 2500;   // ms before abandoning a stalled request
 const SPRITE_SIZE   = 0.44;   // body sprite diameter in Three.js units
 const LABEL_W       = 1.08;   // name-tag sprite width
