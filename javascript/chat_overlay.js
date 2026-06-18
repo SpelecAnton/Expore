@@ -305,7 +305,6 @@ export function createChatOverlay({
             const data = await res.json();
 
             if (data.messages?.length) {
-                const isFirstLoad = _firstLoad;
                 if (_firstLoad) {
                     _firstLoad    = false;
                     _hasMoreOlder = data.has_more ?? false;
@@ -333,20 +332,14 @@ export function createChatOverlay({
                 if (_allMsgs.length > MSG_CAP) _allMsgs = _allMsgs.slice(-MSG_CAP);
 
                 if (_isOpen && newMsgs.length) {
-                    if (isFirstLoad) {
-                        // First poll with panel already open (auto-open case):
-                        // rebuild the whole DOM so all messages appear at once.
-                        _msgDiv.innerHTML = '';
-                        for (const msg of _allMsgs) _msgDiv.appendChild(_renderMsg(msg));
-                        _lmBanner.hidden = !_hasMoreOlder;
+                    // Rebuild the full message list so the panel is always
+                    // correct — works for both auto-open and subsequent polls.
+                    const wasAtBottom = _atBottom;
+                    _msgDiv.innerHTML = '';
+                    for (const msg of _allMsgs) _msgDiv.appendChild(_renderMsg(msg));
+                    _lmBanner.hidden = !_hasMoreOlder;
+                    if (wasAtBottom) {
                         requestAnimationFrame(() => { _msgDiv.scrollTop = _msgDiv.scrollHeight; });
-                    } else {
-                        // Subsequent polls: append only truly new messages.
-                        for (const msg of newMsgs) {
-                            if (!_msgDiv.querySelector(`[data-id="${msg.id}"]`))
-                                _msgDiv.appendChild(_renderMsg(msg));
-                        }
-                        if (_atBottom) _msgDiv.scrollTop = _msgDiv.scrollHeight;
                     }
                 }
 

@@ -102,15 +102,23 @@ function _makeBodyTex(hue) {
 }
 
 function _makeLabelTex(nick, hue) {
-    // Canvas is 512×56 px — wide enough for up to 128-char nicks.
-    // Background is drawn tightly around the text but with a guaranteed minimum
-    // width so short nicks (1–3 chars) never become an unreadable sliver.
-    // Returns { tex, aspectRatio } so the caller can size the sprite correctly.
+    // Canvas 512×56 px. Background fills the full canvas so the sprite
+    // always has a solid backdrop regardless of nick length.
     const W = 512, H = 56;
     const canvas = document.createElement('canvas');
     canvas.width = W; canvas.height = H;
     const ctx = canvas.getContext('2d');
     ctx.clearRect(0, 0, W, H);
+
+    // Rounded-rect background — full canvas width.
+    const r = 10;
+    ctx.fillStyle = 'rgba(0,0,0,0.72)';
+    ctx.beginPath();
+    ctx.moveTo(r, 0);
+    ctx.arcTo(W, 0, W, H, r); ctx.arcTo(W, H, 0, H, r);
+    ctx.arcTo(0, H, 0, 0, r); ctx.arcTo(0, 0, W, 0, r);
+    ctx.closePath();
+    ctx.fill();
 
     // Auto-scale font so the full nick fits without truncation.
     // Starts at 23 px and steps down to 8 px (minimum readable in 3D).
@@ -122,21 +130,6 @@ function _makeLabelTex(nick, hue) {
         ctx.font = `bold ${fontSize}px "Share Tech Mono","Courier New",monospace`;
     }
 
-    // Build background rect: tight around text but never narrower than MIN_BGW.
-    // MIN_BGW = 200 px ≈ 6 monospace characters — keeps short nicks readable.
-    const pad     = 16;    // horizontal padding on each side
-    const MIN_BGW = 200;   // minimum background width in canvas pixels
-    const textW   = ctx.measureText(nick).width;
-    const bgW     = Math.max(textW + pad * 2, MIN_BGW);
-    const bgX     = (W - bgW) / 2;
-    const r       = 8;
-
-    // Rounded-rect background.
-    ctx.fillStyle = 'rgba(0,0,0,0.72)';
-    ctx.beginPath();
-    ctx.roundRect(bgX, 0, bgW, H, r);
-    ctx.fill();
-
     ctx.textAlign    = 'center';
     ctx.textBaseline = 'middle';
     ctx.fillStyle    = `hsl(${hue},100%,72%)`;
@@ -144,10 +137,7 @@ function _makeLabelTex(nick, hue) {
 
     const tex = new THREE.CanvasTexture(canvas);
     tex.needsUpdate = true;
-
-    // aspectRatio drives the sprite's world-space width: width = LABEL_H * aspectRatio.
-    const aspectRatio = bgW / H;
-    return { tex, aspectRatio };
+    return tex;
 }
 
 // ── Factory ───────────────────────────────────────────────────────────────────
@@ -228,12 +218,9 @@ export function createMultiplayer(scene, {
                 if (cur.nick !== p.nick) {
                     cur.nick = p.nick;
                     cur.labelTex.dispose();
-                    const { tex: newTex, aspectRatio } = _makeLabelTex(p.nick, _idToHue(p.uid));
-                    cur.labelTex = newTex;
+                    cur.labelTex = _makeLabelTex(p.nick, _idToHue(p.uid));
                     cur.labelSprite.material.map = cur.labelTex;
                     cur.labelSprite.material.needsUpdate = true;
-                    // Re-size sprite so background stays tight around the new nick.
-                    cur.labelSprite.scale.set(LABEL_H * aspectRatio, LABEL_H, 1);
                 }
             } else {
                 _players.set(p.uid, _spawnPlayer(p));
@@ -248,9 +235,9 @@ export function createMultiplayer(scene, {
 
     // ── Spawn a new player sprite group ──────────────────────────────────────
     function _spawnPlayer(data) {
-        const hue               = _idToHue(data.uid);
-        const bodyTex           = _makeBodyTex(hue);
-        const { tex: labelTex, aspectRatio } = _makeLabelTex(data.nick, hue);
+        const hue      = _idToHue(data.uid);
+        const bodyTex  = _makeBodyTex(hue);
+        const labelTex = _makeLabelTex(data.nick, hue);
 
         const bodyMat  = new THREE.SpriteMaterial({ map: bodyTex,  transparent: true, depthWrite: false });
         const labelMat = new THREE.SpriteMaterial({ map: labelTex, transparent: true, depthWrite: false });
@@ -261,8 +248,7 @@ export function createMultiplayer(scene, {
         bodySprite.userData.noclip = true;
 
         const labelSprite = new THREE.Sprite(labelMat);
-        // Width = LABEL_H × aspectRatio so the background tightly wraps the nick.
-        labelSprite.scale.set(LABEL_H * aspectRatio, LABEL_H, 1);
+        labelSprite.scale.set(LABEL_W, LABEL_H, 1);
         labelSprite.position.set(0, LABEL_Y, 0);
         labelSprite.userData.noclip = true;
 
