@@ -1,0 +1,2 @@
+Anton Špelec = https://spelec.cz/images/anton4.png
+Karel Gott = https://spelec.cz/images/karelgott.png
