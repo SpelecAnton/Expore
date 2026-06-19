@@ -1,11 +1,31 @@
 /**
- * SPELEC Multiplayer v1.3
+ * SPELEC Multiplayer v1.4
  *
  * Renders other players as 3D billboard sprites in the scene.
  * Broadcasts own position to spelec.cz/chat/players.php and receives others every 150 ms.
  * Silently degrades when server is unreachable — the engine keeps running.
  *
- * Changes over v1.2:
+ * Changes over v1.3:
+ *
+ * 1. ANIMATED / VIDEO CUSTOM SKINS:
+ *    player_skins.txt entries can now point at a .gif/.avif/.webp (animated
+ *    image) or .mp4/.webm (video) file, not just a static image — detected
+ *    purely by URL extension.
+ *      - Video skins: a hidden looping <video> element wrapped in a
+ *        THREE.VideoTexture, same off-screen-but-not-display:none trick used
+ *        by bsp_loader.js for map textures. ALWAYS muted — unlike BSP map
+ *        textures, several player avatars playing audio simultaneously would
+ *        be unpleasant, so there is intentionally no unmute path for these.
+ *      - Animated image skins: decoded via the ImageDecoder API into a frame
+ *        list, drawn onto a canvas backing a THREE.CanvasTexture, and ticked
+ *        forward once per frame from _lerpLoop(). Falls back to a plain
+ *        static texture if ImageDecoder is unavailable or the file turns out
+ *        to only have one frame.
+ *    _applyBodyAppearance() now tracks a per-player `skinCleanup` callback
+ *    (removes the <video> element / closes decoded bitmaps) so swapping or
+ *    removing a skin never leaks GPU/DOM resources.
+ *
+ * --- Previous changelog (v1.3) ----------------------------------------------
  *
  * 1. RESERVED ADMIN SKIN GATE:
  *    The custom-skin feature (added in v1.2) matches any nickname against
@@ -233,17 +253,202 @@ async function _loadSkinMap(url) {
     return map;
 }
 
-// Loads a single skin image as a THREE.Texture. Resolves to `null` instead
-// of rejecting on failure so callers can fall back to the default ball
-// without needing a try/catch around every call site.
-function _loadSkinTexture(url) {
+// ── Animated / video skin support ───────────────────────────────────────────
+// Custom skins can be a static image, an animated image (.gif/.avif/.webp),
+// or a short looping video (.mp4/.webm). Detected purely by URL extension —
+// server content-type is not consulted (matches the rest of the skin-list
+// parsing, which is intentionally simple/static).
+//
+// Every loader below resolves to either `null` (failed) or:
+//   { tex, width, height, cleanup }
+// `cleanup()` releases any DOM/decoder resources the asset created (detached
+// <video> elements, decoded ImageBitmaps) — always call it when a skin is
+// replaced or its player leaves.
+
+const SKIN_VIDEO_EXTS = new Set(['.mp4', '.webm']);
+const SKIN_ANIM_EXTS  = new Set(['.gif', '.avif', '.webp']);
+
+function _extOf(url) {
+    try {
+        const path = new URL(url, window.location.origin).pathname;
+        return path.substring(path.lastIndexOf('.')).toLowerCase();
+    } catch { return ''; }
+}
+
+// Active animated-canvas skins — advanced once per frame from _lerpLoop().
+const _activeAnimSkins  = new Set();
+// Active <video> skin elements — resumed if the browser pauses them (tab
+// switch, power-saving), same pattern as bsp_loader.js's tickAnimatedTextures().
+const _activeVideoSkins = new Set();
+
+// Looping muted <video> element as a skin texture. ALWAYS muted: multiple
+// player avatars playing audio simultaneously would be unpleasant, and
+// muted autoplay also sidesteps the browser autoplay-gesture requirement
+// entirely, so the avatar starts animating immediately for everyone.
+function _loadVideoSkin(url) {
+    return new Promise(resolve => {
+        const video = document.createElement('video');
+        video.src         = url;
+        video.loop        = true;
+        video.muted       = true;
+        video.playsInline = true;
+        video.autoplay    = true;
+        video.preload     = 'auto';
+        video.crossOrigin = 'anonymous';
+
+        // Kept off-screen but NOT display:none — some browsers stop decoding
+        // frames for display:none elements, which would freeze the texture
+        // on its first frame.
+        video.style.position      = 'absolute';
+        video.style.top           = '0';
+        video.style.left          = '0';
+        video.style.width         = '1px';
+        video.style.height        = '1px';
+        video.style.opacity       = '0';
+        video.style.pointerEvents = 'none';
+        document.body.appendChild(video);
+
+        let settled = false;
+
+        const onReady = () => {
+            if (settled) return;
+            settled = true;
+
+            const tex = new THREE.VideoTexture(video);
+            tex.colorSpace      = THREE.SRGBColorSpace;
+            tex.minFilter       = THREE.LinearFilter;
+            tex.magFilter       = THREE.LinearFilter;
+            tex.generateMipmaps = false;
+            tex.wrapS = tex.wrapT = THREE.ClampToEdgeWrapping;
+
+            video.play().catch(() => { /* retried by _tickAnimatedSkins() */ });
+            _activeVideoSkins.add(video);
+
+            resolve({
+                tex,
+                width:  video.videoWidth  || 1,
+                height: video.videoHeight || 1,
+                cleanup: () => {
+                    _activeVideoSkins.delete(video);
+                    video.pause();
+                    video.removeAttribute('src');
+                    video.load();
+                    video.remove();
+                },
+            });
+        };
+
+        const onError = () => {
+            if (settled) return;
+            settled = true;
+            console.warn('[Multiplayer] Video skin failed to load:', url);
+            video.remove();
+            resolve(null);
+        };
+
+        video.addEventListener('loadeddata', onReady, { once: true });
+        video.addEventListener('error', onError, { once: true });
+        video.load();
+    });
+}
+
+// Animated GIF/AVIF/WEBP skin via ImageDecoder, drawn frame-by-frame onto a
+// canvas backing a THREE.CanvasTexture. Mirrors bsp_loader.js's
+// loadAnimatedTex() but keeps its own independent state since multiplayer.js
+// has no dependency on bsp_loader.js. Falls back to a plain static texture
+// when ImageDecoder is unavailable or the file turns out to have only one
+// frame (i.e. it isn't actually animated).
+async function _loadAnimatedSkin(url) {
+    if (typeof ImageDecoder === 'undefined') {
+        console.warn('[Multiplayer] ImageDecoder not available, static fallback:', url);
+        return _loadStaticSkin(url);
+    }
+    try {
+        const res = await fetch(url, { mode: 'cors' });
+        if (!res.ok) return null;
+        const buffer = await res.arrayBuffer();
+
+        const ext     = _extOf(url);
+        const typeMap = { '.gif': 'image/gif', '.avif': 'image/avif', '.webp': 'image/webp' };
+        const type    = typeMap[ext] ?? 'image/gif';
+
+        const probeDecoder = new ImageDecoder({
+            data: new Blob([buffer], { type }).stream(), type, preferAnimation: true,
+        });
+        await probeDecoder.tracks.ready;
+        const frameCount = probeDecoder.tracks.selectedTrack?.frameCount ?? 1;
+        probeDecoder.close();
+        if (frameCount <= 1) return _loadStaticSkin(url);
+
+        const decoder = new ImageDecoder({
+            data: new Blob([buffer], { type }).stream(), type, preferAnimation: true,
+        });
+        await decoder.tracks.ready;
+
+        const frames = [];
+        let w = 0, h = 0;
+        for (let i = 0; i < frameCount; i++) {
+            const result   = await decoder.decode({ frameIndex: i });
+            const img      = result.image;
+            const duration = img.duration != null ? img.duration / 1000 : 100;
+            if (i === 0) {
+                w = img.displayWidth  || img.codedWidth  || 128;
+                h = img.displayHeight || img.codedHeight || 128;
+            }
+            const bitmap = await createImageBitmap(img, { resizeWidth: w, resizeHeight: h });
+            img.close();
+            frames.push({ bitmap, duration });
+        }
+        decoder.close();
+        if (!frames.length) return _loadStaticSkin(url);
+
+        const canvas = document.createElement('canvas');
+        canvas.width  = w;
+        canvas.height = h;
+        const ctx = canvas.getContext('2d');
+        ctx.drawImage(frames[0].bitmap, 0, 0, w, h);
+
+        const tex = new THREE.CanvasTexture(canvas);
+        tex.colorSpace  = THREE.SRGBColorSpace;
+        tex.needsUpdate = true;
+
+        const animEntry = {
+            frames, canvas, ctx, tex, frameIdx: 0,
+            nextFrameTime: performance.now() + frames[0].duration,
+        };
+        _activeAnimSkins.add(animEntry);
+
+        return {
+            tex, width: w, height: h,
+            cleanup: () => {
+                _activeAnimSkins.delete(animEntry);
+                for (const f of frames) f.bitmap.close();
+            },
+        };
+    } catch (err) {
+        console.warn('[Multiplayer] Animated skin load failed, static fallback:', url, err.message);
+        return _loadStaticSkin(url);
+    }
+}
+
+// Plain static-image skin loader — the original v1.2/v1.3 behaviour, also
+// used as the fallback path for animated formats when ImageDecoder is
+// unavailable or the file isn't actually animated. Resolves to `null`
+// instead of rejecting on failure so callers never need a try/catch.
+function _loadStaticSkin(url) {
     return new Promise(resolve => {
         _skinLoader.load(
             url,
             tex => {
-                tex.colorSpace = THREE.SRGBColorSpace;
+                tex.colorSpace  = THREE.SRGBColorSpace;
                 tex.needsUpdate = true;
-                resolve(tex);
+                const img = tex.image;
+                resolve({
+                    tex,
+                    width:  img?.width  || 1,
+                    height: img?.height || 1,
+                    cleanup: () => {},
+                });
             },
             undefined,
             () => {
@@ -252,6 +457,39 @@ function _loadSkinTexture(url) {
             },
         );
     });
+}
+
+// Dispatches to the right loader based on the skin URL's file extension.
+function _loadSkinAsset(url) {
+    const ext = _extOf(url);
+    if (SKIN_VIDEO_EXTS.has(ext)) return _loadVideoSkin(url);
+    if (SKIN_ANIM_EXTS.has(ext))  return _loadAnimatedSkin(url);
+    return _loadStaticSkin(url);
+}
+
+// Ticks all active animated-canvas skin textures forward and resumes any
+// <video> skins the browser may have paused. Called once per frame from
+// _lerpLoop() — no separate interval needed.
+function _tickAnimatedSkins() {
+    if (_activeAnimSkins.size) {
+        const now = performance.now();
+        for (const anim of _activeAnimSkins) {
+            if (now < anim.nextFrameTime) continue;
+            const frame = anim.frames[anim.frameIdx];
+            anim.ctx.clearRect(0, 0, anim.canvas.width, anim.canvas.height);
+            anim.ctx.drawImage(frame.bitmap, 0, 0, anim.canvas.width, anim.canvas.height);
+            anim.tex.needsUpdate = true;
+            anim.frameIdx      = (anim.frameIdx + 1) % anim.frames.length;
+            anim.nextFrameTime = now + frame.duration;
+        }
+    }
+    if (_activeVideoSkins.size) {
+        for (const video of _activeVideoSkins) {
+            if (video.paused && !video.ended) {
+                video.play().catch(() => { /* still blocked — retried next tick */ });
+            }
+        }
+    }
 }
 
 // ── Factory ───────────────────────────────────────────────────────────────────
@@ -298,8 +536,8 @@ export function createMultiplayer(scene, {
         return skinUrl;
     }
 
-    // uid → { uid, nick, isAdmin, group, bodySprite, bodyTex, skinUrl, hue,
-    //         labelTex, labelSprite, target:Vector3, destroyed }
+    // uid → { uid, nick, isAdmin, group, bodySprite, bodyTex, skinUrl,
+    //         skinCleanup, hue, labelTex, labelSprite, target:Vector3, destroyed }
     const _players = new Map();
 
     let _ivId   = null;
@@ -307,11 +545,13 @@ export function createMultiplayer(scene, {
     let _lastRf = performance.now();
 
     // ── Apply (or re-apply) a player's body appearance ────────────────────────
-    // Handles both the default procedural ball and async-loaded custom skins.
-    // Safe to call again later (e.g. after a nick/admin-status change) —
-    // disposes the old body texture first so GPU memory doesn't leak.
+    // Handles the default procedural ball plus async-loaded custom skins
+    // (static image, animated image, or video). Safe to call again later
+    // (e.g. after a nick/admin-status change) — disposes the old texture and
+    // runs its cleanup() first so GPU/DOM resources never leak.
     function _applyBodyAppearance(entry) {
-        if (entry.bodyTex) { entry.bodyTex.dispose(); entry.bodyTex = null; }
+        if (entry.bodyTex)     { entry.bodyTex.dispose(); entry.bodyTex = null; }
+        if (entry.skinCleanup) { entry.skinCleanup(); entry.skinCleanup = null; }
 
         const skinUrl = entry.skinUrl;
 
@@ -328,31 +568,31 @@ export function createMultiplayer(scene, {
         entry.bodySprite.material.map = null;
         entry.bodySprite.material.needsUpdate = true;
 
-        _loadSkinTexture(skinUrl).then(tex => {
+        _loadSkinAsset(skinUrl).then(asset => {
             // The player may have left, or their nick/admin status (and thus
             // skin) may have changed again while this request was in flight —
-            // bail out if so.
+            // bail out if so, releasing whatever was just loaded.
             if (entry.destroyed || entry.skinUrl !== skinUrl) {
-                if (tex) tex.dispose();
+                if (asset) { asset.tex.dispose(); asset.cleanup(); }
                 return;
             }
 
-            if (!tex) {
-                // Load failed (404, CORS, etc.) — fall back to the default ball.
+            if (!asset) {
+                // Load failed (404, CORS, unsupported codec, etc.) — fall
+                // back to the default ball.
                 entry.skinUrl = null;
                 _applyBodyAppearance(entry);
                 return;
             }
 
-            entry.bodyTex = tex;
-            entry.bodySprite.material.map = tex;
+            entry.bodyTex     = asset.tex;
+            entry.skinCleanup = asset.cleanup;
+            entry.bodySprite.material.map = asset.tex;
             entry.bodySprite.material.needsUpdate = true;
 
-            // Preserve the source image's aspect ratio instead of forcing a
+            // Preserve the source asset's aspect ratio instead of forcing a
             // square, scaled so the longer side matches SPRITE_SIZE * SKIN_SCALE.
-            const img      = tex.image;
-            const w        = img?.width  || 1;
-            const h        = img?.height || 1;
+            const w = asset.width, h = asset.height;
             const longSide = SPRITE_SIZE * SKIN_SCALE;
             if (w >= h) {
                 entry.bodySprite.scale.set(longSide, longSide * (h / w), 1);
@@ -488,7 +728,7 @@ export function createMultiplayer(scene, {
 
         const entry = {
             uid: data.uid, nick: data.nick, isAdmin: !!data.is_admin, hue, group,
-            bodySprite, bodyTex: null, skinUrl: null,
+            bodySprite, bodyTex: null, skinUrl: null, skinCleanup: null,
             labelTex, labelSprite,
             target: new THREE.Vector3(data.x, data.y, data.z),
             destroyed: false,
@@ -500,18 +740,19 @@ export function createMultiplayer(scene, {
         return entry;
     }
 
-    // ── Remove a player's sprites and free GPU resources ──────────────────────
+    // ── Remove a player's sprites and free GPU/DOM resources ──────────────────
     function _killPlayer(p) {
         p.destroyed = true;
         p.group.removeFromParent();
-        if (p.bodyTex) p.bodyTex.dispose();
+        if (p.bodyTex)     p.bodyTex.dispose();
+        if (p.skinCleanup) p.skinCleanup();
         p.labelTex.dispose();
         for (const child of p.group.children) {
             if (child.material) child.material.dispose();
         }
     }
 
-    // ── RAF loop: smoothly lerp sprite positions ──────────────────────────────
+    // ── RAF loop: smoothly lerp sprite positions + tick animated skins ────────
     function _lerpLoop() {
         const now   = performance.now();
         const dt    = Math.min((now - _lastRf) / 1000, 0.1);
@@ -521,6 +762,8 @@ export function createMultiplayer(scene, {
         for (const p of _players.values()) {
             p.group.position.lerp(p.target, alpha);
         }
+
+        _tickAnimatedSkins();
 
         _rafId = requestAnimationFrame(_lerpLoop);
     }
