@@ -97,8 +97,14 @@ function _fmtTime(ts) {
 function _sanitizeUrl(url) {
     if (!url) return '';
     try {
-        if ((url.startsWith('chat_uploads/') || url.startsWith('/chat/chat_uploads/'))
-            && !url.includes('..')) return url;
+        if (url.startsWith('chat_uploads/')) {
+            url = '/chat/' + url;
+        }
+
+        if (url.startsWith('/chat/chat_uploads/') && !url.includes('..')) {
+            return new URL(url, 'https://spelec.cz').href;
+        }
+
         const p = new URL(url, window.location.origin);
         return (p.protocol === 'https:' || p.protocol === 'http:') ? p.href : '';
     } catch { return ''; }
