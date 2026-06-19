@@ -198,14 +198,14 @@ export function createChatOverlay({
     if (typeof getPlayers === 'function') {
         _plyrSect        = _el('div', { id: 'co-players' });
         const _plyrHdr   = _el('div', { class: 'co-plyr-hdr' });
-        _plyrHdr.textContent = 'HRÁČI NA MAPĚ';
+        _plyrHdr.textContent = 'Players on map';
         _plyrStrip       = _el('div', { id: 'co-plyr-strip' });
         _plyrSect.append(_plyrHdr, _plyrStrip);
     }
 
     //   Load-older banner
     const _lmBanner = _el('div', { id: 'co-lm-banner' });
-    _lmBanner.textContent = '▲ načíst starší zprávy';
+    _lmBanner.textContent = '▲ load older messages  ';
     _lmBanner.hidden = true;
 
     //   Messages
@@ -223,7 +223,7 @@ export function createChatOverlay({
 
     const _inputRow = _el('div', { id: 'co-input-row' });
     const _msgInput = _el('input', { id: 'co-msg-input', class: 'co-input',
-                            maxlength: '2000', placeholder: 'Zpráva…', autocomplete: 'off' });
+                            maxlength: '2000', placeholder: 'Message…', autocomplete: 'off' });
     const _sendBtn  = _el('button', { id: 'co-send', type: 'button' });
     _sendBtn.textContent = '→';
     _inputRow.append(_msgInput, _sendBtn);
