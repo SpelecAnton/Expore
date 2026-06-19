@@ -1,55 +1,56 @@
 /**
- * SPELEC Chat Overlay v1.2
+ * SPELEC Chat Overlay v1.3
  *
  * Embeds the spelec.cz/chat/ global chatroom as a corner widget over the 3D engine.
  *
- * Changes over v1.1:
+ * Changes over v1.2:
  *
- * 1. POLL INTERVAL REDUCED 3000 → 1000 ms:
- *    Chat now refreshes roughly every second instead of every 3 seconds.
+ * 1. PANEL STARTS CLOSED BY DEFAULT:
+ *    v1.2 always force-opened the panel on startup via `_setOpen(true)`.
+ *    Startup now calls `_setOpen(false)` instead, so the widget loads as a
+ *    small ticker + [CHAT] button like normal corner-widget UX. Messages
+ *    keep flowing into the ticker AND the (hidden) message list in real time
+ *    regardless — this was already true since v1.2's _poll() fix, it just
+ *    was never actually exercised because the panel forced itself open.
  *
- * 2. ROOT-CAUSE FIX — MESSAGES NO LONGER FROZEN WHILE PANEL IS CLOSED:
- *    v1.1 only patched _msgDiv (the rendered message list) when `_isOpen`
- *    was true. While the panel was closed, new messages kept arriving into
- *    `_allMsgs` but were never written into the DOM — only a manual toggle
- *    (_setOpen) forced a full rebuild from `_allMsgs`, which is why the chat
- *    appeared to "only update on page load and on clicking the CHAT button".
- *    _poll() now ALWAYS appends new messages into `_msgDiv` (incrementally,
- *    not a full innerHTML rebuild), regardless of open/closed state. Only
- *    auto-scrolling is gated behind `_isOpen`.
+ * 2. BUILT-IN LIGHTBOX REPLACES window.open() FOR IMAGES:
+ *    Clicking an image used to call `window.open(url, '_blank')`. This is
+ *    unreliable: browsers (and popup/ad blockers) frequently swallow
+ *    `window.open()` calls silently — from the user's point of view,
+ *    clicking an image just did nothing. Images now open in a self-contained
+ *    full-screen modal (#co-lightbox) appended directly to the page, with no
+ *    dependency on popups at all. Closes via background click, the [×]
+ *    button, or Escape.
  *
- * 3. CSS SPECIFICITY FIX FOR [hidden]:
- *    `#co-panel { display: flex }` and `#co-ticker { display: flex }` used an
- *    ID selector, which has HIGHER specificity than the UA stylesheet's
- *    `[hidden] { display: none }` rule — so setting `.hidden = true` on
- *    these elements never actually hid them. Added explicit
- *    `#co-panel[hidden]` / `#co-ticker[hidden]` overrides so hidden actually
- *    hides them now.
+ * 3. VIDEO THUMBNAILS GET AN EXPAND BUTTON:
+ *    Inline video thumbnails already have native browser controls
+ *    (play/pause/seek), so clicking the video itself must keep doing that —
+ *    it is NOT wired to the lightbox. Instead each video thumbnail is
+ *    wrapped in `.co-media-wrap` with a small ⛶ button in the corner that
+ *    opens the same lightbox with a larger, autoplaying version, while the
+ *    inline thumbnail's own controls keep working untouched.
  *
- * 4. MEMORY CAP NOW MIRRORED IN THE DOM:
- *    Since _msgDiv is no longer rebuilt from scratch every poll, trimming
- *    `_allMsgs` to MSG_CAP now also removes the corresponding number of
- *    oldest DOM nodes from `_msgDiv`, so memory doesn't grow unbounded.
+ * --- Previous changelog (v1.2) ---------------------------------------------
  *
- * 5. REMOVED DEAD CODE (_initOpenPanel):
- *    This function was defined but never called anywhere. Its logic
- *    (populate player strip + start its interval) is now folded into
- *    _setOpen(), and startup explicitly calls `_setOpen(true)` once instead
- *    of silently assuming `_isOpen = true` without running the open-state
- *    side effects.
- *
- * 6. _setOpen() NO LONGER FULL-REBUILDS THE MESSAGE LIST:
- *    Since _msgDiv is now always kept in sync by _poll(), opening the panel
- *    just resets the unread badge and scrolls to bottom — no need to wipe
- *    and re-render every message again.
+ * - POLL INTERVAL REDUCED 3000 → 1000 ms.
+ * - Root-cause fix: _poll() now ALWAYS appends new messages into the message
+ *   list DOM, regardless of whether the panel is open — previously this only
+ *   happened while open, so the chat looked frozen until a manual toggle.
+ * - CSS specificity fix for `#co-panel[hidden]` / `#co-ticker[hidden]` (an
+ *   ID selector was beating the UA `[hidden]` rule, so `.hidden = true`
+ *   never actually hid these elements).
+ * - Memory cap (MSG_CAP) now mirrored in the DOM, not just the in-memory array.
  *
  * DEFAULT STATE — Ticker:
- *   Small non-interactive strip above the [CHAT] button.
- *   Always shows the 5 most recent messages.
+ *   Small non-interactive strip above the [CHAT] button, shown by default
+ *   since the panel itself now starts CLOSED. Always shows the 5 most
+ *   recent messages.
  *
  * FULL PANEL — opened by [Tab] or clicking [CHAT]:
  *   Full history with "load older" + player teleport strip (if multiplayer active).
  *   WASD / Space / arrows are captured so the engine ignores typing.
+ *   Message updates (and the ticker) keep running in the background even
+ *   while the panel is closed.
  *
  * Usage:
  *   import { createChatOverlay } from './chat_overlay.js';
@@ -64,8 +65,8 @@
 'use strict';
 
 const RESERVED   = 'Anton Špelec';
-const POLL_BASE  = 1000;   // was 3000 — refresh roughly every second
-const POLL_MAX   = 10000;  // was 15000 — backoff ceiling on repeated errors
+const POLL_BASE  = 1000;
+const POLL_MAX   = 10000;
 const PING_IV    = 5000;
 const TICKER_IV  = 5000;   // fallback ticker refresh interval (ms); primary is per-poll
 const MSG_CAP    = 300;    // max messages kept in memory (and in the DOM)
@@ -135,9 +136,10 @@ export function createChatOverlay({
     }
 
     // ── State ─────────────────────────────────────────────────────────────────
-    // Starts false; createChatOverlay() calls _setOpen(true) at the end of
-    // setup so the open-state side effects (player strip interval, scroll,
-    // badge reset, panel/ticker visibility) always run through one code path.
+    // Starts false; createChatOverlay() calls _setOpen(false) at the end of
+    // setup so the closed-state side effects (clearing the player-strip
+    // interval, hiding the panel, showing the ticker) always run through one
+    // consistent code path instead of relying on the variable's initial value.
     let _isOpen       = false;
     let _allMsgs      = [];       // chronological, newest last
     const _seen       = new Set();
@@ -174,7 +176,7 @@ export function createChatOverlay({
 
     // Panel
     const _panel = _el('div', { id: 'co-panel' });
-    _panel.hidden = true; // real initial state is applied via _setOpen(true) below
+    _panel.hidden = true; // real initial state is applied via _setOpen(false) below
 
     //   Header
     const _header   = _el('div', { id: 'co-header' });
@@ -232,6 +234,21 @@ export function createChatOverlay({
     _wrap.append(_ticker, _toggleBtn, _panel);
     document.body.appendChild(_wrap);
 
+    // ── Lightbox ──────────────────────────────────────────────────────────────
+    // Self-contained full-size media viewer for images and videos, used
+    // instead of window.open(). window.open() is unreliable for this:
+    // browsers and popup/ad blockers commonly swallow it silently, so from
+    // the user's perspective clicking an image just did nothing. Appended
+    // directly to <body> (not inside #co-wrap) with a high z-index so it
+    // always renders above the 3D canvas.
+    const _lightbox       = _el('div', { id: 'co-lightbox' });
+    _lightbox.hidden       = true;
+    const _lightboxInner  = _el('div', { id: 'co-lightbox-inner' });
+    const _lightboxClose  = _el('button', { id: 'co-lightbox-close', type: 'button', title: 'Zavřít' });
+    _lightboxClose.textContent = '×';
+    _lightbox.append(_lightboxInner, _lightboxClose);
+    document.body.appendChild(_lightbox);
+
     // ── Restore saved nick ────────────────────────────────────────────────────
     _nickInput.value = localStorage.getItem('chat_nick') || '';
     if (_nickInput.value.trim() === RESERVED) _adminInput.hidden = false;
@@ -269,6 +286,20 @@ export function createChatOverlay({
     };
     window.addEventListener('keydown', _tabH, { capture: true });
 
+    // Escape closes the lightbox when it's open
+    const _escH = e => {
+        if (e.key === 'Escape' && !_lightbox.hidden) {
+            e.stopPropagation();
+            _closeLightbox();
+        }
+    };
+    window.addEventListener('keydown', _escH, { capture: true });
+
+    _lightbox.addEventListener('click', e => {
+        if (e.target === _lightbox) _closeLightbox();   // click on backdrop, not on the media itself
+    });
+    _lightboxClose.addEventListener('click', _closeLightbox);
+
     // Scroll: track bottom + trigger load-older at top
     _msgDiv.addEventListener('scroll', () => {
         _atBottom = _msgDiv.scrollHeight - _msgDiv.scrollTop - _msgDiv.clientHeight < 40;
@@ -281,11 +312,10 @@ export function createChatOverlay({
     _tickerIv = setInterval(_refreshTicker, TICKER_IV);
     _pingOnline();
 
-    // Apply the real initial state (panel open by default) through the same
-    // code path as a manual toggle, instead of silently assuming `_isOpen`
-    // without running its side effects (this used to be dead code: a
-    // function called _initOpenPanel existed but was never invoked).
-    _setOpen(true);
+    // Apply the real initial state (panel CLOSED by default) through the same
+    // code path as a manual toggle. Messages still keep updating live in the
+    // background via _poll(), regardless of this state.
+    _setOpen(false);
 
     // ── Core functions ────────────────────────────────────────────────────────
 
@@ -313,6 +343,32 @@ export function createChatOverlay({
             clearInterval(_plyrIv);
             _plyrIv = null;
         }
+    }
+
+    // ── Lightbox open/close ──────────────────────────────────────────────────
+
+    function _openLightbox(kind, url) {
+        _lightboxInner.innerHTML = '';
+        let media;
+        if (kind === 'video') {
+            media = _el('video');
+            media.controls    = true;
+            media.autoplay    = true;
+            media.playsInline = true;
+        } else {
+            media = _el('img');
+            media.alt = '';
+        }
+        media.src = url;
+        _lightboxInner.appendChild(media);
+        _lightbox.hidden = false;
+    }
+
+    function _closeLightbox() {
+        const vid = _lightboxInner.querySelector('video');
+        if (vid) vid.pause();   // stop playback so audio doesn't keep running offscreen
+        _lightbox.hidden = true;
+        _lightboxInner.innerHTML = '';
     }
 
     // ── Polling ───────────────────────────────────────────────────────────────
@@ -353,7 +409,7 @@ export function createChatOverlay({
 
                 // Cap in-memory store AND mirror the trim in the DOM. Since
                 // _msgDiv is appended to incrementally (not rebuilt from
-                // scratch every poll anymore), old DOM nodes must be removed
+                // scratch every poll), old DOM nodes must be removed
                 // explicitly here or memory would grow unbounded.
                 if (_allMsgs.length > MSG_CAP) {
                     const overflow = _allMsgs.length - MSG_CAP;
@@ -362,12 +418,9 @@ export function createChatOverlay({
                 }
 
                 // Always append new messages to the DOM — even while the panel
-                // is closed. This is the fix for the "chat looks stale" bug:
-                // previously the DOM was only updated while _isOpen was true,
-                // so messages received while the panel was closed never made
-                // it into the DOM until the next manual toggle forced a full
-                // rebuild. Auto-scroll is still gated behind _isOpen, since
-                // there's no point scrolling a hidden element.
+                // is closed, so the chat never looks "frozen". Auto-scroll is
+                // still gated behind _isOpen, since there's no point scrolling
+                // a hidden element.
                 if (newMsgs.length) {
                     const wasAtBottom = _atBottom;
                     const frag = document.createDocumentFragment();
@@ -599,20 +652,52 @@ export function createChatOverlay({
         if (msg.image_url) {
             const safe  = _sanitizeUrl(msg.image_url);
             const lower = safe.toLowerCase();
+
             if (safe) {
-                let med;
                 if (/\.(mp4|webm|ogv)$/i.test(lower)) {
-                    med = _el('video'); med.controls = true; med.preload = 'metadata';
+                    // Video: wrap in a positioned container so an expand
+                    // button can sit in the corner without intercepting
+                    // clicks meant for the native play/pause/seek controls.
+                    const wrap = _el('div', { class: 'co-media-wrap' });
+
+                    const video = _el('video');
+                    video.controls   = true;
+                    video.preload    = 'metadata';
+                    video.src        = safe;
+                    video.className  = 'co-media';
+
+                    const expandBtn = _el('button', {
+                        class: 'co-media-expand', type: 'button', title: 'Zvětšit',
+                    });
+                    expandBtn.textContent = '⛶';
+                    expandBtn.addEventListener('click', e => {
+                        e.stopPropagation();
+                        _openLightbox('video', safe);
+                    });
+
+                    wrap.append(video, expandBtn);
+                    div.appendChild(wrap);
+
                 } else if (/\.(mp3|wav|ogg|aac)$/i.test(lower)) {
-                    med = _el('audio'); med.controls = true;
+                    const audio = _el('audio');
+                    audio.controls  = true;
+                    audio.src       = safe;
+                    audio.className = 'co-media';
+                    div.appendChild(audio);
+
                 } else {
-                    med = _el('img'); med.alt = ''; med.loading = 'lazy';
-                    med.style.cursor = 'pointer';
-                    med.addEventListener('click', () => window.open(safe, '_blank'));
+                    const img = _el('img');
+                    img.alt          = '';
+                    img.loading      = 'lazy';
+                    img.src          = safe;
+                    img.className    = 'co-media';
+                    img.style.cursor = 'zoom-in';
+                    img.addEventListener('click', e => {
+                        e.stopPropagation();
+                        _openLightbox('image', safe);
+                    });
+                    div.appendChild(img);
                 }
-                med.src       = safe;
-                med.className = 'co-media';
-                div.appendChild(med);
             }
         }
 
@@ -627,6 +712,8 @@ export function createChatOverlay({
         clearInterval(_tickerIv);
         clearInterval(_plyrIv);
         window.removeEventListener('keydown', _tabH, { capture: true });
+        window.removeEventListener('keydown', _escH, { capture: true });
+        _lightbox.remove();
         _wrap.remove();
     }
 
@@ -849,6 +936,80 @@ const _CSS = `
 
 .co-media { display:block; max-width:100%; max-height:90px; margin-top:4px; border-radius:3px; object-fit:contain; }
 .co-empty { color:rgba(255,255,255,0.22); text-align:center; padding:20px 8px; font-size:11px; }
+
+/* ── Media wrap + expand button (video) ──────────── */
+.co-media-wrap {
+  position: relative;
+  display: inline-block;
+  max-width: 100%;
+  margin-top: 4px;
+}
+.co-media-wrap .co-media { margin-top: 0; display: block; }
+.co-media-expand {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  width: 22px;
+  height: 22px;
+  border-radius: 4px;
+  background: rgba(0,0,0,0.6);
+  border: 1px solid rgba(255,255,255,0.25);
+  color: rgba(255,255,255,0.9);
+  font-size: 12px;
+  line-height: 1;
+  cursor: pointer;
+  font-family: inherit;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 0.15s;
+}
+.co-media-expand:hover { background: rgba(255,34,0,0.55); }
+
+/* ── Lightbox ────────────────────────────────────── */
+#co-lightbox {
+  position: fixed;
+  inset: 0;
+  z-index: 10000;
+  background: rgba(0,0,0,0.88);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: zoom-out;
+}
+/* Same ID-vs-[hidden] specificity issue as #co-panel — explicit override
+   needed or .hidden = true would not actually hide the backdrop. */
+#co-lightbox[hidden] { display: none; }
+#co-lightbox-inner {
+  max-width: 92vw;
+  max-height: 92vh;
+  display: flex;
+  cursor: default;
+}
+#co-lightbox-inner img,
+#co-lightbox-inner video {
+  max-width: 92vw;
+  max-height: 92vh;
+  border-radius: 4px;
+  box-shadow: 0 8px 40px rgba(0,0,0,0.6);
+}
+#co-lightbox-close {
+  position: fixed;
+  top: 18px;
+  right: 22px;
+  background: rgba(0,0,0,0.55);
+  border: 1px solid rgba(255,255,255,0.18);
+  color: rgba(255,255,255,0.85);
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  font-size: 20px;
+  line-height: 1;
+  cursor: pointer;
+  font-family: inherit;
+  transition: background 0.15s, border-color 0.15s;
+}
+#co-lightbox-close:hover { background: rgba(255,34,0,0.35); border-color: rgba(255,34,0,0.5); }
 
 /* ── Footer ──────────────────────────────────────── */
 #co-footer {
