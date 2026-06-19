@@ -1,30 +1,47 @@
 /**
- * SPELEC Chat Overlay v1.1
+ * SPELEC Chat Overlay v1.2
  *
  * Embeds the spelec.cz/chat/ global chatroom as a corner widget over the 3D engine.
  *
- * Changes over v1.0:
+ * Changes over v1.1:
  *
- * 1. TICKER ALWAYS SHOWS LAST 5 MESSAGES (no age cutoff):
- *    v1.0 filtered ticker messages to those from the last 60 seconds — if there
- *    were no recent messages, the ticker appeared empty and the user saw no sign
- *    of chat activity until they opened the panel. The cutoff is now removed;
- *    the ticker always shows the 5 most recent messages regardless of how old
- *    they are.
+ * 1. POLL INTERVAL REDUCED 3000 → 1000 ms:
+ *    Chat now refreshes roughly every second instead of every 3 seconds.
  *
- * 2. UNREAD BADGE: FIRST LOAD EXCLUDED:
- *    v1.0 counted messages from the initial page-load poll as unread, so the
- *    badge immediately showed "9+" on every page visit. Now only messages that
- *    arrive AFTER the first poll are counted as unread.
+ * 2. ROOT-CAUSE FIX — MESSAGES NO LONGER FROZEN WHILE PANEL IS CLOSED:
+ *    v1.1 only patched _msgDiv (the rendered message list) when `_isOpen`
+ *    was true. While the panel was closed, new messages kept arriving into
+ *    `_allMsgs` but were never written into the DOM — only a manual toggle
+ *    (_setOpen) forced a full rebuild from `_allMsgs`, which is why the chat
+ *    appeared to "only update on page load and on clicking the CHAT button".
+ *    _poll() now ALWAYS appends new messages into `_msgDiv` (incrementally,
+ *    not a full innerHTML rebuild), regardless of open/closed state. Only
+ *    auto-scrolling is gated behind `_isOpen`.
  *
- * 3. TICKER REFRESHED AFTER EVERY POLL:
- *    v1.0 only called _refreshTicker() when new messages arrived; the periodic
- *    setInterval (8 s) was the only guarantee otherwise. _refreshTicker() is now
- *    called unconditionally at the end of every poll cycle so the ticker is
- *    always in sync.
+ * 3. CSS SPECIFICITY FIX FOR [hidden]:
+ *    `#co-panel { display: flex }` and `#co-ticker { display: flex }` used an
+ *    ID selector, which has HIGHER specificity than the UA stylesheet's
+ *    `[hidden] { display: none }` rule — so setting `.hidden = true` on
+ *    these elements never actually hid them. Added explicit
+ *    `#co-panel[hidden]` / `#co-ticker[hidden]` overrides so hidden actually
+ *    hides them now.
  *
- * 4. NICK INPUT MAXLENGTH: 32 → 128:
- *    Matches the 128-char server-side limit in players.php and api.php.
+ * 4. MEMORY CAP NOW MIRRORED IN THE DOM:
+ *    Since _msgDiv is no longer rebuilt from scratch every poll, trimming
+ *    `_allMsgs` to MSG_CAP now also removes the corresponding number of
+ *    oldest DOM nodes from `_msgDiv`, so memory doesn't grow unbounded.
+ *
+ * 5. REMOVED DEAD CODE (_initOpenPanel):
+ *    This function was defined but never called anywhere. Its logic
+ *    (populate player strip + start its interval) is now folded into
+ *    _setOpen(), and startup explicitly calls `_setOpen(true)` once instead
+ *    of silently assuming `_isOpen = true` without running the open-state
+ *    side effects.
+ *
+ * 6. _setOpen() NO LONGER FULL-REBUILDS THE MESSAGE LIST:
+ *    Since _msgDiv is now always kept in sync by _poll(), opening the panel
+ *    just resets the unread badge and scrolls to bottom — no need to wipe
+ *    and re-render every message again.
  *
  * DEFAULT STATE — Ticker:
  *   Small non-interactive strip above the [CHAT] button.
@@ -47,11 +64,11 @@
 'use strict';
 
 const RESERVED   = 'Anton Špelec';
-const POLL_BASE  = 3000;
-const POLL_MAX   = 15000;
+const POLL_BASE  = 1000;   // was 3000 — refresh roughly every second
+const POLL_MAX   = 10000;  // was 15000 — backoff ceiling on repeated errors
 const PING_IV    = 5000;
 const TICKER_IV  = 5000;   // fallback ticker refresh interval (ms); primary is per-poll
-const MSG_CAP    = 300;    // max messages kept in memory
+const MSG_CAP    = 300;    // max messages kept in memory (and in the DOM)
 
 // ── Pure helpers ──────────────────────────────────────────────────────────────
 
@@ -118,7 +135,10 @@ export function createChatOverlay({
     }
 
     // ── State ─────────────────────────────────────────────────────────────────
-    let _isOpen       = true;    // panel is open by default on page load
+    // Starts false; createChatOverlay() calls _setOpen(true) at the end of
+    // setup so the open-state side effects (player strip interval, scroll,
+    // badge reset, panel/ticker visibility) always run through one code path.
+    let _isOpen       = false;
     let _allMsgs      = [];       // chronological, newest last
     const _seen       = new Set();
     let _lastTs       = 0;
@@ -154,7 +174,7 @@ export function createChatOverlay({
 
     // Panel
     const _panel = _el('div', { id: 'co-panel' });
-    // Panel starts visible — matches Consul chat behaviour where chat is always shown.
+    _panel.hidden = true; // real initial state is applied via _setOpen(true) below
 
     //   Header
     const _header   = _el('div', { id: 'co-header' });
@@ -261,6 +281,12 @@ export function createChatOverlay({
     _tickerIv = setInterval(_refreshTicker, TICKER_IV);
     _pingOnline();
 
+    // Apply the real initial state (panel open by default) through the same
+    // code path as a manual toggle, instead of silently assuming `_isOpen`
+    // without running its side effects (this used to be dead code: a
+    // function called _initOpenPanel existed but was never invoked).
+    _setOpen(true);
+
     // ── Core functions ────────────────────────────────────────────────────────
 
     function _setOpen(open) {
@@ -271,13 +297,12 @@ export function createChatOverlay({
         if (open) {
             _unread       = 0;
             _badge.hidden = true;
+            _atBottom     = true;
 
-            // Populate panel from in-memory cache (messages already loaded)
-            _msgDiv.innerHTML = '';
-            for (const msg of _allMsgs) _msgDiv.appendChild(_renderMsg(msg));
+            // _msgDiv is kept continuously in sync with _allMsgs by _poll()
+            // regardless of open/closed state, so no rebuild is needed here —
+            // just scroll to the bottom and reset the unread indicator.
             _lmBanner.hidden = !_hasMoreOlder;
-            _atBottom = true;
-
             requestAnimationFrame(() => { _msgDiv.scrollTop = _msgDiv.scrollHeight; });
 
             _updatePlayerStrip();
@@ -288,12 +313,6 @@ export function createChatOverlay({
             clearInterval(_plyrIv);
             _plyrIv = null;
         }
-    }
-
-    // Called once at startup to set up the open panel's player strip interval
-    function _initOpenPanel() {
-        _updatePlayerStrip();
-        if (_plyrStrip) _plyrIv = setInterval(_updatePlayerStrip, 1000);
     }
 
     // ── Polling ───────────────────────────────────────────────────────────────
@@ -332,17 +351,30 @@ export function createChatOverlay({
                     }
                 }
 
-                // Cap in-memory store
-                if (_allMsgs.length > MSG_CAP) _allMsgs = _allMsgs.slice(-MSG_CAP);
+                // Cap in-memory store AND mirror the trim in the DOM. Since
+                // _msgDiv is appended to incrementally (not rebuilt from
+                // scratch every poll anymore), old DOM nodes must be removed
+                // explicitly here or memory would grow unbounded.
+                if (_allMsgs.length > MSG_CAP) {
+                    const overflow = _allMsgs.length - MSG_CAP;
+                    _allMsgs = _allMsgs.slice(-MSG_CAP);
+                    for (let i = 0; i < overflow; i++) _msgDiv.firstElementChild?.remove();
+                }
 
-                if (_isOpen && newMsgs.length) {
-                    // Rebuild the full message list so the panel is always
-                    // correct — works for both auto-open and subsequent polls.
+                // Always append new messages to the DOM — even while the panel
+                // is closed. This is the fix for the "chat looks stale" bug:
+                // previously the DOM was only updated while _isOpen was true,
+                // so messages received while the panel was closed never made
+                // it into the DOM until the next manual toggle forced a full
+                // rebuild. Auto-scroll is still gated behind _isOpen, since
+                // there's no point scrolling a hidden element.
+                if (newMsgs.length) {
                     const wasAtBottom = _atBottom;
-                    _msgDiv.innerHTML = '';
-                    for (const msg of _allMsgs) _msgDiv.appendChild(_renderMsg(msg));
+                    const frag = document.createDocumentFragment();
+                    for (const msg of newMsgs) frag.appendChild(_renderMsg(msg));
+                    _msgDiv.appendChild(frag);
                     _lmBanner.hidden = !_hasMoreOlder;
-                    if (wasAtBottom) {
+                    if (_isOpen && wasAtBottom) {
                         requestAnimationFrame(() => { _msgDiv.scrollTop = _msgDiv.scrollHeight; });
                     }
                 }
@@ -396,10 +428,8 @@ export function createChatOverlay({
                 _allMsgs.push(data.message);
                 if (data.message.timestamp > _lastTs) _lastTs = data.message.timestamp;
 
-                if (_isOpen) {
-                    _msgDiv.appendChild(_renderMsg(data.message));
-                    _msgDiv.scrollTop = _msgDiv.scrollHeight;
-                }
+                _msgDiv.appendChild(_renderMsg(data.message));
+                if (_isOpen) _msgDiv.scrollTop = _msgDiv.scrollHeight;
             }
         } catch {
             _statusEl.textContent = 'Chyba sítě';
@@ -645,6 +675,9 @@ const _CSS = `
   gap: 3px;
   pointer-events: none;
 }
+/* ID selector beats the UA stylesheet's [hidden] rule on specificity alone —
+   without this override, setting .hidden on #co-ticker had no visual effect. */
+#co-ticker[hidden] { display: none; }
 .co-tick {
   padding: 4px 8px;
   background: rgba(0,0,0,0.62);
@@ -720,6 +753,10 @@ const _CSS = `
   -webkit-backdrop-filter: blur(12px);
   box-shadow: 0 8px 32px rgba(0,0,0,0.72);
 }
+/* ID selector beats the UA stylesheet's [hidden] rule on specificity alone —
+   without this override, setting .hidden on #co-panel had no visual effect,
+   so the panel always stayed visible even when JS thought it was closed. */
+#co-panel[hidden] { display: none; }
 
 /* ── Header ──────────────────────────────────────── */
 #co-header {
