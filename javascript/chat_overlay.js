@@ -1,9 +1,24 @@
 /**
- * SPELEC Chat Overlay v1.3
+ * SPELEC Chat Overlay v1.4
  *
  * Embeds the spelec.cz/chat/ global chatroom as a corner widget over the 3D engine.
  *
- * Changes over v1.2:
+ * Changes over v1.3:
+ *
+ * 1. ADMIN PASSWORD CHANGE CALLBACK:
+ *    New `onAdminPassChange` option, called with the current admin password
+ *    field value every time it changes (and cleared to '' whenever the nick
+ *    field stops being the reserved admin name, so a stale password never
+ *    lingers after switching nicks). Wired up in Map Maker/index.html to
+ *    multiplayer.js's setAdminPass(), so the admin's password reaches the
+ *    position-broadcast endpoint (chat/players.php) which gates the
+ *    "Anton Špelec" custom skin behind real authentication — anyone can
+ *    rename themselves to the reserved name, but only the real admin's
+ *    broadcast carries the correct password.
+ *    The password itself is intentionally never persisted to localStorage —
+ *    it only lives in memory for as long as this overlay instance exists.
+ *
+ * --- Previous changelog (v1.3) ----------------------------------------------
  *
  * 1. PANEL STARTS CLOSED BY DEFAULT:
  *    v1.2 always force-opened the panel on startup via `_setOpen(true)`.
@@ -59,6 +74,7 @@
  *     onlineUrl:  'https://spelec.cz/chat/online.php',
  *     getPlayers: () => multiplayer.getPlayers(),    // optional
  *     onTeleport: (x, y, z) => physics.teleport(...) // optional
+ *     onAdminPassChange: (pass) => multiplayer.setAdminPass(pass) // optional
  *   });
  */
 
@@ -131,6 +147,7 @@ export function createChatOverlay({
     onlineUrl   = 'https://spelec.cz/chat/online.php',
     getPlayers  = null,   // () => [{uid,nick,x,y,z}]
     onTeleport  = null,   // (x,y,z) => void
+    onAdminPassChange = null,   // (pass: string) => void
 } = {}) {
 
     // ── Identity ──────────────────────────────────────────────────────────────
@@ -198,14 +215,14 @@ export function createChatOverlay({
     if (typeof getPlayers === 'function') {
         _plyrSect        = _el('div', { id: 'co-players' });
         const _plyrHdr   = _el('div', { class: 'co-plyr-hdr' });
-        _plyrHdr.textContent = 'Players on map';
+        _plyrHdr.textContent = 'PLAYERS ON THIS MAP';
         _plyrStrip       = _el('div', { id: 'co-plyr-strip' });
         _plyrSect.append(_plyrHdr, _plyrStrip);
     }
 
     //   Load-older banner
     const _lmBanner = _el('div', { id: 'co-lm-banner' });
-    _lmBanner.textContent = '▲ load older messages  ';
+    _lmBanner.textContent = '▲ načíst starší zprávy';
     _lmBanner.hidden = true;
 
     //   Messages
@@ -223,7 +240,7 @@ export function createChatOverlay({
 
     const _inputRow = _el('div', { id: 'co-input-row' });
     const _msgInput = _el('input', { id: 'co-msg-input', class: 'co-input',
-                            maxlength: '2000', placeholder: 'Message…', autocomplete: 'off' });
+                            maxlength: '2000', placeholder: 'Zpráva…', autocomplete: 'off' });
     const _sendBtn  = _el('button', { id: 'co-send', type: 'button' });
     _sendBtn.textContent = '→';
     _inputRow.append(_msgInput, _sendBtn);
@@ -264,7 +281,19 @@ export function createChatOverlay({
     _nickInput.addEventListener('input', () => {
         const v = _nickInput.value.trim();
         localStorage.setItem('chat_nick', v);
-        _adminInput.hidden = (v !== RESERVED);
+        const isReserved = (v === RESERVED);
+        _adminInput.hidden = !isReserved;
+
+        // Clear any leftover password the moment the nick stops being the
+        // reserved admin name, so a stale value never gets broadcast under
+        // a different nick. Notifies multiplayer.js either way so its own
+        // admin_pass field stays in sync with what's actually visible here.
+        if (!isReserved && _adminInput.value) _adminInput.value = '';
+        onAdminPassChange?.(_adminInput.hidden ? '' : _adminInput.value);
+    });
+
+    _adminInput.addEventListener('input', () => {
+        onAdminPassChange?.(_adminInput.value);
     });
 
     _toggleBtn.addEventListener('click', () => _setOpen(!_isOpen));
@@ -477,7 +506,7 @@ export function createChatOverlay({
                 signal:  _abortFor(6000),
             });
             const data = await res.json();
-            if (!res.ok) { _statusEl.textContent = data.error || 'Chyba odesílání'; return; }
+            if (!res.ok) { _statusEl.textContent = data.error || 'Sending Error'; return; }
 
             _msgInput.value = '';
             _atBottom = true;
@@ -491,7 +520,7 @@ export function createChatOverlay({
                 if (_isOpen) _msgDiv.scrollTop = _msgDiv.scrollHeight;
             }
         } catch {
-            _statusEl.textContent = 'Chyba sítě';
+            _statusEl.textContent = 'Network Error';
         } finally {
             _sendBtn.disabled = false;
             _msgInput.focus();
@@ -518,7 +547,7 @@ export function createChatOverlay({
     async function _loadOlder() {
         if (!_hasMoreOlder || !_oldestTs || _loadingOlder) return;
         _loadingOlder = true;
-        _lmBanner.textContent = '⏳ načítám...';
+        _lmBanner.textContent = '⏳ loading...';
 
         try {
             const res  = await fetch(`${apiUrl}?action=get&before=${_oldestTs}`, {
@@ -546,10 +575,10 @@ export function createChatOverlay({
 
             _hasMoreOlder       = data.has_more ?? false;
             _lmBanner.hidden    = !_hasMoreOlder;
-            if (_hasMoreOlder) _lmBanner.textContent = '▲ načíst starší zprávy';
+            if (_hasMoreOlder) _lmBanner.textContent = '▲ load older messages';
 
         } catch {
-            _lmBanner.textContent = '▲ načíst starší zprávy (chyba, zkus znovu)';
+            _lmBanner.textContent = '▲ load older messages (error, try again)';
         } finally {
             _loadingOlder = false;
         }

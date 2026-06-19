@@ -1,11 +1,28 @@
 /**
- * SPELEC Multiplayer v1.2
+ * SPELEC Multiplayer v1.3
  *
  * Renders other players as 3D billboard sprites in the scene.
  * Broadcasts own position to spelec.cz/chat/players.php and receives others every 150 ms.
  * Silently degrades when server is unreachable — the engine keeps running.
  *
- * Changes over v1.1:
+ * Changes over v1.2:
+ *
+ * 1. RESERVED ADMIN SKIN GATE:
+ *    The custom-skin feature (added in v1.2) matches any nickname against
+ *    player_skins.txt — but the reserved admin name ("Anton Špelec", same
+ *    constant used by chat.js / chat_overlay.js / api.php) is a special
+ *    case: ANYONE could otherwise just rename themselves "Anton Špelec" and
+ *    impersonate the admin's appearance.
+ *    The reserved name's skin now only renders when the server
+ *    (chat/players.php) confirms `is_admin: true` on that player's record,
+ *    which it only sets when the broadcast included the correct admin
+ *    password. All other nicknames in the skin list are unaffected — no
+ *    password needed for those.
+ *    Own admin password is supplied via the new setAdminPass() method on
+ *    the object returned by createMultiplayer(); see Map Maker/index.html
+ *    for how it's wired to the chat overlay's admin password field.
+ *
+ * --- Previous changelog (v1.2 — CUSTOM SKINS EDITION) -----------------------
  *
  * 1. CUSTOM SKINS BY NICKNAME:
  *    A player can swap the default glowing-ball sprite for a custom image
@@ -45,6 +62,7 @@
  *     // skinsUrl omitted → defaults to SKINS_URL below
  *   });
  *   // mp.getPlayers() → [{ uid, nick, x, y, z }]
+ *   // mp.setAdminPass(pass) → include with own broadcast for the admin gate
  *   // mp.destroy()
  *
  * Requires window._cam (THREE.PerspectiveCamera) set by engine.js after load.
@@ -72,6 +90,12 @@ const SKINS_URL = 'https://spelecanton.github.io/Expore/player_skins.txt';
 // clearly as a character — this is the length of the sprite's longer side,
 // relative to SPRITE_SIZE.
 const SKIN_SCALE = 2.2;
+
+// Same reserved name used by chat.js / chat_overlay.js / chat/api.php.
+// A skin-list entry for this exact name only applies once the server has
+// confirmed the broadcasting player supplied the correct admin password —
+// see _resolveSkinUrl() and chat/players.php's `is_admin` field.
+const RESERVED_NAME = 'Anton Špelec';
 
 // ── Auto map name ─────────────────────────────────────────────────────────────
 // Derives a stable group key from the current page path.
@@ -252,15 +276,29 @@ export function createMultiplayer(scene, {
         localStorage.setItem('chat_user_id', _uid);
     }
 
+    // Own admin password, supplied at runtime via setAdminPass() — never
+    // persisted to localStorage. Sent with every broadcast so the server
+    // (chat/players.php) can set `is_admin` on our own player record when
+    // it matches. Empty by default, which simply means "not the admin".
+    let _adminPass = '';
+
     // nickname (lower-cased, trimmed) → image URL. Populated asynchronously;
     // starts empty so everyone renders as the default ball until (if) it loads.
     let _skinMap = new Map();
 
-    function _resolveSkinUrl(nick) {
-        return _skinMap.get((nick || '').trim().toLowerCase()) || null;
+    // Resolves the skin URL for a player, given their nick and whether the
+    // server confirmed admin status for that record. The reserved admin
+    // name requires `isAdmin === true`; every other name in the skin list
+    // just needs a matching nickname.
+    function _resolveSkinUrl(nick, isAdmin) {
+        const trimmed = (nick || '').trim();
+        const skinUrl = _skinMap.get(trimmed.toLowerCase());
+        if (!skinUrl) return null;
+        if (trimmed === RESERVED_NAME && !isAdmin) return null;
+        return skinUrl;
     }
 
-    // uid → { uid, nick, group, bodySprite, bodyTex, skinUrl, hue,
+    // uid → { uid, nick, isAdmin, group, bodySprite, bodyTex, skinUrl, hue,
     //         labelTex, labelSprite, target:Vector3, destroyed }
     const _players = new Map();
 
@@ -270,8 +308,8 @@ export function createMultiplayer(scene, {
 
     // ── Apply (or re-apply) a player's body appearance ────────────────────────
     // Handles both the default procedural ball and async-loaded custom skins.
-    // Safe to call again later (e.g. after a nick change) — disposes the old
-    // body texture first so GPU memory doesn't leak.
+    // Safe to call again later (e.g. after a nick/admin-status change) —
+    // disposes the old body texture first so GPU memory doesn't leak.
     function _applyBodyAppearance(entry) {
         if (entry.bodyTex) { entry.bodyTex.dispose(); entry.bodyTex = null; }
 
@@ -291,8 +329,9 @@ export function createMultiplayer(scene, {
         entry.bodySprite.material.needsUpdate = true;
 
         _loadSkinTexture(skinUrl).then(tex => {
-            // The player may have left, or their nick (and thus skin) may have
-            // changed again while this request was in flight — bail out if so.
+            // The player may have left, or their nick/admin status (and thus
+            // skin) may have changed again while this request was in flight —
+            // bail out if so.
             if (entry.destroyed || entry.skinUrl !== skinUrl) {
                 if (tex) tex.dispose();
                 return;
@@ -329,7 +368,7 @@ export function createMultiplayer(scene, {
     // the default ball even though their nick matches an entry.
     function _refreshAllSkins() {
         for (const entry of _players.values()) {
-            const want = _resolveSkinUrl(entry.nick);
+            const want = _resolveSkinUrl(entry.nick, entry.isAdmin);
             if (want !== entry.skinUrl) {
                 entry.skinUrl = want;
                 _applyBodyAppearance(entry);
@@ -357,12 +396,13 @@ export function createMultiplayer(scene, {
                 method:  'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body:    JSON.stringify({
-                    uid:  _uid,
-                    nick: _nick,
-                    x:    cam.position.x,
-                    y:    cam.position.y,
-                    z:    cam.position.z,
-                    map:  _mapName,
+                    uid:        _uid,
+                    nick:       _nick,
+                    x:          cam.position.x,
+                    y:          cam.position.y,
+                    z:          cam.position.z,
+                    map:        _mapName,
+                    admin_pass: _adminPass,
                 }),
                 signal: ctrl.signal,
             });
@@ -389,16 +429,23 @@ export function createMultiplayer(scene, {
             const cur = _players.get(p.uid);
             if (cur) {
                 cur.target.set(p.x, p.y, p.z);
-                if (cur.nick !== p.nick) {
+
+                const nickChanged = cur.nick !== p.nick;
+                if (nickChanged) {
                     cur.nick = p.nick;
                     cur.labelTex.dispose();
                     cur.labelTex = _makeLabelTex(p.nick, cur.hue);
                     cur.labelSprite.material.map = cur.labelTex;
                     cur.labelSprite.material.needsUpdate = true;
+                }
 
-                    // Nick changed — re-resolve the skin too, since the whole
-                    // point of this feature is "rename to swap appearance".
-                    const newSkinUrl = _resolveSkinUrl(p.nick);
+                // Re-resolve the skin whenever the nick changes OR the
+                // server's admin confirmation flips (e.g. the reserved name
+                // typed the correct password without changing their nick).
+                const newIsAdmin = !!p.is_admin;
+                if (nickChanged || cur.isAdmin !== newIsAdmin) {
+                    cur.isAdmin = newIsAdmin;
+                    const newSkinUrl = _resolveSkinUrl(p.nick, newIsAdmin);
                     if (newSkinUrl !== cur.skinUrl) {
                         cur.skinUrl = newSkinUrl;
                         _applyBodyAppearance(cur);
@@ -440,14 +487,14 @@ export function createMultiplayer(scene, {
         scene.add(group);
 
         const entry = {
-            uid: data.uid, nick: data.nick, hue, group,
+            uid: data.uid, nick: data.nick, isAdmin: !!data.is_admin, hue, group,
             bodySprite, bodyTex: null, skinUrl: null,
             labelTex, labelSprite,
             target: new THREE.Vector3(data.x, data.y, data.z),
             destroyed: false,
         };
 
-        entry.skinUrl = _resolveSkinUrl(data.nick);
+        entry.skinUrl = _resolveSkinUrl(data.nick, entry.isAdmin);
         _applyBodyAppearance(entry);
 
         return entry;
@@ -497,6 +544,15 @@ export function createMultiplayer(scene, {
                 y:    p.target.y,
                 z:    p.target.z,
             }));
+        },
+
+        /**
+         * Supplies the admin password to include with our own position
+         * broadcasts. Call this whenever the chat overlay's admin password
+         * field changes (see Map Maker/index.html). Pass '' to clear it.
+         */
+        setAdminPass(pass) {
+            _adminPass = pass || '';
         },
 
         destroy() {

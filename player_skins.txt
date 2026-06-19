@@ -1,4 +1,2 @@
 Anton Špelec = https://spelec.cz/images/anton4.png
 Karel Gott = https://spelec.cz/images/karelgott.png
-videotest = https://spelec.cz/expore/yokai/textures/video.webm
-giftest = https://spelec.cz/images/brboptimized.gif
