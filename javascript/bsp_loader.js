@@ -1,7 +1,17 @@
 /**
- * SPELEC BSP Loader v5.4 — VIDEO TEXTURE EDITION
+ * SPELEC BSP Loader v5.5 — CHAT MEDIA ISOLATION EDITION
  *
- * Changes over v5.3:
+ * Changes over v5.4:
+ *
+ * 9. BSP TEXTURE VIDEO MARKER:
+ *    - <video> elements created here for video textures (e.g. "video.mp4"
+ *      replacing a static texture) are now tagged with
+ *      `data-spelec-bsp-video` so other code (engine.js) can target them
+ *      specifically instead of accidentally grabbing every <video> on the
+ *      page — including chat-uploaded videos from chat_overlay.js / chat.js,
+ *      which must stay paused until the user manually presses play.
+ *
+ * --- Previous changelog (v5.4 — VIDEO TEXTURE EDITION) --------------------
  *
  * 8. AUDIO UNMUTE ON USER GESTURE:
  *    - Video textures are created with muted = true so autoplay works
@@ -164,6 +174,8 @@ export function tickAnimatedTextures() {
 
   // Resume any <video> textures the browser may have paused
   // (tab switch, power saving, autoplay-policy re-checks, etc.).
+  // _videoList only ever contains BSP texture videos (see loadVideoTex),
+  // never chat-uploaded media — so this never touches chat videos.
   if (_videoList.length) {
     for (const video of _videoList) {
       if (video.paused && !video.ended) {
@@ -177,6 +189,7 @@ export function tickAnimatedTextures() {
 // Browsers require a user gesture before audio can play. Video textures are
 // created muted so autoplay starts immediately; call this from engine.js's
 // existing first-interaction handler (click / keydown) to enable audio.
+// Only affects BSP texture videos in _videoList — never chat media.
 export function unmuteVideos() {
   for (const video of _videoList) {
     if (video.muted) {
@@ -206,6 +219,10 @@ function applyTexFilters(tex, { linearMag = false } = {}) {
 // stop decoding <video> frames when the element is display:none, which would
 // freeze the texture on the first frame. Instead it's moved off-screen with
 // position:absolute + opacity:0 so decoding keeps running normally.
+//
+// data-spelec-bsp-video marks this element as a map-texture video, distinct
+// from chat-uploaded videos. engine.js uses this marker to scope its
+// keydown play-retry so it never force-plays chat media.
 function loadVideoTex(url) {
   return new Promise(resolve => {
     const video = document.createElement('video');
@@ -216,6 +233,7 @@ function loadVideoTex(url) {
     video.autoplay    = true;
     video.preload     = 'auto';
     video.crossOrigin = 'anonymous';
+    video.dataset.spelecBspVideo = ''; // marker: BSP texture video, not chat media
 
     // Keep decoding alive — do NOT use display:none here.
     video.style.position      = 'absolute';

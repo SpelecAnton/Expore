@@ -1,7 +1,22 @@
 /**
- * SPELEC EXPLORE ENGINE v7.3 — VIDEO AUDIO EDITION
+ * SPELEC EXPLORE ENGINE v7.4 — CHAT MEDIA ISOLATION EDITION
  *
- * Changes over v7.2:
+ * Changes over v7.3:
+ *
+ * 1. CHAT VIDEO/AUDIO NO LONGER FORCE-PLAYED ON KEYPRESS:
+ *    - The keydown handler used to call
+ *      `document.querySelectorAll('video').forEach(v => v.play())`,
+ *      which matches EVERY <video> element on the page — including videos
+ *      uploaded as chat attachments by chat_overlay.js / chat.js. Pressing
+ *      any key would force those to start playing even though they have no
+ *      autoplay attribute and the user never clicked play.
+ *    - Now scoped to `video[data-spelec-bsp-video]`, a marker bsp_loader.js
+ *      sets only on <video> elements created for map textures (the ones
+ *      that SHOULD autoplay). Chat media is untouched and stays manual-only.
+ *    - unmuteVideos() and startBgMusic() are unaffected — they already only
+ *      ever touch BSP texture videos / the background music Audio object.
+ *
+ * --- Previous changelog (v7.3 — VIDEO AUDIO EDITION) ------------------------
  *
  * 1. VIDEO TEXTURE AUDIO UNLOCK:
  *    - bsp_loader.js v5.4 creates <video> textures muted so autoplay works
@@ -556,7 +571,12 @@ export async function initEngine({
     if (e.key === ' ') e.preventDefault();
     startBgMusic();
     unmuteVideos();
-    document.querySelectorAll('video').forEach(v => v.play().catch(() => {}));
+    // Only resume BSP texture videos (marked via data-spelec-bsp-video) — NOT
+    // chat-uploaded videos/audio. Those must stay paused until the user
+    // explicitly presses their own native play button; a global
+    // querySelectorAll('video') would force-play every <video> on the page,
+    // including chat attachments.
+    document.querySelectorAll('video[data-spelec-bsp-video]').forEach(v => v.play().catch(() => {}));
   });
 
   window.addEventListener('keyup', e => { keys[e.key.toLowerCase()] = false; });
