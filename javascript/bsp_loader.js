@@ -1,7 +1,26 @@
 /**
- * SPELEC BSP Loader v5.6 — GLSL SHADER TEXTURE EDITION
+ * SPELEC BSP Loader v5.7 — PORTAL MEDIA TEXTURE EDITION
  *
- * Changes over v5.5:
+ * Changes over v5.6:
+ *
+ * 11. GENERIC loadTextureFromUrl() EXPORT:
+ *    - New exported helper that loads a texture from an arbitrary URL using
+ *      the exact same format detection + loaders already used for BSP face
+ *      textures (static image, animated gif/avif/webp, video mp4/webm, and
+ *      GLSL .frag shader) — picked purely by file extension, same as
+ *      findTex()/tryLoadTex().
+ *    - Used by engine.js to give trigger_portal entities a "media label":
+ *      if a portal's "label" field is a URL ending in a recognized image/
+ *      video/shader extension instead of plain text, the portal renders
+ *      that media full-size across its whole plane instead of a small text
+ *      caption.
+ *    - Results are cached in the same _texCache as every other texture, and
+ *      videos/shaders/animated images loaded this way are automatically
+ *      ticked by the existing tickAnimatedTextures() loop — no new ticking
+ *      code needed, since they're pushed into the same _videoList /
+ *      _shaderList / _animList already used by BSP face textures.
+ *
+ * --- Previous changelog (v5.6 — GLSL SHADER TEXTURE EDITION) -------------
  *
  * 10. GLSL SHADER TEXTURES (.frag):
  *    - A BSP texture name can now resolve to a ".frag" fragment shader
@@ -103,8 +122,8 @@
  *      (whiteTex fallback), and a background swap pass runs as each batch
  *      completes to replace whiteTex with the real albedo.
  *
- * Backward compat: exports loadBSP, tickAnimatedTextures, initTexLoader
- * unchanged.
+ * Backward compat: exports loadBSP, tickAnimatedTextures, initTexLoader,
+ * unmuteVideos, loadTextureFromUrl.
  */
 
 import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.165.0/build/three.module.js';
@@ -207,8 +226,8 @@ export function tickAnimatedTextures() {
 
   // Resume any <video> textures the browser may have paused
   // (tab switch, power saving, autoplay-policy re-checks, etc.).
-  // _videoList only ever contains BSP texture videos (see loadVideoTex),
-  // never chat-uploaded media — so this never touches chat videos.
+  // _videoList contains both BSP face videos and portal media videos
+  // (loaded via loadTextureFromUrl) — never chat-uploaded media.
   if (_videoList.length) {
     for (const video of _videoList) {
       if (video.paused && !video.ended) {
@@ -233,7 +252,8 @@ export function tickAnimatedTextures() {
 // Browsers require a user gesture before audio can play. Video textures are
 // created muted so autoplay starts immediately; call this from engine.js's
 // existing first-interaction handler (click / keydown) to enable audio.
-// Only affects BSP texture videos in _videoList — never chat media.
+// Affects both BSP face videos and portal media videos in _videoList —
+// never chat media.
 export function unmuteVideos() {
   for (const video of _videoList) {
     if (video.muted) {
@@ -511,6 +531,30 @@ async function tryLoadTex(url) {
     const probe = await fetch(url, { method: 'HEAD' });
     if (!probe.ok) { _texCache.set(url, null); return null; }
   } catch { _texCache.set(url, null); return null; }
+  const ext = url.substring(url.lastIndexOf('.')).toLowerCase();
+  const tex  = VIDEO_EXTS.has(ext)  ? await loadVideoTex(url)
+             : SHADER_EXTS.has(ext) ? await loadShaderTex(url)
+             : ANIM_EXTS.has(ext)   ? await loadAnimatedTex(url)
+             : await loadStaticTex(url);
+  _texCache.set(url, tex);
+  return tex;
+}
+
+// ── Generic texture loader for an arbitrary, already-known URL ───────────────
+// Unlike findTex() (which probes multiple base paths + every extension) or
+// tryLoadTex() (which HEAD-probes one candidate URL before loading), this
+// assumes the caller already knows the exact URL is correct and just wants
+// it loaded with the right loader for its file type. Used by engine.js for
+// trigger_portal "media labels": a portal's label field can be a URL to an
+// image, animated image, video, or GLSL shader, and the whole portal plane
+// gets textured with it instead of a small text caption.
+//
+// Results share the same _texCache as every other texture (so re-using the
+// same media URL on multiple portals only loads it once), and videos/
+// shaders/animated images registered here are picked up automatically by
+// the existing tickAnimatedTextures() loop — no separate ticking required.
+export async function loadTextureFromUrl(url) {
+  if (_texCache.has(url)) return _texCache.get(url);
   const ext = url.substring(url.lastIndexOf('.')).toLowerCase();
   const tex  = VIDEO_EXTS.has(ext)  ? await loadVideoTex(url)
              : SHADER_EXTS.has(ext) ? await loadShaderTex(url)
