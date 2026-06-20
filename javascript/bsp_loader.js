@@ -1,7 +1,34 @@
 /**
- * SPELEC BSP Loader v5.5 — CHAT MEDIA ISOLATION EDITION
+ * SPELEC BSP Loader v5.6 — GLSL SHADER TEXTURE EDITION
  *
- * Changes over v5.4:
+ * Changes over v5.5:
+ *
+ * 10. GLSL SHADER TEXTURES (.frag):
+ *    - A BSP texture name can now resolve to a ".frag" fragment shader
+ *      file instead of an image/video, using the same GlslCanvas engine
+ *      that powers the shader background on the main page (index.html).
+ *    - findTex() / tryLoadTex() probe ".frag" alongside the existing
+ *      image/video/animated extensions. Example: a face textured
+ *      "textures/lava" will use "lava.frag" if present (checked right
+ *      after video formats, before static images), exactly like any
+ *      other texture variant.
+ *    - loadShaderTex() fetches the shader source as text, lazily loads
+ *      GlslCanvas.js as a classic (non-module) script — required because
+ *      its UMD wrapper relies on a non-strict top-level `this` to attach
+ *      itself to `window`, which an ES module context does not provide —
+ *      then renders it onto a hidden offscreen <canvas> wrapped in a
+ *      THREE.CanvasTexture.
+ *    - The canvas runs GlslCanvas's own internal requestAnimationFrame
+ *      loop (unmodified, same as the main page), so animated shaders
+ *      (u_time, u_mouse, u_date) keep updating on their own; this loader
+ *      just needs to flag the THREE.CanvasTexture as needsUpdate each
+ *      tick so the latest frame gets uploaded to the GPU — handled in
+ *      tickAnimatedTextures() alongside the existing GIF/video upkeep.
+ *    - No mipmaps (same reasoning as video textures: avoids a class of
+ *      silent black-texture bugs), no DOM cleanup on destroy (matches
+ *      the existing lifetime assumptions of _animList / _videoList).
+ *
+ * --- Previous changelog (v5.5 — CHAT MEDIA ISOLATION EDITION) ------------
  *
  * 9. BSP TEXTURE VIDEO MARKER:
  *    - <video> elements created here for video textures (e.g. "video.mp4"
@@ -136,12 +163,17 @@ function buildBVH(geometry) {
 // ── Configuration ─────────────────────────────────────────────────────────────
 // Video formats are tried FIRST so a texture named e.g. "video.mp4" wins
 // over a "video.png" poster/placeholder that may exist alongside it.
+// ".frag" (GLSL shader textures) is checked right after video formats, for
+// the same reason — an explicit shader variant should win over a static
+// placeholder image sitting next to it.
 const VIDEO_EXTS         = new Set(['.mp4', '.webm']);
-const TEX_EXTENSIONS     = ['.mp4', '.webm', '.gif', '.avif', '.webp', '.png', '.jpg'];
+const SHADER_EXTS        = new Set(['.frag']);
+const TEX_EXTENSIONS     = ['.mp4', '.webm', '.frag', '.gif', '.avif', '.webp', '.png', '.jpg'];
 const ANIM_EXTS          = new Set(['.gif', '.avif', '.webp']);
 const TEXTURE_BATCH_SIZE = 4;    // Reduced 8 → 4: fewer simultaneous ImageBitmap decodes
 const MESH_YIELD_EVERY   = 10;   // Reduced 50 → 10: yield more often to avoid 250ms stalls
 const MAX_ATLAS_MIPMAP   = 4096;
+const SHADER_TEX_SIZE    = 512;  // pixel resolution of the offscreen canvas used for .frag textures
 
 // ── Anisotropy ────────────────────────────────────────────────────────────────
 let _maxAniso = 1;
@@ -152,10 +184,11 @@ export function initTexLoader(renderer) {
 }
 
 // ── Internal state ────────────────────────────────────────────────────────────
-const _texCache = new Map();
-const _loader   = new THREE.TextureLoader();
-const _animList = [];
-const _videoList = [];
+const _texCache   = new Map();
+const _loader     = new THREE.TextureLoader();
+const _animList   = [];
+const _videoList  = [];
+const _shaderList = [];
 
 // ── Tick animated textures ────────────────────────────────────────────────────
 export function tickAnimatedTextures() {
@@ -181,6 +214,17 @@ export function tickAnimatedTextures() {
       if (video.paused && !video.ended) {
         video.play().catch(() => { /* still blocked — try again next tick */ });
       }
+    }
+  }
+
+  // Re-flag GLSL shader textures as needing a GPU re-upload. GlslCanvas runs
+  // its own internal requestAnimationFrame loop and keeps painting the
+  // offscreen canvas by itself — all this loader needs to do is tell
+  // Three.js the canvas contents changed so the next render call uploads
+  // the latest frame.
+  if (_shaderList.length) {
+    for (const shader of _shaderList) {
+      shader.tex.needsUpdate = true;
     }
   }
 }
@@ -279,6 +323,118 @@ function loadVideoTex(url) {
   });
 }
 
+// ── GlslCanvas lazy loader ────────────────────────────────────────────────────
+// GlslCanvas.js is a UMD bundle, not an ES module — it attaches itself to
+// `window.GlslCanvas` by reading the top-level `this`, which only resolves to
+// `window` in a classic (non-module) script. Importing it with `import` would
+// give `this === undefined` (modules are strict) and throw. So instead it's
+// loaded once via a plain <script> tag, same mechanism the main page
+// (index.html) already uses with its static <script src="..."> include — and
+// the same local-then-remote fallback pattern as fetchWorkerCode() below.
+let _glslCanvasLoadPromise = null;
+
+function ensureGlslCanvasLoaded() {
+  if (window.GlslCanvas) return Promise.resolve();
+  if (_glslCanvasLoadPromise) return _glslCanvasLoadPromise;
+
+  const loaderUrl  = import.meta.url;
+  const loaderBase = loaderUrl.substring(0, loaderUrl.lastIndexOf('/') + 1);
+  const localUrl    = loaderBase + 'GlslCanvas.js';
+  const remoteUrl   = 'https://spelecanton.github.io/Expore/javascript/GlslCanvas.js';
+
+  function loadScript(src) {
+    return new Promise((resolve, reject) => {
+      const script   = document.createElement('script');
+      script.src     = src;
+      script.onload  = () => resolve();
+      script.onerror = () => reject(new Error(`Failed to load ${src}`));
+      document.head.appendChild(script);
+    });
+  }
+
+  _glslCanvasLoadPromise = loadScript(localUrl)
+    .catch(() => loadScript(remoteUrl))
+    .then(() => {
+      if (!window.GlslCanvas) throw new Error('GlslCanvas.js loaded but window.GlslCanvas is missing');
+      console.log('[BSP] GlslCanvas.js loaded');
+    });
+
+  return _glslCanvasLoadPromise;
+}
+
+// ── GLSL shader texture loader ────────────────────────────────────────────────
+// Renders a .frag fragment shader onto a hidden offscreen <canvas> using the
+// same GlslCanvas engine as the main page's tunnel shader, then wraps that
+// canvas in a THREE.CanvasTexture so it can be used as a normal material map.
+//
+// The canvas is kept out of display:none for the same reason video textures
+// are (see loadVideoTex above) — some browsers throttle rendering for
+// display:none elements — and is positioned at (0,0) so GlslCanvas's own
+// isCanvasVisible() check keeps its internal render loop running.
+//
+// data-spelec-bsp-shader marks this element as a map-texture shader canvas,
+// distinct from any other canvas on the page.
+function loadShaderTex(url) {
+  return fetch(url)
+    .then(res => {
+      if (!res.ok) {
+        console.warn('[BSP] Shader texture fetch failed:', url, res.status);
+        return null;
+      }
+      return res.text();
+    })
+    .then(async fragSource => {
+      if (!fragSource) return null;
+
+      await ensureGlslCanvasLoaded();
+
+      const canvas = document.createElement('canvas');
+      canvas.width  = canvas.height = SHADER_TEX_SIZE;
+      canvas.style.position      = 'absolute';
+      canvas.style.top           = '0';
+      canvas.style.left          = '0';
+      canvas.style.width         = SHADER_TEX_SIZE + 'px';
+      canvas.style.height        = SHADER_TEX_SIZE + 'px';
+      canvas.style.opacity       = '0';
+      canvas.style.pointerEvents = 'none';
+      canvas.dataset.spelecBspShader = ''; // marker: BSP shader texture canvas
+      canvas.setAttribute('data-fragment', fragSource);
+
+      document.body.appendChild(canvas);
+
+      let sandbox;
+      try {
+        sandbox = new window.GlslCanvas(canvas);
+      } catch (err) {
+        console.warn('[BSP] GlslCanvas init failed:', url, err.message);
+        canvas.remove();
+        return null;
+      }
+
+      if (!sandbox.isValid) {
+        console.warn('[BSP] Shader failed to compile, skipping texture:', url);
+        sandbox.destroy?.();
+        canvas.remove();
+        return null;
+      }
+
+      const tex = new THREE.CanvasTexture(canvas);
+      tex.colorSpace      = THREE.SRGBColorSpace;
+      tex.minFilter       = THREE.LinearFilter;
+      tex.magFilter       = THREE.LinearFilter;
+      tex.generateMipmaps = false;
+      tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+
+      _shaderList.push({ canvas, sandbox, tex });
+      console.log(`[BSP] Shader texture ready: ${url}`);
+      return tex;
+    })
+    .catch(err => {
+      console.warn('[BSP] Shader texture load failed:', url, err.message);
+      return null;
+    });
+}
+
 // ── Animated texture loader ───────────────────────────────────────────────────
 async function loadAnimatedTex(url) {
   if (typeof ImageDecoder === 'undefined') {
@@ -356,8 +512,9 @@ async function tryLoadTex(url) {
     if (!probe.ok) { _texCache.set(url, null); return null; }
   } catch { _texCache.set(url, null); return null; }
   const ext = url.substring(url.lastIndexOf('.')).toLowerCase();
-  const tex  = VIDEO_EXTS.has(ext) ? await loadVideoTex(url)
-             : ANIM_EXTS.has(ext)  ? await loadAnimatedTex(url)
+  const tex  = VIDEO_EXTS.has(ext)  ? await loadVideoTex(url)
+             : SHADER_EXTS.has(ext) ? await loadShaderTex(url)
+             : ANIM_EXTS.has(ext)   ? await loadAnimatedTex(url)
              : await loadStaticTex(url);
   _texCache.set(url, tex);
   return tex;
@@ -378,8 +535,9 @@ async function findTex(bases, name) {
     if (!found) continue;
     if (_texCache.has(found)) return _texCache.get(found);
     const ext = found.substring(found.lastIndexOf('.')).toLowerCase();
-    const tex  = VIDEO_EXTS.has(ext) ? await loadVideoTex(found)
-               : ANIM_EXTS.has(ext)  ? await loadAnimatedTex(found)
+    const tex  = VIDEO_EXTS.has(ext)  ? await loadVideoTex(found)
+               : SHADER_EXTS.has(ext) ? await loadShaderTex(found)
+               : ANIM_EXTS.has(ext)   ? await loadAnimatedTex(found)
                : await loadStaticTex(found);
     _texCache.set(found, tex);
     if (tex) return tex;
