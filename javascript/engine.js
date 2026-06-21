@@ -1,7 +1,25 @@
 /**
- * SPELEC Engine v7.6 — PORTAL MEDIA LABELS
+ * SPELEC Engine v7.7 — FALLBACK TEXTURE PATH TYPO FIX
  *
- * Change over v7.5:
+ * Change over v7.6:
+ *   - The hardcoded fallback texture base passed to loadBSP() had a typo:
+ *     '/explore/textures/' (extra "l") instead of '/expore/textures/' —
+ *     the actual deployed path (matches spelec.cz/expore/... and
+ *     spelecanton.github.io/Expore used everywhere else in this codebase,
+ *     e.g. multiplayer.js's SKINS_URL). The typo'd route doesn't exist on
+ *     the server at all, so any texture that fell through to the fallback
+ *     always 404'd no matter what.
+ *   - Note: this fallback should rarely even be reached now. The much more
+ *     common cause of "texture not found" 404s was a case-sensitivity bug
+ *     in bsp_worker.js (texture names from the BSP lump were forced to
+ *     lowercase before being used as a filename), which has been fixed
+ *     separately — see bsp_worker.js v1.1. That fix makes the *primary*
+ *     (per-map, relative) textureBase lookup succeed in the correct
+ *     directory in the first place, for maps using mixed-case texture
+ *     filenames (e.g. ported Counter-Strike/Half-Life content).
+ *
+ * --- Previous changelog (v7.6 — PORTAL MEDIA LABELS) ----------------------
+ *
  *   - trigger_portal entities can now use their "label" field as a media
  *     URL instead of plain text. If label ends in a recognized image
  *     (.jpg/.jpeg/.png/.gif/.webp/.avif), video (.mp4/.webm) or GLSL
@@ -373,7 +391,10 @@ export async function initEngine({
 
   try {
     const loaded = await loadBSP({
-      url: mapUrl, scene, textureBase, fallbackTexBase: '/explore/textures/', onProgress,
+      // Fixed typo: was '/explore/textures/' (extra "l", a route that does
+      // not exist on the server) — must match the real deployed path used
+      // everywhere else in this project ("expore", not "explore").
+      url: mapUrl, scene, textureBase, fallbackTexBase: '/expore/textures/', onProgress,
     });
 
     if (loaded.ambientColor !== undefined)     ambientLight.color.set(loaded.ambientColor);
