@@ -19,7 +19,7 @@ Grab the latest release of the Expore Map Maker package and extract it to your c
 
 ### 3. Follow the Tutorial
 Ready to build? Follow the official step-by-step guide to configure TrenchBroom and start creating your first map:
-* 📖 [Expore Documentation & Tutorial](https://spelecanton.github.io/Expore/)
+* 📖 [Expore Documentation & Tutorial](https://spelecanton.github.io/Expore/tutorial/)
 
 ---
 
