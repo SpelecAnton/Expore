@@ -1,7 +1,68 @@
 /**
- * SPELEC BSP Loader v5.7 — PORTAL MEDIA TEXTURE EDITION
+ * SPELEC BSP Loader v5.8 — FASTER TEXTURE RESOLUTION EDITION
  *
- * Changes over v5.6:
+ * Changes over v5.7:
+ *
+ * 12. REMOVED THE HEAD-THEN-GET DOUBLE ROUND TRIP:
+ *    - findTex() used to HEAD-probe every candidate extension first, wait
+ *      for ALL of them to answer, and only THEN issue a second, separate
+ *      load request for the extension that won. That meant every texture
+ *      that successfully resolved (the large majority of faces) paid for
+ *      two full network round trips back-to-back before it was usable.
+ *    - Every per-format loader below (loadVideoTex / loadShaderTex /
+ *      loadAnimatedTex / loadStaticTex) already treats a missing file as a
+ *      normal, silent failure (404 → onerror / !res.ok), so the load
+ *      attempt itself already IS a perfectly good existence check — a
+ *      separate HEAD pre-flight was pure overhead. findTex() now fires a
+ *      real load attempt for every candidate extension in parallel and
+ *      keeps the highest-priority one that succeeds, with no HEAD step at
+ *      all. This roughly halves time-to-texture for the common case,
+ *      without dropping a single format: video (.mp4/.webm), GLSL shader
+ *      (.frag), animated (.gif/.avif/.webp) and static (.png/.jpg) are all
+ *      still probed in exactly the same priority order as before —
+ *      nothing was removed, only how fast the winner gets found changed.
+ *    - The only visible side effect: a few extra small, fast-failing
+ *      requests now happen for extensions that don't exist (e.g. probing
+ *      "name.mp4" for a texture that's actually "name.png"). These were
+ *      already happening before too (as HEAD requests) — they're just real
+ *      load attempts now instead, of roughly the same cost, since 404
+ *      responses are tiny either way.
+ *    - New shared loadTexByExt() dispatcher removes the duplicated
+ *      video/shader/animated/static ternary that used to be copy-pasted in
+ *      three different places (findTex, tryLoadTex, loadTextureFromUrl).
+ *
+ * 13. SILENT PROBING vs. LOUD DIRECT LOOKUPS:
+ *    - loadVideoTex(), loadShaderTex() and loadAnimatedTex() take a new
+ *      `silent` flag. During findTex()'s extension probing, almost every
+ *      candidate extension is EXPECTED to 404 (only one of the ~8 actually
+ *      exists) — without this flag, every ordinary .png/.jpg texture would
+ *      now spam the console with "video texture failed to load" / "shader
+ *      texture fetch failed" warnings for its non-existent .mp4/.webm/
+ *      .frag siblings.
+ *    - loadTextureFromUrl() (used for trigger_portal media labels, where
+ *      the caller already knows the exact URL and a failure means
+ *      something is actually broken) keeps these warnings loud, so real
+ *      problems with portal media stay easy to spot in the console.
+ *
+ * 14. PER-CANDIDATE TIMEOUT (TEX_PROBE_TIMEOUT_MS):
+ *    - Every loader now gives up and resolves null after 10s if neither a
+ *      success nor a clean failure event ever fires, so one stuck/slow
+ *      request (flaky connection, server hiccup) can no longer stall an
+ *      entire texture batch — and by extension, the mesh build / progress
+ *      bar waiting on it. Previously a hung request had no ceiling at all.
+ *
+ * 15. INITIAL_BATCHES 2 → 1:
+ *    - Only ONE batch (TEXTURE_BATCH_SIZE textures) is now awaited
+ *      synchronously before the first meshes are built and shown, instead
+ *      of two. Combined with point 12, the map becomes visible and
+ *      walkable noticeably sooner — remaining textures still swap in
+ *      progressively in the background exactly as before (point 6 in the
+ *      v5.2 changelog, unchanged).
+ *
+ * Nothing about WHICH formats are supported changed in this update — this
+ * is purely about how fast each one gets resolved over the network.
+ *
+ * --- Previous changelog (v5.7 — PORTAL MEDIA TEXTURE EDITION) -------------
  *
  * 11. GENERIC loadTextureFromUrl() EXPORT:
  *    - New exported helper that loads a texture from an arbitrary URL using
@@ -193,6 +254,7 @@ const TEXTURE_BATCH_SIZE = 4;    // Reduced 8 → 4: fewer simultaneous ImageBit
 const MESH_YIELD_EVERY   = 10;   // Reduced 50 → 10: yield more often to avoid 250ms stalls
 const MAX_ATLAS_MIPMAP   = 4096;
 const SHADER_TEX_SIZE    = 512;  // pixel resolution of the offscreen canvas used for .frag textures
+const TEX_PROBE_TIMEOUT_MS = 10000; // v5.8: per-candidate safety cap — a stuck request can no longer stall a whole batch
 
 // ── Anisotropy ────────────────────────────────────────────────────────────────
 let _maxAniso = 1;
@@ -273,6 +335,15 @@ function applyTexFilters(tex, { linearMag = false } = {}) {
   tex.generateMipmaps = true;
 }
 
+// ── Timeout helper for fetch() based loaders ──────────────────────────────────
+// Used by loadShaderTex() and loadAnimatedTex() so a stuck/slow request can't
+// hang a probe forever — see point 14 in the v5.8 changelog above.
+function fetchWithTimeout(url, ms = TEX_PROBE_TIMEOUT_MS, opts = {}) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), ms);
+  return fetch(url, { ...opts, signal: controller.signal }).finally(() => clearTimeout(timer));
+}
+
 // ── Video texture loader ──────────────────────────────────────────────────────
 // Creates a hidden <video> element (looped, muted, autoplay) and wraps it in
 // a THREE.VideoTexture. Mipmaps are disabled and linear filtering is forced —
@@ -287,7 +358,12 @@ function applyTexFilters(tex, { linearMag = false } = {}) {
 // data-spelec-bsp-video marks this element as a map-texture video, distinct
 // from chat-uploaded videos. engine.js uses this marker to scope its
 // keydown play-retry so it never force-plays chat media.
-function loadVideoTex(url) {
+//
+// `silent` (v5.8): when true, a missing/failed/timed-out file resolves to
+// null WITHOUT logging — used by findTex() during extension probing, where
+// most candidates are expected not to exist. Direct lookups (loadTextureFromUrl)
+// leave this false so real problems with a known URL stay visible.
+function loadVideoTex(url, silent = false) {
   return new Promise(resolve => {
     const video = document.createElement('video');
     video.src         = url;
@@ -319,22 +395,33 @@ function loadVideoTex(url) {
 
     let settled = false;
 
-    const onReady = () => {
+    const finish = result => {
       if (settled) return;
       settled = true;
+      clearTimeout(timeoutId);
+      resolve(result);
+    };
+
+    const onReady = () => {
       _videoList.push(video);
       video.play().catch(() => { /* will retry from tickAnimatedTextures() */ });
       console.log(`[BSP] Video texture ready: ${url}`);
-      resolve(tex);
+      finish(tex);
     };
 
     const onError = () => {
-      if (settled) return;
-      settled = true;
-      console.warn('[BSP] Video texture failed to load:', url);
+      // Expected during findTex() extension probing — most candidate
+      // extensions don't exist. See point 13, v5.8 changelog.
+      if (!silent) console.warn('[BSP] Video texture failed to load:', url);
       video.remove();
-      resolve(null);
+      finish(null);
     };
+
+    const timeoutId = setTimeout(() => {
+      if (!silent) console.warn('[BSP] Video texture timed out:', url);
+      video.remove();
+      finish(null);
+    }, TEX_PROBE_TIMEOUT_MS);
 
     video.addEventListener('loadeddata', onReady, { once: true });
     video.addEventListener('error', onError, { once: true });
@@ -394,11 +481,14 @@ function ensureGlslCanvasLoaded() {
 //
 // data-spelec-bsp-shader marks this element as a map-texture shader canvas,
 // distinct from any other canvas on the page.
-function loadShaderTex(url) {
-  return fetch(url)
+//
+// `silent` — see loadVideoTex() above for the reasoning.
+function loadShaderTex(url, silent = false) {
+  return fetchWithTimeout(url)
     .then(res => {
       if (!res.ok) {
-        console.warn('[BSP] Shader texture fetch failed:', url, res.status);
+        // Expected during findTex() probing — see point 13, v5.8 changelog.
+        if (!silent) console.warn('[BSP] Shader texture fetch failed:', url, res.status);
         return null;
       }
       return res.text();
@@ -450,19 +540,22 @@ function loadShaderTex(url) {
       return tex;
     })
     .catch(err => {
-      console.warn('[BSP] Shader texture load failed:', url, err.message);
+      // Also catches our own fetchWithTimeout() abort — expected noise
+      // during probing, so respect `silent` here too.
+      if (!silent) console.warn('[BSP] Shader texture load failed:', url, err.message);
       return null;
     });
 }
 
 // ── Animated texture loader ───────────────────────────────────────────────────
-async function loadAnimatedTex(url) {
+// `silent` — see loadVideoTex() above for the reasoning.
+async function loadAnimatedTex(url, silent = false) {
   if (typeof ImageDecoder === 'undefined') {
-    console.warn('[BSP] ImageDecoder not available, static fallback:', url);
+    if (!silent) console.warn('[BSP] ImageDecoder not available, static fallback:', url);
     return loadStaticTex(url);
   }
   try {
-    const response = await fetch(url);
+    const response = await fetchWithTimeout(url);
     if (!response.ok) return null;
     const buffer = await response.arrayBuffer();
     const ext     = url.substring(url.lastIndexOf('.')).toLowerCase();
@@ -513,78 +606,116 @@ async function loadAnimatedTex(url) {
     _animList.push({ frames, canvas, ctx, tex, frameIdx: 0, nextFrameTime: performance.now() + frames[0].duration });
     return tex;
   } catch (err) {
-    console.warn('[BSP] Animation load failed, fallback static:', url, err.message);
+    // Also catches our own fetchWithTimeout() abort — expected noise
+    // during probing, so respect `silent` here too.
+    if (!silent) console.warn('[BSP] Animation load failed, fallback static:', url, err.message);
     return loadStaticTex(url);
   }
 }
 
 // ── Static texture loader ─────────────────────────────────────────────────────
+// No `silent` param needed — this loader never logs on failure, it just
+// resolves null (unchanged from before v5.8).
 function loadStaticTex(url) {
   return new Promise(res => {
-    _loader.load(url, tex => { applyTexFilters(tex); res(tex); }, undefined, () => res(null));
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      res(null); // give up waiting so the batch isn't stalled forever
+    }, TEX_PROBE_TIMEOUT_MS);
+
+    _loader.load(url, tex => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      applyTexFilters(tex);
+      res(tex);
+    }, undefined, () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      res(null);
+    });
   });
+}
+
+// ── Per-extension format dispatcher (v5.8) ────────────────────────────────────
+// Shared by findTex() (extension probing — silent, see point 13 above),
+// tryLoadTex(), and loadTextureFromUrl() (direct, known-URL lookups — not
+// silent, so real failures stay visible). Keeping this in one place avoids
+// the same video/shader/animated/static ternary being copy-pasted in three
+// different spots, as it was before v5.8.
+function loadTexByExt(url, ext, silent = false) {
+  if (VIDEO_EXTS.has(ext))  return loadVideoTex(url, silent);
+  if (SHADER_EXTS.has(ext)) return loadShaderTex(url, silent);
+  if (ANIM_EXTS.has(ext))   return loadAnimatedTex(url, silent);
+  return loadStaticTex(url);
 }
 
 async function tryLoadTex(url) {
   if (_texCache.has(url)) return _texCache.get(url);
-  try {
-    const probe = await fetch(url, { method: 'HEAD' });
-    if (!probe.ok) { _texCache.set(url, null); return null; }
-  } catch { _texCache.set(url, null); return null; }
   const ext = url.substring(url.lastIndexOf('.')).toLowerCase();
-  const tex  = VIDEO_EXTS.has(ext)  ? await loadVideoTex(url)
-             : SHADER_EXTS.has(ext) ? await loadShaderTex(url)
-             : ANIM_EXTS.has(ext)   ? await loadAnimatedTex(url)
-             : await loadStaticTex(url);
+  const tex = await loadTexByExt(url, ext);
   _texCache.set(url, tex);
   return tex;
 }
 
 // ── Generic texture loader for an arbitrary, already-known URL ───────────────
-// Unlike findTex() (which probes multiple base paths + every extension) or
-// tryLoadTex() (which HEAD-probes one candidate URL before loading), this
-// assumes the caller already knows the exact URL is correct and just wants
-// it loaded with the right loader for its file type. Used by engine.js for
-// trigger_portal "media labels": a portal's label field can be a URL to an
-// image, animated image, video, or GLSL shader, and the whole portal plane
-// gets textured with it instead of a small text caption.
+// Unlike findTex() (which probes multiple base paths + every extension),
+// this assumes the caller already knows the exact URL is correct and just
+// wants it loaded with the right loader for its file type. Used by engine.js
+// for trigger_portal "media labels": a portal's label field can be a URL to
+// an image, animated image, video, or GLSL shader, and the whole portal
+// plane gets textured with it instead of a small text caption.
 //
 // Results share the same _texCache as every other texture (so re-using the
 // same media URL on multiple portals only loads it once), and videos/
 // shaders/animated images registered here are picked up automatically by
 // the existing tickAnimatedTextures() loop — no separate ticking required.
+//
+// NOT silent — a missing/broken portal media URL is a real authoring
+// mistake worth seeing in the console, unlike findTex()'s speculative
+// extension probing.
 export async function loadTextureFromUrl(url) {
   if (_texCache.has(url)) return _texCache.get(url);
   const ext = url.substring(url.lastIndexOf('.')).toLowerCase();
-  const tex  = VIDEO_EXTS.has(ext)  ? await loadVideoTex(url)
-             : SHADER_EXTS.has(ext) ? await loadShaderTex(url)
-             : ANIM_EXTS.has(ext)   ? await loadAnimatedTex(url)
-             : await loadStaticTex(url);
+  const tex = await loadTexByExt(url, ext);
   _texCache.set(url, tex);
   return tex;
 }
 
-// ── findTex — parallel HEAD probe ────────────────────────────────────────────
+// ── findTex — parallel format-priority probe (v5.8: no HEAD pre-flight) ──────
+// Tries every candidate extension as a REAL load attempt (not a separate
+// HEAD request) and takes the highest-priority success. Each per-type loader
+// above already treats a missing resource as a normal, silent (when probing)
+// failure — so there's no need for a separate existence check before
+// loading: the load attempt itself IS the existence check. This removes what
+// used to be a mandatory HEAD-then-load double round trip for every texture
+// that resolves (the vast majority of faces), roughly halving time-to-
+// texture, without changing which formats are supported or their priority
+// order (video > shader > animated > static, same as always).
 async function findTex(bases, name) {
   for (const base of bases) {
     if (!base) continue;
-    const probes = await Promise.all(
+
+    const attempts = await Promise.all(
       TEX_EXTENSIONS.map(async ext => {
         const url = base + name + ext;
-        try { const r = await fetch(url, { method: 'HEAD' }); return r.ok ? url : null; }
-        catch { return null; }
+        if (_texCache.has(url)) {
+          const cached = _texCache.get(url);
+          return cached ? { url, tex: cached } : null;
+        }
+        const tex = await loadTexByExt(url, ext, /* silent */ true);
+        _texCache.set(url, tex);
+        return tex ? { url, tex } : null;
       })
     );
-    const found = probes.find(u => u !== null);
-    if (!found) continue;
-    if (_texCache.has(found)) return _texCache.get(found);
-    const ext = found.substring(found.lastIndexOf('.')).toLowerCase();
-    const tex  = VIDEO_EXTS.has(ext)  ? await loadVideoTex(found)
-               : SHADER_EXTS.has(ext) ? await loadShaderTex(found)
-               : ANIM_EXTS.has(ext)   ? await loadAnimatedTex(found)
-               : await loadStaticTex(found);
-    _texCache.set(found, tex);
-    if (tex) return tex;
+
+    // TEX_EXTENSIONS is already priority-ordered (video > shader > animated
+    // > static) — the first non-null entry IS the highest-priority match.
+    const hit = attempts.find(a => a !== null);
+    if (hit) return hit.tex;
   }
   return null;
 }
@@ -829,7 +960,7 @@ async function buildMeshesProgressively(mergedBatches, texNames, lmTex, albedoMa
 // The first INITIAL_BATCHES are awaited synchronously before mesh build starts.
 // Remaining textures load in the background; when each batch finishes,
 // pendingSwap materials are updated so the map visually fills in.
-const INITIAL_BATCHES = 2; // Load first 2 × TEXTURE_BATCH_SIZE textures before first mesh
+const INITIAL_BATCHES = 1; // v5.8: reduced 2 → 1 — first frame appears sooner; rest still swap in progressively below
 
 async function loadTexturesInBatches(uniqueNames, texBases, onProgress, pendingSwapRef) {
   const albedoMap = new Map();
