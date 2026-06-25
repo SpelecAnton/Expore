@@ -1,76 +1,142 @@
 /**
- * SPELEC BSP Loader v5.9 — LOAD TIMING DIAGNOSTICS
+ * SPELEC BSP Loader v5.9 — GZIP MAP SUPPORT
  *
  * Changes over v5.8:
  *
- * 16. PER-PHASE TIMING REPORT:
- *    - loadBSP() now records a performance.now() timestamp at the start of
- *      every major phase and logs the elapsed time when that phase ends.
- *      Phases timed (each printed to console with a ⏱ prefix):
- *        • BSP download + arrayBuffer()  — network + browser decode
- *        • BSP Worker parse              — all work inside the worker
- *        • Lightmap DataTexture create   — atlas Uint8Array → DataTexture
- *        • Geometry merge                — mergeBatchGeometries() CPU pass
- *        • Initial texture batch         — the BLOCKING findTex() calls
- *        • Mesh build (progressive)      — GPU BufferGeometry uploads
- *        • Total to first frame          — sum of all blocking phases
- *      This tells you immediately which phase is the bottleneck without
- *      having to instrument the code yourself.
+ * 16. .BSP.GZ SUPPORT (fetchBSP helper):
+ *    - loadBSP() now accepts both plain 'map.bsp' and compressed 'map.bsp.gz'
+ *      URLs interchangeably. The URL extension is the only signal — no server
+ *      configuration changes are required.
+ *    - When the URL ends in '.gz', the response body is piped through the
+ *      browser's native DecompressionStream('gzip') before being handed to
+ *      the BSP worker. This is a standard Web API available in Chrome 80+,
+ *      Firefox 113+, Safari 16.4+ — no third-party inflate library needed.
+ *    - The decompressed ArrayBuffer is identical to a plain .bsp file, so
+ *      the worker receives exactly the same bytes and zero other code changes
+ *      were needed downstream.
+ *    - If the browser does not support DecompressionStream (very old UA), a
+ *      clear error is thrown immediately rather than silently producing a
+ *      corrupt parse.
+ *    - Typical .bsp.gz files are 60-75% smaller than the raw BSP — on a
+ *      slow connection this can shave several seconds off the initial load.
+ *      To produce one: `gzip -k map.bsp` (keeps the original alongside).
+ *    - Usage: just change mapUrl in engine.js / index.html from 'map.bsp'
+ *      to 'map.bsp.gz'. Everything else — textures, physics, portals —
+ *      stays exactly the same.
  *
- * 17. TEXTURE PROBE STATISTICS:
- *    - New module-level _probeStats object tracks across the whole session:
- *        • attempts   — total findTex() calls (= unique texture names)
- *        • resolved   — how many got a real texture (not whiteTex fallback)
- *        • fallback   — how many fell back to whiteTex (file not found)
- *        • requests   — total individual fetch/load attempts fired
- *                       (attempts × TEX_EXTENSIONS.length × bases.length)
- *        • hitMs      — cumulative ms inside findTex() for successful finds
- *        • missMs     — cumulative ms for names that resolved to nothing
- *        • avgMs      — average ms per unique texture name
- *    - Printed in the final summary table so you can see exactly how much
- *      time the texture probing phase consumes, and how many unnecessary
- *      404-level requests are flying (= good argument for adding a texture
- *      manifest JSON as the next optimization).
+ * --- Previous changelog (v5.8 — FASTER TEXTURE RESOLUTION EDITION) ---------
  *
- * 18. BSP FILE SIZE IN LOGS:
- *    - BSP download line now includes the file size in MB so you can tell
- *      at a glance whether the download itself is the dominant cost.
+ * 12. REMOVED THE HEAD-THEN-GET DOUBLE ROUND TRIP:
+ *    - findTex() used to HEAD-probe every candidate extension first, wait
+ *      for ALL of them to answer, and only THEN issue a second, separate
+ *      load request for the extension that won. That meant every texture
+ *      that successfully resolved (the large majority of faces) paid for
+ *      two full network round trips back-to-back before it was usable.
+ *    - Every per-format loader below (loadVideoTex / loadShaderTex /
+ *      loadAnimatedTex / loadStaticTex) already treats a missing file as a
+ *      normal, silent failure (404 → onerror / !res.ok), so the load
+ *      attempt itself already IS a perfectly good existence check — a
+ *      separate HEAD pre-flight was pure overhead. findTex() now fires a
+ *      real load attempt for every candidate extension in parallel and
+ *      keeps the highest-priority one that succeeds, with no HEAD step at
+ *      all. This roughly halves time-to-texture for the common case,
+ *      without dropping a single format: video (.mp4/.webm), GLSL shader
+ *      (.frag), animated (.gif/.avif/.webp) and static (.png/.jpg) are all
+ *      still probed in exactly the same priority order as before —
+ *      nothing was removed, only how fast the winner gets found changed.
+ *    - The only visible side effect: a few extra small, fast-failing
+ *      requests now happen for extensions that don't exist (e.g. probing
+ *      "name.mp4" for a texture that's actually "name.png"). These were
+ *      already happening before too (as HEAD requests) — they're just real
+ *      load attempts now instead, of roughly the same cost, since 404
+ *      responses are tiny either way.
+ *    - New shared loadTexByExt() dispatcher removes the duplicated
+ *      video/shader/animated/static ternary that used to be copy-pasted in
+ *      three different places (findTex, tryLoadTex, loadTextureFromUrl).
  *
- * 19. DRAW-CALL COUNT IN MERGE LOG:
- *    - Geometry merge line now prints both the input batch count AND the
- *      output merged draw-call count so you can see how much consolidation
- *      actually happened (high output count → many unique tex/lm combos,
- *      possible over-segmentation in the map).
+ * 13. SILENT PROBING vs. LOUD DIRECT LOOKUPS:
+ *    - loadVideoTex(), loadShaderTex() and loadAnimatedTex() take a new
+ *      `silent` flag. During findTex()'s extension probing, almost every
+ *      candidate extension is EXPECTED to 404 (only one of the ~8 actually
+ *      exists) — without this flag, every ordinary .png/.jpg texture would
+ *      now spam the console with "video texture failed to load" / "shader
+ *      texture fetch failed" warnings for its non-existent .mp4/.webm/
+ *      .frag siblings.
+ *    - loadTextureFromUrl() (used for trigger_portal media labels, where
+ *      the caller already knows the exact URL and a failure means
+ *      something is actually broken) keeps these warnings loud, so real
+ *      problems with portal media stay easy to spot in the console.
  *
- * None of the above changes any runtime behaviour — all timing is read-only
- * observation. The diagnostic output can be removed or guarded behind a
- * DEBUG flag once the bottleneck is identified and fixed.
+ * 14. PER-CANDIDATE TIMEOUT (TEX_PROBE_TIMEOUT_MS):
+ *    - Every loader now gives up and resolves null after 10s if neither a
+ *      success nor a clean failure event ever fires, so one stuck/slow
+ *      request (flaky connection, server hiccup) can no longer stall an
+ *      entire texture batch — and by extension, the mesh build / progress
+ *      bar waiting on it. Previously a hung request had no ceiling at all.
  *
- * --- Previous changelog (v5.8 — FASTER TEXTURE RESOLUTION EDITION) --------
+ * 15. INITIAL_BATCHES 2 → 1:
+ *    - Only ONE batch (TEXTURE_BATCH_SIZE textures) is now awaited
+ *      synchronously before the first meshes are built and shown, instead
+ *      of two. Combined with point 12, the map becomes visible and
+ *      walkable noticeably sooner — remaining textures still swap in
+ *      progressively in the background exactly as before (point 6 in the
+ *      v5.2 changelog, unchanged).
  *
- * 12. REMOVED THE HEAD-THEN-GET DOUBLE ROUND TRIP
- * 13. SILENT PROBING vs. LOUD DIRECT LOOKUPS
- * 14. PER-CANDIDATE TIMEOUT (TEX_PROBE_TIMEOUT_MS)
- * 15. INITIAL_BATCHES 2 → 1
+ * Nothing about WHICH formats are supported changed in that update — it was
+ * purely about how fast each one gets resolved over the network.
  *
  * --- Previous changelog (v5.7 — PORTAL MEDIA TEXTURE EDITION) -------------
- * 11. GENERIC loadTextureFromUrl() EXPORT
+ *
+ * 11. GENERIC loadTextureFromUrl() EXPORT:
+ *    - New exported helper that loads a texture from an arbitrary URL using
+ *      the exact same format detection + loaders already used for BSP face
+ *      textures (static image, animated gif/avif/webp, video mp4/webm, and
+ *      GLSL .frag shader) — picked purely by file extension, same as
+ *      findTex()/tryLoadTex().
+ *    - Used by engine.js to give trigger_portal entities a "media label":
+ *      if a portal's "label" field is a URL ending in a recognized image/
+ *      video/shader extension instead of plain text, the portal renders
+ *      that media full-size across its whole plane instead of a small text
+ *      caption.
+ *    - Results are cached in the same _texCache as every other texture, and
+ *      videos/shaders/animated images loaded this way are automatically
+ *      ticked by the existing tickAnimatedTextures() loop — no new ticking
+ *      code needed, since they're pushed into the same _videoList /
+ *      _shaderList / _animList already used by BSP face textures.
  *
  * --- Previous changelog (v5.6 — GLSL SHADER TEXTURE EDITION) -------------
- * 10. GLSL SHADER TEXTURES (.frag)
+ *
+ * 10. GLSL SHADER TEXTURES (.frag):
+ *    - A BSP texture name can now resolve to a ".frag" fragment shader
+ *      file instead of an image/video, using the same GlslCanvas engine
+ *      that powers the shader background on the main page (index.html).
+ *    - findTex() / tryLoadTex() probe ".frag" alongside the existing
+ *      image/video/animated extensions. Example: a face textured
+ *      "textures/lava" will use "lava.frag" if present (checked right
+ *      after video formats, before static images), exactly like any
+ *      other texture variant.
+ *    - loadShaderTex() fetches the shader source as text, lazily loads
+ *      GlslCanvas.js as a classic (non-module) script — required because
+ *      its UMD wrapper relies on a non-strict top-level `this` to attach
+ *      itself to `window`, which an ES module context does not provide —
+ *      then renders it onto a hidden offscreen <canvas> wrapped in a
+ *      THREE.CanvasTexture.
+ *    - The canvas runs GlslCanvas's own internal requestAnimationFrame
+ *      loop (unmodified, same as the main page), so animated shaders
+ *      (u_time, u_mouse, u_date) keep updating on their own; this loader
+ *      just needs to flag the THREE.CanvasTexture as needsUpdate each
+ *      tick so the latest frame gets uploaded to the GPU — handled in
+ *      tickAnimatedTextures() alongside the existing GIF/video upkeep.
+ *    - No mipmaps (same reasoning as video textures: avoids a class of
+ *      silent black-texture bugs), no DOM cleanup on destroy (matches
+ *      the existing lifetime assumptions of _animList / _videoList).
  *
  * --- Previous changelog (v5.5 — CHAT MEDIA ISOLATION EDITION) ------------
- *  9. BSP TEXTURE VIDEO MARKER (data-spelec-bsp-video)
  *
- * --- Previous changelog (v5.4 — VIDEO TEXTURE EDITION) --------------------
- *  8. AUDIO UNMUTE ON USER GESTURE (unmuteVideos export)
- *
- * --- Previous changelog (v5.3 — VIDEO TEXTURE EDITION) --------------------
- *  7. REAL VIDEO TEXTURE SUPPORT (.mp4 / .webm)
- *
- * --- Previous changelog (v5.2 — LARGE MAP EDITION) -----------------------
- *  1–6. MESH_YIELD_EVERY, TEXTURE_BATCH_SIZE, progressive swap, BVH,
- *       lightmap deferral, geometry dispose guard
+ * 9. BSP TEXTURE VIDEO MARKER:
+ *    - <video> elements created here for video textures are tagged with
+ *      `data-spelec-bsp-video` so engine.js can target them specifically
+ *      instead of accidentally grabbing every <video> on the page.
  *
  * Backward compat: exports loadBSP, tickAnimatedTextures, initTexLoader,
  * unmuteVideos, loadTextureFromUrl.
@@ -130,15 +196,20 @@ function buildBVH(geometry) {
 }
 
 // ── Configuration ─────────────────────────────────────────────────────────────
+// Video formats are tried FIRST so a texture named e.g. "video.mp4" wins
+// over a "video.png" poster/placeholder that may exist alongside it.
+// ".frag" (GLSL shader textures) is checked right after video formats, for
+// the same reason — an explicit shader variant should win over a static
+// placeholder image sitting next to it.
 const VIDEO_EXTS         = new Set(['.mp4', '.webm']);
 const SHADER_EXTS        = new Set(['.frag']);
 const TEX_EXTENSIONS     = ['.mp4', '.webm', '.frag', '.gif', '.avif', '.webp', '.png', '.jpg'];
 const ANIM_EXTS          = new Set(['.gif', '.avif', '.webp']);
-const TEXTURE_BATCH_SIZE = 4;
-const MESH_YIELD_EVERY   = 10;
+const TEXTURE_BATCH_SIZE = 4;    // Reduced 8 → 4: fewer simultaneous ImageBitmap decodes
+const MESH_YIELD_EVERY   = 10;   // Reduced 50 → 10: yield more often to avoid 250ms stalls
 const MAX_ATLAS_MIPMAP   = 4096;
-const SHADER_TEX_SIZE    = 512;
-const TEX_PROBE_TIMEOUT_MS = 10000;
+const SHADER_TEX_SIZE    = 512;  // pixel resolution of the offscreen canvas used for .frag textures
+const TEX_PROBE_TIMEOUT_MS = 10000; // v5.8: per-candidate safety cap — a stuck request can no longer stall a whole batch
 
 // ── Anisotropy ────────────────────────────────────────────────────────────────
 let _maxAniso = 1;
@@ -155,18 +226,6 @@ const _animList   = [];
 const _videoList  = [];
 const _shaderList = [];
 
-// ── Diagnostic probe stats (v5.9) ─────────────────────────────────────────────
-// Accumulated across all findTex() calls for the current page load.
-// Printed in the final summary table inside loadBSP().
-const _probeStats = {
-  attempts:  0,   // total findTex() calls (= unique texture names probed)
-  resolved:  0,   // names that found a real texture
-  fallback:  0,   // names that fell back to whiteTex (nothing found)
-  requests:  0,   // individual fetch/load attempts fired (attempts × exts × bases)
-  hitMs:     0,   // cumulative ms for successful findTex() calls
-  missMs:    0,   // cumulative ms for failed findTex() calls
-};
-
 // ── Tick animated textures ────────────────────────────────────────────────────
 export function tickAnimatedTextures() {
   if (_animList.length) {
@@ -182,14 +241,23 @@ export function tickAnimatedTextures() {
     }
   }
 
+  // Resume any <video> textures the browser may have paused
+  // (tab switch, power saving, autoplay-policy re-checks, etc.).
+  // _videoList contains both BSP face videos and portal media videos
+  // (loaded via loadTextureFromUrl) — never chat-uploaded media.
   if (_videoList.length) {
     for (const video of _videoList) {
       if (video.paused && !video.ended) {
-        video.play().catch(() => {});
+        video.play().catch(() => { /* still blocked — try again next tick */ });
       }
     }
   }
 
+  // Re-flag GLSL shader textures as needing a GPU re-upload. GlslCanvas runs
+  // its own internal requestAnimationFrame loop and keeps painting the
+  // offscreen canvas by itself — all this loader needs to do is tell
+  // Three.js the canvas contents changed so the next render call uploads
+  // the latest frame.
   if (_shaderList.length) {
     for (const shader of _shaderList) {
       shader.tex.needsUpdate = true;
@@ -202,7 +270,7 @@ export function unmuteVideos() {
   for (const video of _videoList) {
     if (video.muted) {
       video.muted = false;
-      video.play().catch(() => {});
+      video.play().catch(() => { /* still blocked — tickAnimatedTextures retries */ });
     }
   }
 }
@@ -224,7 +292,63 @@ function fetchWithTimeout(url, ms = TEX_PROBE_TIMEOUT_MS, opts = {}) {
   return fetch(url, { ...opts, signal: controller.signal }).finally(() => clearTimeout(timer));
 }
 
+// ── BSP file fetch with optional gzip decompression (v5.9) ───────────────────
+// Handles both plain .bsp and compressed .bsp.gz URLs transparently.
+// Decompression uses the browser's native DecompressionStream API (no library
+// required). If the URL does not end in '.gz', plain arrayBuffer() is used,
+// same as before.
+async function fetchBSP(url) {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`BSP fetch failed: ${url} (${res.status})`);
+
+  // Plain .bsp — fast path, unchanged from v5.8.
+  if (!url.endsWith('.gz')) {
+    return res.arrayBuffer();
+  }
+
+  // Compressed .bsp.gz — decompress via native streaming API.
+  if (typeof DecompressionStream === 'undefined') {
+    throw new Error(
+      '[BSP] DecompressionStream is not available in this browser. ' +
+      'Use a plain .bsp file or upgrade to a recent browser.'
+    );
+  }
+
+  console.log('[BSP] Decompressing gzip stream...');
+  const t0         = performance.now();
+  const ds         = new DecompressionStream('gzip');
+  const reader     = res.body.pipeThrough(ds).getReader();
+  const chunks     = [];
+  let   totalBytes = 0;
+
+  // Collect all decompressed chunks.
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+    totalBytes += value.byteLength;
+  }
+
+  // Concatenate into a single contiguous ArrayBuffer.
+  const out    = new Uint8Array(totalBytes);
+  let   offset = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+
+  console.log(
+    `[BSP] Decompressed ${(totalBytes / 1024 / 1024).toFixed(2)} MB` +
+    ` in ${(performance.now() - t0).toFixed(0)} ms`
+  );
+  return out.buffer;
+}
+
 // ── Video texture loader ──────────────────────────────────────────────────────
+// `silent` (v5.8): when true, a missing/failed/timed-out file resolves to
+// null WITHOUT logging — used by findTex() during extension probing, where
+// most candidates are expected not to exist. Direct lookups (loadTextureFromUrl)
+// leave this false so real problems with a known URL stay visible.
 function loadVideoTex(url, silent = false) {
   return new Promise(resolve => {
     const video = document.createElement('video');
@@ -235,8 +359,9 @@ function loadVideoTex(url, silent = false) {
     video.autoplay    = true;
     video.preload     = 'auto';
     video.crossOrigin = 'anonymous';
-    video.dataset.spelecBspVideo = '';
+    video.dataset.spelecBspVideo = ''; // marker: BSP texture video, not chat media
 
+    // Keep decoding alive — do NOT use display:none here.
     video.style.position      = 'absolute';
     video.style.top           = '0';
     video.style.left          = '0';
@@ -265,7 +390,7 @@ function loadVideoTex(url, silent = false) {
 
     const onReady = () => {
       _videoList.push(video);
-      video.play().catch(() => {});
+      video.play().catch(() => { /* will retry from tickAnimatedTextures() */ });
       console.log(`[BSP] Video texture ready: ${url}`);
       finish(tex);
     };
@@ -290,6 +415,11 @@ function loadVideoTex(url, silent = false) {
 }
 
 // ── GlslCanvas lazy loader ────────────────────────────────────────────────────
+// GlslCanvas.js is a UMD bundle, not an ES module — it attaches itself to
+// `window.GlslCanvas` by reading the top-level `this`, which only resolves to
+// `window` in a classic (non-module) script. Importing it with `import` would
+// give `this === undefined` (modules are strict) and throw. So instead it's
+// loaded once via a plain <script> tag.
 let _glslCanvasLoadPromise = null;
 
 function ensureGlslCanvasLoaded() {
@@ -322,6 +452,7 @@ function ensureGlslCanvasLoaded() {
 }
 
 // ── GLSL shader texture loader ────────────────────────────────────────────────
+// `silent` — see loadVideoTex() above for the reasoning.
 function loadShaderTex(url, silent = false) {
   return fetchWithTimeout(url)
     .then(res => {
@@ -384,6 +515,7 @@ function loadShaderTex(url, silent = false) {
 }
 
 // ── Animated texture loader ───────────────────────────────────────────────────
+// `silent` — see loadVideoTex() above for the reasoning.
 async function loadAnimatedTex(url, silent = false) {
   if (typeof ImageDecoder === 'undefined') {
     if (!silent) console.warn('[BSP] ImageDecoder not available, static fallback:', url);
@@ -471,7 +603,7 @@ function loadStaticTex(url) {
   });
 }
 
-// ── Per-extension format dispatcher ──────────────────────────────────────────
+// ── Per-extension format dispatcher (v5.8) ────────────────────────────────────
 function loadTexByExt(url, ext, silent = false) {
   if (VIDEO_EXTS.has(ext))  return loadVideoTex(url, silent);
   if (SHADER_EXTS.has(ext)) return loadShaderTex(url, silent);
@@ -496,18 +628,11 @@ export async function loadTextureFromUrl(url) {
   return tex;
 }
 
-// ── findTex — parallel format-priority probe (v5.9: with diagnostic stats) ───
-// v5.9 adds per-call timing and probe counting on top of the v5.8 parallel
-// logic. The actual probing behaviour is identical to v5.8 — only the
-// instrumentation is new.
+// ── findTex — parallel format-priority probe (v5.8: no HEAD pre-flight) ──────
 async function findTex(bases, name) {
-  const t0 = performance.now();
-  // Count how many individual load attempts this call will fire so we can
-  // accumulate the total in _probeStats.requests.
-  const activeBases = bases.filter(Boolean);
-  _probeStats.requests += activeBases.length * TEX_EXTENSIONS.length;
+  for (const base of bases) {
+    if (!base) continue;
 
-  for (const base of activeBases) {
     const attempts = await Promise.all(
       TEX_EXTENSIONS.map(async ext => {
         const url = base + name + ext;
@@ -521,22 +646,11 @@ async function findTex(bases, name) {
       })
     );
 
+    // TEX_EXTENSIONS is already priority-ordered (video > shader > animated
+    // > static) — the first non-null entry IS the highest-priority match.
     const hit = attempts.find(a => a !== null);
-    if (hit) {
-      // Successful probe — record timing and return.
-      const elapsed = performance.now() - t0;
-      _probeStats.attempts++;
-      _probeStats.resolved++;
-      _probeStats.hitMs += elapsed;
-      return hit.tex;
-    }
+    if (hit) return hit.tex;
   }
-
-  // Nothing found in any base — whiteTex fallback will be used by caller.
-  const elapsed = performance.now() - t0;
-  _probeStats.attempts++;
-  _probeStats.fallback++;
-  _probeStats.missMs += elapsed;
   return null;
 }
 
@@ -771,8 +885,8 @@ async function buildMeshesProgressively(mergedBatches, texNames, lmTex, albedoMa
   return { totalMeshes, pendingSwap };
 }
 
-// ── Batch texture loader ──────────────────────────────────────────────────────
-const INITIAL_BATCHES = 1;
+// ── Batch texture loader — returns live Map + background Promise ──────────────
+const INITIAL_BATCHES = 1; // v5.8: reduced 2 → 1 — first frame appears sooner
 
 async function loadTexturesInBatches(uniqueNames, texBases, onProgress, pendingSwapRef) {
   const albedoMap = new Map();
@@ -809,40 +923,20 @@ export async function loadBSP({
   fallbackTexBase = '',
   onProgress      = null,
 }) {
-  // ── Phase timing helpers (v5.9) ───────────────────────────────────────────
-  // ms() returns a formatted elapsed-time string from a previous timestamp.
-  // phase() logs a labelled phase line and returns the current timestamp for
-  // use as the start of the next phase.
-  const ms   = t  => `${(performance.now() - t).toFixed(0)} ms`;
-  const phase = (label, t, extra = '') => {
-    const elapsed = (performance.now() - t).toFixed(0);
-    console.log(`[BSP] ⏱  ${label.padEnd(30)} ${String(elapsed).padStart(6)} ms${extra ? '  — ' + extra : ''}`);
-    return performance.now();
-  };
-
-  const tTotal = performance.now();
-  console.log('[BSP] ════════════════════════════════════════ LOAD START');
-
-  // ── Phase 1: fetch BSP + decode ArrayBuffer ───────────────────────────────
   onProgress?.(0);
-  let t = performance.now();
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`BSP fetch failed: ${url} (${res.status})`);
-  const buffer = await res.arrayBuffer();
-  const sizeMB = (buffer.byteLength / 1048576).toFixed(2);
-  t = phase('BSP download + decode', t, `${sizeMB} MB`);
+
+  // v5.9: fetchBSP() transparently handles both .bsp and .bsp.gz
+  const buffer = await fetchBSP(url);
   onProgress?.(5);
 
-  // ── Phase 2: BSP worker (parse + build batches) ───────────────────────────
   const parsed = await runBSPWorker(
     buffer, textureBase, fallbackTexBase,
     pct => onProgress?.(5 + pct * 0.75)
   );
-  const { portals, playerStart, ambientIntensity, ambientColorArr, texNames, lmAtlas, batches } = parsed;
-  t = phase('BSP Worker parse', t,
-    `${batches.length} raw batches, ${[...new Set(batches.map(b => b.texIdx))].length} tex refs`);
 
-  // ── Phase 3: lightmap DataTexture ─────────────────────────────────────────
+  const { portals, playerStart, ambientIntensity, ambientColorArr, texNames, lmAtlas, batches } = parsed;
+
+  // ── Lightmap ──────────────────────────────────────────────────────────────
   let lmTex = null;
   if (lmAtlas) {
     if (lmAtlas.nonZero === 0) {
@@ -872,67 +966,43 @@ export async function loadBSP({
     lmTex.magFilter  = THREE.LinearFilter;
     lmTex.anisotropy = _maxAniso;
     lmTex.wrapS = lmTex.wrapT = THREE.ClampToEdgeWrapping;
+
     setTimeout(() => { lmTex.needsUpdate = true; }, 0);
   }
-  t = phase('Lightmap DataTexture', t, lmAtlas ? `${lmAtlas.W}×${lmAtlas.H}` : 'none');
 
-  // ── Phase 4: geometry merge (CPU) ─────────────────────────────────────────
+  // ── Merge geometries first (CPU only, no GPU) ─────────────────────────────
   console.log(`[BSP] Merging ${batches.length} batches (vertex budget: ${MAX_VERTS_PER_DRAW})...`);
   const mergedBatches = mergeBatchGeometries(batches);
-  t = phase('Geometry merge', t,
-    `${batches.length} → ${mergedBatches.length} draw calls`);
+  console.log(`[BSP] After merge: ${mergedBatches.length} draw calls`);
 
-  // ── Phase 5: initial texture batch (BLOCKING — holds up first frame) ──────
+  // ── Load first N texture batches synchronously before building any mesh ───
   const texBases    = [textureBase, fallbackTexBase];
   const uniqueNames = [...new Set(batches.filter(b => !b.invisible).map(b => texNames[b.texIdx] || 'default'))];
+
+  console.log(`[BSP] Loading ${uniqueNames.length} unique textures (${TEXTURE_BATCH_SIZE}/batch)...`);
+
   const initialNames = uniqueNames.slice(0, INITIAL_BATCHES * TEXTURE_BATCH_SIZE);
+  const albedoMap    = new Map();
 
-  console.log(`[BSP] Unique textures: ${uniqueNames.length}  |  initial (blocking): ${initialNames.length}`);
-  console.log(`[BSP] Probe candidates per texture: ${texBases.filter(Boolean).length} base(s) × ${TEX_EXTENSIONS.length} ext(s) = ${texBases.filter(Boolean).length * TEX_EXTENSIONS.length} requests`);
-
-  const albedoMap = new Map();
   await Promise.all(initialNames.map(async name => {
     const tex = await findTex(texBases, name);
     albedoMap.set(name, tex || _whiteTex);
   }));
-  t = phase('Initial texture batch', t,
-    `${initialNames.length} textures, ${_probeStats.resolved}/${_probeStats.attempts} resolved`);
+
   onProgress?.(82);
 
-  // ── Phase 6: mesh build (GPU uploads, yields every MESH_YIELD_EVERY) ──────
+  // ── Build all meshes now (remaining textures swap in later) ───────────────
   const { pendingSwap } = await buildMeshesProgressively(
     mergedBatches, texNames, lmTex, albedoMap, scene, onProgress
   );
-  t = phase('Mesh build (initial)', t, `${mergedBatches.length} draw calls → scene`);
 
   onProgress?.(100);
 
-  // ── Summary report (v5.9) ─────────────────────────────────────────────────
-  const totalBlockingMs = (performance.now() - tTotal).toFixed(0);
-  const avgProbeMs = _probeStats.attempts > 0
-    ? (_probeStats.hitMs + _probeStats.missMs) / _probeStats.attempts
-    : 0;
-
-  console.log('[BSP] ════════════════════════════════════════ LOAD SUMMARY');
-  console.log(`[BSP] Total time to first frame : ${totalBlockingMs} ms`);
-  console.log('[BSP] Texture probe stats:');
-  console.log(`[BSP]   unique names probed     : ${_probeStats.attempts}`);
-  console.log(`[BSP]   resolved (real texture) : ${_probeStats.resolved}`);
-  console.log(`[BSP]   fallback (not found)    : ${_probeStats.fallback}`);
-  console.log(`[BSP]   total fetch attempts    : ${_probeStats.requests}`);
-  console.log(`[BSP]   avg ms per texture      : ${avgProbeMs.toFixed(1)} ms`);
-  console.log(`[BSP]   total probe time (hit)  : ${_probeStats.hitMs.toFixed(0)} ms`);
-  console.log(`[BSP]   total probe time (miss) : ${_probeStats.missMs.toFixed(0)} ms`);
-  console.log('[BSP] ════════════════════════════════════════════════════');
-
-  // Background-load remaining textures (non-blocking, swap in as ready).
+  // ── Load remaining textures in the background ─────────────────────────────
   const remainingNames = uniqueNames.slice(initialNames.length);
   if (remainingNames.length > 0) {
     console.log(`[BSP] Background-loading ${remainingNames.length} remaining textures...`);
-    loadTexturesInBatches(remainingNames, texBases, null, pendingSwap).then(() => {
-      const totalProbeMs = (_probeStats.hitMs + _probeStats.missMs).toFixed(0);
-      console.log(`[BSP] ✓ All textures loaded — total probe time: ${totalProbeMs} ms`);
-    }).catch(err => {
+    loadTexturesInBatches(remainingNames, texBases, null, pendingSwap).catch(err => {
       console.warn('[BSP] Background texture load error:', err);
     });
   }
