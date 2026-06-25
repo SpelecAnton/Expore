@@ -60,15 +60,14 @@
 <canvas id="c"></canvas>
 
 <script type="module">
-  import { initEngine }       from 'https://spelecanton.github.io/Expore/javascript/engine.js';
+  import { initEngine }        from 'https://spelecanton.github.io/Expore/javascript/engine.js';
   import { createMultiplayer } from 'https://spelecanton.github.io/Expore/javascript/multiplayer.js';
   import { createChatOverlay } from 'https://spelecanton.github.io/Expore/javascript/chat_overlay.js';
 
   // ── 3D engine ─────────────────────────────────────────────────────────────
-  // await: after this returns, window._scene / _cam / _physics are all set.
   await initEngine({
     canvas:      document.getElementById('c'),
-    mapUrl:      'teaching.bsp',
+    mapUrl:      'teaching.expore',
     textureBase: 'textures/',
 
     fogColor:       0x000000,
@@ -78,6 +77,10 @@
     bloomRadius:    0.4,
     bloomThreshold: 0.2,
     maxPixelRatio:  1.5,
+
+
+    bobStrength: 0.05,
+    bobSpeed: 10,
 
     physicsConfig: {
       MOVE_SPEED:      280 * 0.02,
@@ -105,39 +108,21 @@
   });
 
   // ── Multiplayer ────────────────────────────────────────────────────────────
-  // Broadcasts own position every 150 ms and receives other players on the
-  // same mapName.  Silently does nothing when spelec.cz is unreachable.
-  // mapName is intentionally omitted — multiplayer.js auto-detects it from
-  // window.location.pathname and deliberately ignores the hash (coordinates).
-  // Example: https://spelec.cz/expore/#6.3,1.6,−1.9,−14.6  →  map = "expore"
-  //
-  // Custom player skins (player_skins.txt) are matched by nickname; the
-  // reserved admin name's skin additionally requires the correct admin
-  // password, supplied below via mp.setAdminPass() — see chat_overlay.js's
-  // onAdminPassChange wiring.
   const mp = createMultiplayer(window._scene, {
     playersUrl: 'https://spelec.cz/chat/players.php',
   });
 
   // ── Chat overlay ───────────────────────────────────────────────────────────
-  // Ticker: last 60 s of messages, always visible, non-interactive.
-  // Full panel: [Tab] or click [CHAT] button — shows full history + player strip.
   createChatOverlay({
     apiUrl:    'https://spelec.cz/chat/api.php',
     onlineUrl: 'https://spelec.cz/chat/online.php',
 
-    // Supply live player list so the chat panel shows a teleport strip
     getPlayers: () => mp.getPlayers(),
 
-    // Teleport — uses the Rapier KCC already set up by engine.js
     onTeleport: (x, y, z) => {
       window._physics?.teleport(window._cam, x, y, z);
     },
 
-    // Forward the admin password field straight to multiplayer.js so it can
-    // be included with our own position broadcasts. chat/players.php only
-    // sets is_admin: true when this matches — required for the reserved
-    // name's custom skin to actually render for other players.
     onAdminPassChange: (pass) => {
       mp.setAdminPass(pass);
     },
