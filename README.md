@@ -1,7 +1,6 @@
 # Expore 🚶‍♂️✨ (work in progress)
 
 A 3D walking simulator engine made specifically for people who don't know how to make a game.
-I have no idea how to write javascript so this $hit is 99% vibecode
 
 ---
 
@@ -15,7 +14,7 @@ Expore uses **TrenchBroom** as its level editor. If you don't have it yet, downl
 
 ### 2. Download the Expore Package
 Grab the latest release of the Expore Map Maker package and extract it to your computer.
-* 📦 [Download Latest Release](https://github.com/SpelecAnton/Expore/releases/download/1.4/ExporeMapMaker.zip)
+* 📦 [Download Latest Release](https://github.com/SpelecAnton/Expore/releases/download/1.6/ExporeMapMaker.zip)
 
 ### 3. Follow the Tutorial
 Ready to build? Follow the official step-by-step guide to configure TrenchBroom and start creating your first map:
