@@ -20,7 +20,7 @@ import { EffectComposer } from "https://cdn.jsdelivr.net/npm/three@0.165.0/examp
 import { RenderPass }     from "https://cdn.jsdelivr.net/npm/three@0.165.0/examples/jsm/postprocessing/RenderPass.js";
 import { UnrealBloomPass } from "https://cdn.jsdelivr.net/npm/three@0.165.0/examples/jsm/postprocessing/UnrealBloomPass.js";
 import { ShaderPass }      from "https://cdn.jsdelivr.net/npm/three@0.165.0/examples/jsm/postprocessing/ShaderPass.js";
-import { loadBSP, tickAnimatedTextures, initTexLoader, unmuteVideos, loadTextureFromUrl, setShaderTexSize }
+import { loadBSP, tickAnimatedTextures, initTexLoader, unmuteVideos, loadTextureFromUrl, setShaderTexSize, setShaderConfig }
     from "https://spelecanton.github.io/Expore/javascript/bsp_loader.js";
 import { createPhysics } from "https://spelecanton.github.io/Expore/javascript/physics.js";
 
@@ -334,6 +334,8 @@ export async function initEngine({
     //   1024 = high quality
     //   2048 = very high (use only if few shader textures in the map)
     shaderTexSize = 512,
+    shaderFps = 0,
+    shaderFilter = 1, // 0 = nearest, 1 = bilinear, 2 = bicubic
     // ── Frame rate cap ────────────────────────────────────────────────────
     // targetFps: maximum frames per second to render.
     //   0  = unlimited — renders every requestAnimationFrame tick (default).
@@ -343,6 +345,7 @@ export async function initEngine({
     targetFps = 0,
 }) {
     // Apply shader texture size before BSP load so every .frag face uses it
+    setShaderConfig(shaderFps, shaderFilter);
     setShaderTexSize(shaderTexSize);
 
     // ── Renderer ──────────────────────────────────────────────────────────────
@@ -585,7 +588,7 @@ export async function initEngine({
     });
 
     onReady?.();
-    console.log(`[Engine] bobStrength=${bobStrength}, bobSpeed=${bobSpeed}, shaderTexSize=${shaderTexSize}, targetFps=${targetFps||"unlimited"}`);
+    console.log(`[Engine] bobStrength=${bobStrength}, bobSpeed=${bobSpeed}, shaderTexSize=${shaderTexSize}, shaderFps=${shaderFps||"unlimited"}, shaderFilter=${shaderFilter}, targetFps=${targetFps||"unlimited"}`);
 
     let _bobPhase = 0, _bobFactor = 0;
 
