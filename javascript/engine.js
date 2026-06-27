@@ -713,8 +713,7 @@ export async function initEngine({
         cam.position.y=savedY+bobOffset;
 
         // 8. Render
-        if (sceneReady) composer.render();
-        else            renderer.render(scene, cam);
+        composer.render();
 
         cam.position.y=savedY;
     })();
