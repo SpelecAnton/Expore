@@ -1,5 +1,12 @@
-// engine.js v7.15
+// engine.js v7.16
 // Changelog:
+// v7.16 — MSAA 2x support via WebGLRenderTarget with samples.
+//         New `msaa` parameter (default 2) passed to initEngine.
+//         A WebGLRenderTarget with samples=msaa is created and passed
+//         to EffectComposer so the main scene pass benefits from
+//         hardware multi-sample anti-aliasing before bloom is applied.
+//         Set msaa:0 to disable. Resize handler updated to resize
+//         the MSAA render target alongside the composer.
 // v7.15 — Fix inconsistent bob frequency on slopes and walls.
 //         Root cause: _bobPhase was driven by horizDist*bobSpeed (rad/unit).
 //         On a slope Rapier projects horizontal input onto the slope surface,
@@ -287,6 +294,12 @@ export async function initEngine({
     renderDistance = 180,
     maxPixelRatio  = 1,
     fogColor       = 0,
+    // ── MSAA ───────────────────────────────────────────────────────────────
+    // msaa: WebGL multi-sample count for the main scene render target.
+    //   2 = MSAA 2x (good balance of quality vs. cost).
+    //   4 = MSAA 4x (higher quality, more GPU cost).
+    //   0 = disabled (falls back to antialias:true on the renderer).
+    msaa = 2,
     // ── Camera bob ─────────────────────────────────────────────────────────
     // bobStrength: vertical sine amplitude in world units (0 = disabled).
     //   0.02 = barely noticeable, 0.05 = natural, 0.10 = very pronounced.
@@ -325,7 +338,24 @@ export async function initEngine({
     scene.add(ambient);
 
     // ── Post-processing ───────────────────────────────────────────────────────
-    const composer = new EffectComposer(renderer);
+    // MSAA render target: samples>0 enables hardware multi-sample AA on the
+    // main scene pass before bloom is applied. EffectComposer uses this as
+    // its read buffer so the first RenderPass resolves into it.
+    let msaaTarget = null;
+    if (msaa > 0) {
+        msaaTarget = new THREE.WebGLRenderTarget(
+            window.innerWidth, window.innerHeight,
+            {
+                samples:    msaa,
+                type:       THREE.HalfFloatType,
+                colorSpace: THREE.SRGBColorSpace,
+            }
+        );
+        console.log(`[Engine] MSAA ${msaa}x enabled`);
+    }
+    const composer = msaaTarget
+        ? new EffectComposer(renderer, msaaTarget)
+        : new EffectComposer(renderer);
     composer.addPass(new RenderPass(scene, cam));
     let bloomPass = null;
     if (bloomStrength > 0) {
@@ -518,6 +548,7 @@ export async function initEngine({
             cam.aspect = window.innerWidth / window.innerHeight;
             cam.updateProjectionMatrix();
             renderer.setSize(window.innerWidth, window.innerHeight);
+            if (msaaTarget) msaaTarget.setSize(window.innerWidth, window.innerHeight);
             composer.setSize(window.innerWidth, window.innerHeight);
             if (bloomPass) bloomPass.resolution.set(
                 Math.floor(window.innerWidth  / 2),
