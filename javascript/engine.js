@@ -1,40 +1,21 @@
-// engine.js v7.18
+// engine.js v7.19
 // Changelog:
+// v7.19 — Add shaderTexSize parameter to initEngine().
+//         Calls setShaderTexSize() from bsp_loader.js before BSP load,
+//         so .frag shader canvas textures render at the chosen resolution
+//         (default 512, recommended range 256–2048; power-of-2 only).
+//         Configurable in index.html alongside other engine params.
 // v7.18 — Portal label texture resolution 512×80 → 2048×320 (4× upscale).
-//         Font 30px → 120px, shadowBlur 18 → 72, all canvas coords ×4.
-//         Added auto font-shrink loop for long text (down to 48px).
-//         Enabled generateMipmaps + LinearMipmapLinearFilter on label tex
-//         for crisp rendering at any distance.
-// v7.17 — Fix three camera bob bugs:
-//         1. Jitter: phase was frozen mid-sine during fade-out, so
-//            sin(_bobPhase)*_bobFactor decayed from a non-zero value,
-//            producing a visible snap/jitter at the end. Fix: phase now
-//            always advances toward the nearest zero crossing while
-//            _bobFactor > 0 (not only when < 0.05), driven by bobSpeed.
-//         2. Wall-induced amplitude: fadeRate=20 threshold was
-//            horizDist<0.005, but sliding along a wall keeps horizDist
-//            above that so the fast-fade never triggered. Fix: fadeRate
-//            is now always proportional to horizDist — fast when still,
-//            slow when moving — using a smooth remap.
-//         3. Slope-dependent amplitude: bob was applied as a pitch
-//            (cam.rotation.x) offset. On slopes the camera pitch itself
-//            changes (LOOK_SPEED / RETURN_SPEED), so adding the bob angle
-//            to a tilted pitch produced a different apparent vertical
-//            movement depending on slope angle. Fix: bob is now applied
-//            as a pure Y-position offset (+bobOffset to cam.position.y
-//            during render, removed after), completely independent of
-//            camera orientation. bobStrength unit is now world-units
-//            (same as v7.13 and earlier).
+// v7.17 — Fix three camera bob bugs (Y-offset, fadeRate, phase snap).
 // v7.16 — MSAA 2x support via WebGLRenderTarget with samples.
 // v7.15 — Fix inconsistent bob frequency on slopes and walls.
-// v7.14 — Bob as pitch rotation instead of Y position offset.
 
 import * as THREE from "https://cdn.jsdelivr.net/npm/three@0.165.0/build/three.module.js";
 import { EffectComposer } from "https://cdn.jsdelivr.net/npm/three@0.165.0/examples/jsm/postprocessing/EffectComposer.js";
 import { RenderPass }     from "https://cdn.jsdelivr.net/npm/three@0.165.0/examples/jsm/postprocessing/RenderPass.js";
 import { UnrealBloomPass } from "https://cdn.jsdelivr.net/npm/three@0.165.0/examples/jsm/postprocessing/UnrealBloomPass.js";
 import { ShaderPass }      from "https://cdn.jsdelivr.net/npm/three@0.165.0/examples/jsm/postprocessing/ShaderPass.js";
-import { loadBSP, tickAnimatedTextures, initTexLoader, unmuteVideos, loadTextureFromUrl }
+import { loadBSP, tickAnimatedTextures, initTexLoader, unmuteVideos, loadTextureFromUrl, setShaderTexSize }
     from "https://spelecanton.github.io/Expore/javascript/bsp_loader.js";
 import { createPhysics } from "https://spelecanton.github.io/Expore/javascript/physics.js";
 
@@ -65,16 +46,9 @@ const ColorAdjustShader = {
 
         void main() {
             vec4 tex = texture2D(tDiffuse, vUv);
-            
-            // Apply contrast
             tex.rgb = (tex.rgb - 0.5) * max(contrast, 0.0) + 0.5;
-            
-            // Apply brightness
             tex.rgb += brightness;
-            
-            // Apply RGBA tint
             tex.rgb = mix(tex.rgb, tintColor, tintAlpha);
-            
             gl_FragColor = tex;
         }
     `
@@ -147,9 +121,8 @@ function mapBaseFromUrl(url) {
 
 // ── Portal helpers ────────────────────────────────────────────────────────────
 
-// Label canvas is 2048×320 (4× the old 512×80) so text renders at 120 px on
-// the same 2.8×0.44 world-unit plane — roughly 731 px/unit vs the old 183.
-// generateMipmaps + LinearMipmapLinearFilter keep it sharp at any view distance.
+// Label canvas 2048×320 (4× the old 512×80): ~731 px/world-unit vs old 183.
+// generateMipmaps + LinearMipmapLinearFilter keep it sharp at any distance.
 function buildPortalLabel(text, color, parent) {
     if (!text) return null;
     const W = 2048, H = 320;
@@ -158,7 +131,7 @@ function buildPortalLabel(text, color, parent) {
     const ctx = canvas.getContext("2d");
     ctx.clearRect(0, 0, W, H);
 
-    // Auto-shrink font for long strings (minimum 48 px keeps it legible)
+    // Auto-shrink font for long strings (minimum 48 px stays legible)
     let fontSize = 120;
     ctx.font = `bold ${fontSize}px "Share Tech Mono", monospace`;
     while (ctx.measureText(text.toUpperCase()).width > W - 120 && fontSize > 48) {
@@ -167,17 +140,17 @@ function buildPortalLabel(text, color, parent) {
     }
 
     ctx.shadowColor  = `#${color.getHexString()}`;
-    ctx.shadowBlur   = 72;   // was 18 — scaled 4×
+    ctx.shadowBlur   = 72;
     ctx.fillStyle    = `#${color.getHexString()}`;
     ctx.textAlign    = "center";
     ctx.textBaseline = "middle";
     ctx.fillText(text.toUpperCase(), W / 2, H / 2);
 
     const tex = new THREE.CanvasTexture(canvas);
-    tex.needsUpdate       = true;
-    tex.generateMipmaps   = true;
-    tex.minFilter         = THREE.LinearMipmapLinearFilter;
-    tex.magFilter         = THREE.LinearFilter;
+    tex.needsUpdate     = true;
+    tex.generateMipmaps = true;
+    tex.minFilter       = THREE.LinearMipmapLinearFilter;
+    tex.magFilter       = THREE.LinearFilter;
 
     const mesh = new THREE.Mesh(
         new THREE.PlaneGeometry(2.8, 0.44),
@@ -275,7 +248,7 @@ function addLightSprites(scene, lights) {
         pt.position.set(l.x, l.y, l.z);
         scene.add(pt);
         if (!l.sprite) continue;
-        const mat    = new THREE.SpriteMaterial({
+        const mat = new THREE.SpriteMaterial({
             map: getSpriteTex(l.r, l.g, l.b),
             transparent: true, depthWrite: false,
             blending: THREE.AdditiveBlending, color,
@@ -340,18 +313,26 @@ export async function initEngine({
     // ── Camera bob ─────────────────────────────────────────────────────────
     // bobStrength: vertical sine amplitude in world units (0 = disabled).
     //   0.02 = barely noticeable, 0.05 = natural, 0.10 = very pronounced.
-    //   Applied as a Y-position offset (not pitch), so slope angle has
-    //   zero effect on apparent amplitude.
-    // bobSpeed: phase advance rate in radians per second (rad/s).
-    //   Phase advances only when actually moving (horizDist > 0.001).
+    // bobSpeed: phase advance rate in rad/s.
     //   At MOVE_SPEED 5.6 u/s and bobSpeed 7.0: ~1.1 Hz walking rhythm.
     bobStrength = 0,
     bobSpeed    = 7.0,
-    // ── Color Adjustments ──────────────────────────────────────────────────
+    // ── Color adjustments ──────────────────────────────────────────────────
     brightness  = 0.0,
     contrast    = 1.0,
     tintRgba    = [1, 1, 1, 0], // [r, g, b, alpha]
+    // ── Shader texture resolution ──────────────────────────────────────────
+    // shaderTexSize: canvas pixel size for .frag shader textures on BSP faces.
+    //   Must be power-of-2. Larger = sharper but more GPU memory per texture.
+    //   256  = low  (fast, blurry up close)
+    //   512  = default
+    //   1024 = high quality
+    //   2048 = very high (use only if few shader textures in the map)
+    shaderTexSize = 512,
 }) {
+    // Apply shader texture size before BSP load so every .frag face uses it
+    setShaderTexSize(shaderTexSize);
+
     // ── Renderer ──────────────────────────────────────────────────────────────
     const renderer = new THREE.WebGLRenderer({
         canvas, antialias: true,
@@ -380,18 +361,11 @@ export async function initEngine({
     scene.add(ambient);
 
     // ── Post-processing ───────────────────────────────────────────────────────
-    // MSAA render target: samples>0 enables hardware multi-sample AA on the
-    // main scene pass before bloom is applied. EffectComposer uses this as
-    // its read buffer so the first RenderPass resolves into it.
     let msaaTarget = null;
     if (msaa > 0) {
         msaaTarget = new THREE.WebGLRenderTarget(
             window.innerWidth, window.innerHeight,
-            {
-                samples:    msaa,
-                type:       THREE.HalfFloatType,
-                colorSpace: THREE.SRGBColorSpace,
-            }
+            { samples: msaa, type: THREE.HalfFloatType, colorSpace: THREE.SRGBColorSpace }
         );
         console.log(`[Engine] MSAA ${msaa}x enabled`);
     }
@@ -399,12 +373,12 @@ export async function initEngine({
         ? new EffectComposer(renderer, msaaTarget)
         : new EffectComposer(renderer);
     composer.addPass(new RenderPass(scene, cam));
-    
+
     const colorAdjustPass = new ShaderPass(ColorAdjustShader);
     colorAdjustPass.uniforms["brightness"].value = brightness;
-    colorAdjustPass.uniforms["contrast"].value = contrast;
+    colorAdjustPass.uniforms["contrast"].value   = contrast;
     colorAdjustPass.uniforms["tintColor"].value.set(tintRgba[0], tintRgba[1], tintRgba[2]);
-    colorAdjustPass.uniforms["tintAlpha"].value = tintRgba[3] !== undefined ? tintRgba[3] : 0.0;
+    colorAdjustPass.uniforms["tintAlpha"].value  = tintRgba[3] ?? 0.0;
     composer.addPass(colorAdjustPass);
 
     let bloomPass = null;
@@ -416,18 +390,15 @@ export async function initEngine({
         composer.addPass(bloomPass);
     }
 
-    // ── Scene-ready gate (bloom off until BSP is fully loaded) ───────────────
-    let sceneReady = false;
-
     // ── Portal / mesh lists for raycasting ───────────────────────────────────
     const portals     = [];
-    const solidMeshes = [];   // visible, depthWrite=true → collidable for raycasts
-    const invisMeshes = [];   // invisible clip brushes
+    const solidMeshes = [];
+    const invisMeshes = [];
 
     // ── Background music (start fetching early) ───────────────────────────────
     const bgMusicPromise = findBackgroundMusic(mapBaseFromUrl(mapUrl));
 
-    // ── Yaw (shared between spawn, physics loop, and hash writes) ────────────
+    // ── Yaw ───────────────────────────────────────────────────────────────────
     let yaw = 0;
 
     // ── Load BSP ──────────────────────────────────────────────────────────────
@@ -439,13 +410,12 @@ export async function initEngine({
             onProgress,
         });
 
-        if (bsp.ambientColor    !== undefined) ambient.color.set(bsp.ambientColor);
+        if (bsp.ambientColor     !== undefined) ambient.color.set(bsp.ambientColor);
         if (bsp.ambientIntensity !== undefined) ambient.intensity = bsp.ambientIntensity;
 
         for (const portal of bsp.portals) buildPortal(portal, scene, portals);
         addLightSprites(scene, bsp.lights ?? []);
 
-        // Spawn position
         const hash = readHashState();
         if (hash) {
             cam.position.set(hash.x, hash.y, hash.z);
@@ -456,17 +426,15 @@ export async function initEngine({
             yaw = ps.angle * Math.PI / 180;
         }
 
-        // Collect meshes for portal occlusion raycasting
         const portalMeshSet = new Set(portals.map(p => p.mesh));
         scene.traverse(obj => {
             if (!obj.isMesh || !obj.geometry) return;
             if (portalMeshSet.has(obj)) return;
-            if (obj.userData.invisible)            invisMeshes.push(obj);
-            else if (obj.material?.depthWrite !== false) solidMeshes.push(obj);
+            if (obj.userData.invisible)                    invisMeshes.push(obj);
+            else if (obj.material?.depthWrite !== false)   solidMeshes.push(obj);
         });
 
         setTimeout(() => {
-            sceneReady = true;
             console.log("[Engine] Scene ready — full render pipeline active");
         }, 500);
 
@@ -476,10 +444,9 @@ export async function initEngine({
         ambient.intensity = 3;
         scene.traverse(obj => {
             if (!obj.isMesh || !obj.geometry) return;
-            if (obj.userData.invisible)            invisMeshes.push(obj);
-            else if (obj.material?.depthWrite !== false) solidMeshes.push(obj);
+            if (obj.userData.invisible)                    invisMeshes.push(obj);
+            else if (obj.material?.depthWrite !== false)   solidMeshes.push(obj);
         });
-        sceneReady = true;
     }
 
     // ── Physics ───────────────────────────────────────────────────────────────
@@ -490,8 +457,8 @@ export async function initEngine({
     window._scene   = scene;
 
     // ── Background music ──────────────────────────────────────────────────────
-    const bgMusic  = await bgMusicPromise;
-    let bgStarted  = false;
+    const bgMusic = await bgMusicPromise;
+    let bgStarted = false;
     function startBgMusic() {
         if (!bgStarted && bgMusic) {
             bgStarted = true;
@@ -500,11 +467,11 @@ export async function initEngine({
     }
 
     // ── Portal hover raycasting ───────────────────────────────────────────────
-    let _lastPortal    = null;
-    let _rayFrame      = 0;
-    const _centerUV    = new THREE.Vector2(0, 0);
-    const _fwdRay      = new THREE.Raycaster;
-    const _occRay      = new THREE.Raycaster;
+    let _lastPortal     = null;
+    let _rayFrame       = 0;
+    const _centerUV     = new THREE.Vector2(0, 0);
+    const _fwdRay       = new THREE.Raycaster;
+    const _occRay       = new THREE.Raycaster;
     const _portalMeshes = portals.map(p => p.mesh);
 
     function getHoveredPortal() {
@@ -538,7 +505,6 @@ export async function initEngine({
         unmuteVideos();
         document.querySelectorAll("video[data-spelec-bsp-video]").forEach(v => v.play().catch(() => {}));
 
-        // Debug: F = ground probe
         if (e.key.toLowerCase() === "f") {
             const pos = cam.position;
             console.log("=== GROUND DEBUG ===");
@@ -561,7 +527,6 @@ export async function initEngine({
             }
             console.log("====================");
         }
-        // Debug: P = renderer stats
         if (e.key.toLowerCase() === "p") {
             const info = renderer.info;
             console.log("=== RENDERER STATS ===");
@@ -608,16 +573,14 @@ export async function initEngine({
     });
 
     onReady?.();
+    console.log(`[Engine] bobStrength=${bobStrength}, bobSpeed=${bobSpeed}, shaderTexSize=${shaderTexSize}`);
 
-    // Debug: log received bobStrength so we can verify the parameter arrived.
-    console.log(`[Engine] bobStrength=${bobStrength}, bobSpeed=${bobSpeed}`);
-
-    let _bobPhase=0,_bobFactor=0;
+    let _bobPhase = 0, _bobFactor = 0;
 
     // ── Render loop ───────────────────────────────────────────────────────────
-    const clock   = new THREE.Clock;
-    let frameN    = 0;
-    let lastHash  = 0;
+    const clock  = new THREE.Clock;
+    let frameN   = 0;
+    let lastHash = 0;
 
     (function loop() {
         requestAnimationFrame(loop);
@@ -626,70 +589,41 @@ export async function initEngine({
         let dt = clock.getDelta();
         if (dt > 0.1) dt = 0.1;
 
-        // 1. Save camera XZ before physics so we can measure actual movement
-        const prevX=cam.position.x,prevZ=cam.position.z;
-
-        // 2. Physics — moves cam.position based on Rapier KCC
+        const prevX = cam.position.x, prevZ = cam.position.z;
         yaw = physics.update(cam, keys, yaw, dt);
 
-        // Actual horizontal distance traveled this frame.
-        // This is the ground truth for bob activation and phase advance:
-        //   • Against a wall: displacement ≈ 0 → bob stops
-        //   • On a steep slope: horizontal component is smaller → bob slows
-        const dx=cam.position.x-prevX,dz=cam.position.z-prevZ;
-        const horizDist=Math.sqrt(dx*dx+dz*dz);
+        const dx = cam.position.x - prevX, dz = cam.position.z - prevZ;
+        const horizDist = Math.sqrt(dx*dx + dz*dz);
 
-        // 3. Animated textures every 3rd frame
         if (frameN % 3 === 0) tickAnimatedTextures();
 
-        // 4. Portal opacity
         for (const p of portals) p.mesh.material.opacity = p.opacity;
 
-        // 5. Hash save every 3 s — uses raw physics Y, not bobbed Y
         const now = performance.now();
         if (now - lastHash >= 3000) {
             lastHash = now;
             writeHashState(cam.position.x, cam.position.y, cam.position.z, yaw);
         }
 
-        // 6. Portal hover cursor — uses raw physics cam position
         canvas.style.cursor = getHoveredPortal() ? "pointer" : "default";
 
-        // 7. Camera bob — pure Y-position offset, independent of camera pitch.
-        //
-        // Design rationale (v7.17):
-        //   • Y-offset (not pitch): slope angle and LOOK_SPEED pitch changes
-        //     have zero effect on apparent bob amplitude.
-        //   • fadeRate scales with horizDist: near zero movement (wall press,
-        //     stopped) the factor fades out quickly (rate→20); while moving
-        //     normally it fades in/out at rate 8. This prevents wall-induced
-        //     amplitude increase without a hard threshold.
-        //   • Phase always advances toward the nearest zero crossing when
-        //     not active (bobActive=false) at rate bobSpeed. This guarantees
-        //     the bob value sin(_bobPhase)*_bobFactor decays smoothly through
-        //     zero with no mid-sine jitter or sudden snap.
-        const isWalkKey=keys.w||keys.s||keys.a||keys.d||keys.arrowup||keys.arrowdown||keys.arrowleft||keys.arrowright;
-        const onGround = physics.isOnGround;
-        // bobActive: requires isOnGround (physics.js v1.3 fixes computedGrounded
-        // flickering), isWalkKey, and actual horizontal displacement.
-        const bobActive=bobStrength>0&&onGround&&isWalkKey&&horizDist>0.001;
-        // fadeRate: maps horizDist 0→0.001 to rate 20→8 smoothly.
-        const fadeRate=bobActive?8:20;
-        _bobFactor+=((bobActive?1:0)-_bobFactor)*(1-Math.exp(-dt*fadeRate));
-        if(bobActive){
-            _bobPhase+=dt*bobSpeed;
+        // Camera bob — pure Y-position offset, independent of camera pitch.
+        const isWalkKey = keys.w||keys.s||keys.a||keys.d||keys.arrowup||keys.arrowdown||keys.arrowleft||keys.arrowright;
+        const onGround  = physics.isOnGround;
+        const bobActive = bobStrength > 0 && onGround && isWalkKey && horizDist > 0.001;
+        const fadeRate  = bobActive ? 8 : 20;
+        _bobFactor += ((bobActive ? 1 : 0) - _bobFactor) * (1 - Math.exp(-dt * fadeRate));
+        if (bobActive) {
+            _bobPhase += dt * bobSpeed;
         } else {
-            // Advance phase toward the nearest N*PI zero crossing so the
-            // bob damps to exactly 0, not to an arbitrary sine value.
-            const target=Math.round(_bobPhase/Math.PI)*Math.PI;
-            const diff=target-_bobPhase;
-            const step=dt*bobSpeed;
-            _bobPhase+=Math.abs(diff)<=step?diff:Math.sign(diff)*step;
+            const target = Math.round(_bobPhase / Math.PI) * Math.PI;
+            const diff   = target - _bobPhase;
+            const step   = dt * bobSpeed;
+            _bobPhase   += Math.abs(diff) <= step ? diff : Math.sign(diff) * step;
         }
-        const bobOffset=Math.sin(_bobPhase)*bobStrength*_bobFactor;
+        const bobOffset = Math.sin(_bobPhase) * bobStrength * _bobFactor;
 
-        // Live diagnostics — inspect via window._bobDebug in the browser console.
-        window._bobDebug={
+        window._bobDebug = {
             bobStrength, bobSpeed, bobActive, onGround, isWalkKey,
             horizDist: +horizDist.toFixed(5),
             factor:    +_bobFactor.toFixed(4),
@@ -697,14 +631,9 @@ export async function initEngine({
             offset:    +bobOffset.toFixed(6),
         };
 
-        // Apply bob as Y-position offset — save physics Y, shift cam up/down,
-        // render, restore. Rapier and hash saves never see the offset.
-        const savedY=cam.position.y;
-        cam.position.y=savedY+bobOffset;
-
-        // 8. Render
+        const savedY = cam.position.y;
+        cam.position.y = savedY + bobOffset;
         composer.render();
-
-        cam.position.y=savedY;
+        cam.position.y = savedY;
     })();
 }
