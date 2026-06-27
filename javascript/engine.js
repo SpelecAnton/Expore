@@ -1,1 +1,596 @@
-import*as THREE from"https://cdn.jsdelivr.net/npm/three@0.165.0/build/three.module.js";import{EffectComposer}from"https://cdn.jsdelivr.net/npm/three@0.165.0/examples/jsm/postprocessing/EffectComposer.js";import{RenderPass}from"https://cdn.jsdelivr.net/npm/three@0.165.0/examples/jsm/postprocessing/RenderPass.js";import{UnrealBloomPass}from"https://cdn.jsdelivr.net/npm/three@0.165.0/examples/jsm/postprocessing/UnrealBloomPass.js";import{loadBSP,tickAnimatedTextures,initTexLoader,unmuteVideos,loadTextureFromUrl}from"https://spelecanton.github.io/Expore/javascript/bsp_loader.js";import{createPhysics}from"https://spelecanton.github.io/Expore/javascript/physics.js";const PLAYER_HEIGHT=80,FOV=90,UNIT=.02;function readHashState(){const e=window.location.hash.slice(1);if(!e)return null;const t=e.split(",").map(Number);return t.length<4||t.some(isNaN)?null:{x:t[0],y:t[1],z:t[2],yaw:t[3]}}function writeHashState(e,t,o,n){const i=e=>Math.round(1e3*e)/1e3;history.replaceState(null,"",`#${i(e)},${i(t)},${i(o)},${i(n)}`)}const AUDIO_EXTS=new Set([".mp3",".ogg",".wav",".flac",".aac"]);function isAudioUrl(e){try{const t=new URL(e,location.href).pathname;return AUDIO_EXTS.has(t.substring(t.lastIndexOf(".")).toLowerCase())}catch{return!1}}let _activePortalAudio=null;function playPortalAudio(e){const t=new URL(e,location.href).href;if(_activePortalAudio&&_activePortalAudio.src===t)return void(_activePortalAudio.paused?_activePortalAudio.play():_activePortalAudio.pause());_activePortalAudio&&(_activePortalAudio.pause(),_activePortalAudio=null);const o=new Audio(t);o.play().catch(e=>console.warn("[Engine] Portal audio play failed:",e)),_activePortalAudio=o}const BG_CANDIDATES=["background.mp3","background.ogg","background.wav"];async function findBackgroundMusic(e){const t=(await Promise.all(BG_CANDIDATES.map(async t=>{const o=e+t;try{return(await fetch(o,{method:"HEAD"})).ok?o:null}catch{return null}}))).find(Boolean);if(!t)return console.log("[Engine] No background music found."),null;console.log(`[Engine] Background music: ${t}`);const o=new Audio(t);return o.loop=!0,o.volume=.5,o}function mapBaseFromUrl(e){try{const t=new URL(e,location.href).href;return t.substring(0,t.lastIndexOf("/")+1)}catch{return"./"}}function buildPortalLabel(e,t,o){if(!e)return null;const n=document.createElement("canvas");n.width=512,n.height=80;const i=n.getContext("2d");i.clearRect(0,0,512,80),i.shadowColor=`#${t.getHexString()}`,i.shadowBlur=18,i.font='bold 30px "Share Tech Mono", monospace',i.fillStyle=`#${t.getHexString()}`,i.textAlign="center",i.textBaseline="middle",i.fillText(e.toUpperCase(),256,40);const a=new THREE.CanvasTexture(n);a.needsUpdate=!0;const r=new THREE.Mesh(new THREE.PlaneGeometry(2.8,.44),new THREE.MeshBasicMaterial({map:a,transparent:!0,depthWrite:!1,side:THREE.DoubleSide}));return r.position.set(0,0,.02),o.add(r),r}const PORTAL_MEDIA_RE=/\.(jpe?g|png|gif|webp|avif|mp4|webm|frag)(?:[?#].*)?$/i;function isPortalMediaLabel(e){return!!e&&PORTAL_MEDIA_RE.test(e.trim())}function applyPortalMediaTexture(e,t){loadTextureFromUrl(e).then(o=>{if(!o)return void console.warn("[Engine] Portal media texture failed to load:",e);const n=t.material;n.map=o,n.color.set(16777215),n.needsUpdate=!0})}function buildPortal(e,t,o){const[n,i,a]=(e.origin||"0 0 0").split(" ").map(Number),r=e.target_url||"#",s=(e.label||"").trim(),l=(new THREE.Color).setHex(parseInt((e.color||"0xff2200").replace("#",""),16)),c=parseFloat(e.angle||"0")*Math.PI/180,d=e.size||"110",p=.02*parseFloat(e.width||d),u=.02*parseFloat(e.height||d),h=Math.max(0,Math.min(1,parseFloat(e.opacity??"0.78"))),m=.02*n,w=.02*a,E=.02*-i,g=new THREE.PlaneGeometry(p,u),f=new THREE.Mesh(g,new THREE.MeshBasicMaterial({color:l,transparent:!0,opacity:h,side:THREE.DoubleSide,depthWrite:!1}));f.position.set(m,w,E),f.rotation.y=c,t.add(f),f.add(new THREE.LineSegments(new THREE.EdgesGeometry(g),new THREE.LineBasicMaterial({color:l,opacity:h,transparent:!0})));const T=isPortalMediaLabel(s);T?applyPortalMediaTexture(s,f):buildPortalLabel(s,l,f),o.push({x:m,y:w,z:E,url:r,label:s,col:l,mesh:f,opacity:h,isMedia:T})}function makeSpriteTexture(e,t,o){const n=document.createElement("canvas");n.width=n.height=128;const i=n.getContext("2d"),a=i.createRadialGradient(64,64,0,64,64,64),r=`${Math.round(255*e)},${Math.round(255*t)},${Math.round(255*o)}`;a.addColorStop(0,`rgba(${r},0.9)`),a.addColorStop(.25,`rgba(${r},0.5)`),a.addColorStop(.6,`rgba(${r},0.12)`),a.addColorStop(1,`rgba(${r},0)`),i.fillStyle=a,i.fillRect(0,0,128,128);const s=i.createRadialGradient(64,64,0,64,64,15.36);s.addColorStop(0,"#ffffff"),s.addColorStop(.5,`rgba(${r},0.9)`),s.addColorStop(1,`rgba(${r},0)`),i.fillStyle=s,i.fillRect(0,0,128,128);const l=new THREE.CanvasTexture(n);return l.colorSpace=THREE.SRGBColorSpace,l.needsUpdate=!0,l}const _spriteTexCache=new Map;function getSpriteTex(e,t,o){const n=`${15*e|0}:${15*t|0}:${15*o|0}`;return _spriteTexCache.has(n)||_spriteTexCache.set(n,makeSpriteTexture(e,t,o)),_spriteTexCache.get(n)}function addLightSprites(e,t){if(!t?.length)return;let o=0;for(const n of t){const t=new THREE.Color(n.r,n.g,n.b),i=Math.min(20,Math.max(2,.05*n.intensity)),a=Math.min(5,Math.max(.2,.015*n.intensity)),r=new THREE.PointLight(t,a,i);if(r.position.set(n.x,n.y,n.z),e.add(r),!n.sprite)continue;const s=new THREE.SpriteMaterial({map:getSpriteTex(n.r,n.g,n.b),transparent:!0,depthWrite:!1,blending:THREE.AdditiveBlending,color:t}),l=new THREE.Sprite(s);l.position.set(n.x,n.y,n.z),l.scale.setScalar(.5),l.userData.noclip=!0,e.add(l),o++}console.log(`[Engine] Lights: ${t.length} total, ${o} with sprite`)}function _fallbackRoom(e){const t=new THREE.MeshLambertMaterial({color:1710638}),o=new THREE.MeshLambertMaterial({color:1447454}),n=new THREE.MeshLambertMaterial({color:657946}),i=new THREE.Mesh(new THREE.PlaneGeometry(20,20),t);i.rotation.x=-Math.PI/2,e.add(i);const a=new THREE.Mesh(new THREE.PlaneGeometry(20,20),o);a.rotation.x=Math.PI/2,a.position.y=5,e.add(a);for(const[t,o,i,a]of[[-10,2.5,0,0],[10,2.5,0,Math.PI],[0,2.5,-10,Math.PI/2],[0,2.5,10,-Math.PI/2]]){const r=new THREE.Mesh(new THREE.PlaneGeometry(20,5),n);r.position.set(t,o,i),r.rotation.y=a,e.add(r)}e.add(new THREE.AmbientLight(3359846,3))}export async function initEngine({canvas:e,mapUrl:t="map.bsp",textureBase:o="textures/",mapName:n="MAP",onReady:i=null,onProgress:a=null,physicsConfig:r={},bloomStrength:s=.4,bloomRadius:l=.4,bloomThreshold:c=.2,renderDistance:d=180,maxPixelRatio:p=1,fogColor:u=0,bobStrength:h=0,bobSpeed:m=2}){const w=new THREE.WebGLRenderer({canvas:e,antialias:!0,powerPreference:"high-performance",logarithmicDepthBuffer:!1});w.setPixelRatio(Math.min(window.devicePixelRatio,p)),w.setSize(window.innerWidth,window.innerHeight),w.toneMapping=THREE.ACESFilmicToneMapping,w.toneMappingExposure=2,window._rendererInfo=w.info,initTexLoader(w);const E=new THREE.Scene,g=new THREE.Color(u).convertSRGBToLinear();E.fog=new THREE.Fog(g,.2*d,d),E.background=new THREE.Color(g);const f=new THREE.PerspectiveCamera(90,window.innerWidth/window.innerHeight,.01,d);f.position.set(0,1.6,0);const T=new THREE.AmbientLight(16777215,1);E.add(T);const x=new EffectComposer(w);x.addPass(new RenderPass(E,f));let y=null;s>0&&(y=new UnrealBloomPass(new THREE.Vector2(Math.floor(window.innerWidth/2),Math.floor(window.innerHeight/2)),s,l,c),x.addPass(y));let R=!1;const b=[],H=[],P=[],M=findBackgroundMusic(mapBaseFromUrl(t));let S=0;try{const e=await loadBSP({url:t,scene:E,textureBase:o,fallbackTexBase:"/expore/textures/",onProgress:a});void 0!==e.ambientColor&&T.color.set(e.ambientColor),void 0!==e.ambientIntensity&&(T.intensity=e.ambientIntensity);for(const t of e.portals)buildPortal(t,E,b);addLightSprites(E,e.lights??[]);const n=readHashState();if(n)f.position.set(n.x,n.y,n.z),S=n.yaw;else if(e.playerStart){const t=e.playerStart;f.position.set(t.x,t.y+1.6,t.z),S=t.angle*Math.PI/180}const i=new Set(b.map(e=>e.mesh));E.traverse(e=>{e.isMesh&&e.geometry&&(i.has(e)||(e.userData.invisible?P.push(e):!1!==e.material?.depthWrite&&H.push(e)))}),setTimeout(()=>{R=!0,console.log("[Engine] Scene ready — full render pipeline active")},500)}catch(e){console.error("[Engine] BSP load failed:",e),_fallbackRoom(E),T.intensity=3,E.traverse(e=>{e.isMesh&&e.geometry&&(e.userData.invisible?P.push(e):!1!==e.material?.depthWrite&&H.push(e))}),R=!0}const v=createPhysics(E,r);v.refreshCollidables(),window._cam=f,window._physics=v,window._scene=E;const C=await M;let A=!1;function $(){!A&&C&&(A=!0,C.play().catch(e=>console.warn("[Engine] BG music failed:",e)))}let L=null,_=0;const B=new THREE.Vector2(0,0),j=new THREE.Raycaster,k=new THREE.Raycaster,F=b.map(e=>e.mesh);function D(){if(!F.length)return null;if(++_%4!=0)return L;j.setFromCamera(B,f);const e=j.intersectObjects(F,!1);if(!e.length)return L=null;const t=e[0].distance;k.ray.copy(j.ray),k.near=j.near,k.far=t-.05;const o=k.intersectObjects(H,!1).length>0||P.length&&k.intersectObjects(P,!1).length>0;return L=o?null:b.find(t=>t.mesh===e[0].object)??null}const I={};window.addEventListener("mousemove",e=>{B.x=e.clientX/window.innerWidth*2-1,B.y=-e.clientY/window.innerHeight*2+1}),window.addEventListener("keydown",e=>{if(I[e.key.toLowerCase()]=!0," "===e.key&&e.preventDefault(),$(),unmuteVideos(),document.querySelectorAll("video[data-spelec-bsp-video]").forEach(e=>e.play().catch(()=>{})),"f"===e.key.toLowerCase()){const e=f.position;console.log("=== GROUND DEBUG ==="),console.log("Camera pos:",`(${e.x.toFixed(4)}, ${e.y.toFixed(4)}, ${e.z.toFixed(4)})`);const t=new THREE.Raycaster;t.firstHitOnly=!0;const o=H.filter(e=>!e.userData.noclip);for(const[n,i]of[[0,0],[.2,0],[-.2,0],[0,.2],[0,-.2]]){t.set(new THREE.Vector3(e.x+n,e.y+.25,e.z+i),new THREE.Vector3(0,-1,0)),t.far=5;const a=t.intersectObjects(o,!1);if(a.length){const e=a[0],t=e.face?.normal?.clone().transformDirection(e.object.matrixWorld);console.log(`  [${n.toFixed(1)},${i.toFixed(1)}]`,"dist="+e.distance.toFixed(3),"hitY="+e.point.y.toFixed(3),"n="+(t?`(${t.x.toFixed(2)},${t.y.toFixed(2)},${t.z.toFixed(2)})`:"N/A"),e.object.name||e.object.uuid.slice(0,8))}else console.log(`  [${n.toFixed(1)},${i.toFixed(1)}] NO HIT`)}console.log("====================")}if("p"===e.key.toLowerCase()){const e=w.info;console.log("=== RENDERER STATS ==="),console.log(`Draw calls:  ${e.render.calls}`),console.log(`Triangles:   ${e.render.triangles}`),console.log(`Geometries:  ${e.memory.geometries}`),console.log(`Textures:    ${e.memory.textures}`),console.log(`Programs:    ${e.programs?.length??"N/A"}`),console.log("======================")}},{passive:!0}),window.addEventListener("keyup",e=>{I[e.key.toLowerCase()]=!1}),window.addEventListener("click",()=>{$(),unmuteVideos();const e=D();e&&(isAudioUrl(e.url)?playPortalAudio(e.url):(document.getElementById("fade")?.classList.add("out"),setTimeout(()=>{window.location.href=e.url},350)))});let U=null;window.addEventListener("resize",()=>{clearTimeout(U),U=setTimeout(()=>{f.aspect=window.innerWidth/window.innerHeight,f.updateProjectionMatrix(),w.setSize(window.innerWidth,window.innerHeight),x.setSize(window.innerWidth,window.innerHeight),y&&y.resolution.set(Math.floor(window.innerWidth/2),Math.floor(window.innerHeight/2))},150)}),i?.();let G=0,z=0;const O=new THREE.Clock;let W=0,N=0;!function t(){requestAnimationFrame(t),W++;let o=O.getDelta();o>.1&&(o=.1);const n=f.position.x,i=f.position.z;S=v.update(f,I,S,o);const a=f.position.x-n,r=f.position.z-i,s=Math.sqrt(a*a+r*r);W%3==0&&tickAnimatedTextures();for(const e of b)e.mesh.material.opacity=e.opacity;const l=performance.now();l-N>=3e3&&(N=l,writeHashState(f.position.x,f.position.y,f.position.z,S)),e.style.cursor=D()?"pointer":"default";const c=h>0&&v.isOnGround&&s>1e-4,d=s<.005?20:8;z+=((c?1:0)-z)*(1-Math.exp(-o*d)),c&&(G+=s*m);const p=Math.sin(G)*h*z,u=f.rotation.x;f.rotation.x=u+p,R?x.render():w.render(E,f),f.rotation.x=u}()}
+// engine.js v7.15
+// Changelog:
+// v7.15 — Fix inconsistent bob frequency on slopes and walls.
+//         Root cause: _bobPhase was driven by horizDist*bobSpeed (rad/unit).
+//         On a slope Rapier projects horizontal input onto the slope surface,
+//         changing the per-frame horizDist vs flat ground → different frequency.
+//         Fix: phase now advances by dt*bobSpeed (rad/s) — consistent rate
+//         everywhere. _bobFactor is still gated by horizDist>0.001, so
+//         pressing into a wall (horizDist≈0) fades the bob out correctly.
+//         When _bobFactor falls below 0.05 the phase snaps to the nearest
+//         zero crossing so the bob always fades in from silence, not mid-peak.
+//         bobSpeed unit changed back to rad/s; update index.html.
+// v7.14 — Bob as pitch rotation instead of Y position offset.
+//         Root cause: position-lerp _renderY lags behind physicsY when
+//         climbing → camera rendered lower than physics → floor appears
+//         closer → bob looks bigger. Descending: opposite lag, floor farther,
+//         bob looks smaller.
+//         Fix: replace position-lerp with a VELOCITY-FOLLOWING smoother.
+//         Instead of lerping _renderY toward physicsY (which lags on any
+//         sustained vertical movement), we smooth the Y *velocity* each frame
+//         and integrate it into _renderY. DC component (slope trend) passes
+//         through immediately with zero lag; high-frequency step-snap noise
+//         is attenuated ~77 % at 10 Hz and ~92 % at 30 Hz. A very slow drift
+//         correction (K=2, τ≈500 ms) prevents long-term numerical divergence
+//         without introducing any perceptible position lag.
+// v7.11 — Frame-rate independent bob: lerp factors use 1-exp(-dt*K).
+// v7.10 — Fix: camera bob appeared larger on slopes (added _renderY filter).
+// v7.9  — Bob phase driven by actual horizontal displacement instead of time.
+// v7.8  — Camera bob while walking on ground.
+// v7.7  — (previous version)
+//         on slopes or alongside walls. Root cause: Rapier's step-snapping
+//         and ground-snap produce per-frame Y noise that adds to the sine
+//         offset, making the apparent amplitude larger than bobStrength.
+//         Fix: render uses a low-pass-filtered _renderY (smoothing constant
+//         25) instead of raw physicsY, which kills high-frequency Y jitter
+//         while still tracking real terrain changes within ~130 ms.
+//         Also: bobFactor fades out 2.5× faster when the player is truly
+//         not moving (horizDist < 0.005), preventing the sine wave from
+//         lingering at its peak after the player hits a wall.
+//         Raw physicsY is fully restored after render — Rapier never sees
+//         any of the visual smoothing or bob offset.
+// v7.9 — Bob phase driven by actual horizontal displacement instead of time.
+// v7.8 — Camera bob while walking on ground.
+// v7.7 — (previous version)
+
+import * as THREE from "https://cdn.jsdelivr.net/npm/three@0.165.0/build/three.module.js";
+import { EffectComposer } from "https://cdn.jsdelivr.net/npm/three@0.165.0/examples/jsm/postprocessing/EffectComposer.js";
+import { RenderPass }     from "https://cdn.jsdelivr.net/npm/three@0.165.0/examples/jsm/postprocessing/RenderPass.js";
+import { UnrealBloomPass } from "https://cdn.jsdelivr.net/npm/three@0.165.0/examples/jsm/postprocessing/UnrealBloomPass.js";
+import { loadBSP, tickAnimatedTextures, initTexLoader, unmuteVideos, loadTextureFromUrl }
+    from "https://spelecanton.github.io/Expore/javascript/bsp_loader.js";
+import { createPhysics } from "https://spelecanton.github.io/Expore/javascript/physics.js";
+
+const PLAYER_HEIGHT = 80, FOV = 90, UNIT = 0.02;
+
+// ── URL hash helpers ──────────────────────────────────────────────────────────
+
+function readHashState() {
+    const s = window.location.hash.slice(1);
+    if (!s) return null;
+    const parts = s.split(",").map(Number);
+    return parts.length < 4 || parts.some(isNaN) ? null
+        : { x: parts[0], y: parts[1], z: parts[2], yaw: parts[3] };
+}
+
+function writeHashState(x, y, z, yaw) {
+    const f = v => Math.round(v * 1000) / 1000;
+    history.replaceState(null, "", `#${f(x)},${f(y)},${f(z)},${f(yaw)}`);
+}
+
+// ── Audio helpers ─────────────────────────────────────────────────────────────
+
+const AUDIO_EXTS = new Set([".mp3", ".ogg", ".wav", ".flac", ".aac"]);
+
+function isAudioUrl(url) {
+    try {
+        const p = new URL(url, location.href).pathname;
+        return AUDIO_EXTS.has(p.substring(p.lastIndexOf(".")).toLowerCase());
+    } catch { return false; }
+}
+
+let _activePortalAudio = null;
+
+function playPortalAudio(url) {
+    const href = new URL(url, location.href).href;
+    if (_activePortalAudio && _activePortalAudio.src === href) {
+        _activePortalAudio.paused ? _activePortalAudio.play() : _activePortalAudio.pause();
+        return;
+    }
+    if (_activePortalAudio) { _activePortalAudio.pause(); _activePortalAudio = null; }
+    const a = new Audio(href);
+    a.play().catch(e => console.warn("[Engine] Portal audio play failed:", e));
+    _activePortalAudio = a;
+}
+
+// ── Background music ──────────────────────────────────────────────────────────
+
+const BG_CANDIDATES = ["background.mp3", "background.ogg", "background.wav"];
+
+async function findBackgroundMusic(base) {
+    const found = (await Promise.all(BG_CANDIDATES.map(async name => {
+        const url = base + name;
+        try { return (await fetch(url, { method: "HEAD" })).ok ? url : null; }
+        catch { return null; }
+    }))).find(Boolean);
+    if (!found) { console.log("[Engine] No background music found."); return null; }
+    console.log(`[Engine] Background music: ${found}`);
+    const a = new Audio(found);
+    a.loop = true;
+    a.volume = 0.5;
+    return a;
+}
+
+function mapBaseFromUrl(url) {
+    try {
+        const href = new URL(url, location.href).href;
+        return href.substring(0, href.lastIndexOf("/") + 1);
+    } catch { return "./"; }
+}
+
+// ── Portal helpers ────────────────────────────────────────────────────────────
+
+function buildPortalLabel(text, color, parent) {
+    if (!text) return null;
+    const canvas = document.createElement("canvas");
+    canvas.width = 512; canvas.height = 80;
+    const ctx = canvas.getContext("2d");
+    ctx.clearRect(0, 0, 512, 80);
+    ctx.shadowColor  = `#${color.getHexString()}`;
+    ctx.shadowBlur   = 18;
+    ctx.font         = 'bold 30px "Share Tech Mono", monospace';
+    ctx.fillStyle    = `#${color.getHexString()}`;
+    ctx.textAlign    = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText(text.toUpperCase(), 256, 40);
+    const tex = new THREE.CanvasTexture(canvas);
+    tex.needsUpdate = true;
+    const mesh = new THREE.Mesh(
+        new THREE.PlaneGeometry(2.8, 0.44),
+        new THREE.MeshBasicMaterial({ map: tex, transparent: true, depthWrite: false, side: THREE.DoubleSide })
+    );
+    mesh.position.set(0, 0, 0.02);
+    parent.add(mesh);
+    return mesh;
+}
+
+const PORTAL_MEDIA_RE = /\.(jpe?g|png|gif|webp|avif|mp4|webm|frag)(?:[?#].*)?$/i;
+
+function isPortalMediaLabel(s) {
+    return !!s && PORTAL_MEDIA_RE.test(s.trim());
+}
+
+function applyPortalMediaTexture(url, mesh) {
+    loadTextureFromUrl(url).then(tex => {
+        if (!tex) { console.warn("[Engine] Portal media texture failed to load:", url); return; }
+        const mat = mesh.material;
+        mat.map = tex;
+        mat.color.set(0xffffff);
+        mat.needsUpdate = true;
+    });
+}
+
+function buildPortal(entity, scene, portals) {
+    const [ox, oy, oz] = (entity.origin || "0 0 0").split(" ").map(Number);
+    const url          = entity.target_url || "#";
+    const label        = (entity.label || "").trim();
+    const color        = new THREE.Color().setHex(parseInt((entity.color || "0xff2200").replace("#", ""), 16));
+    const angle        = parseFloat(entity.angle  || "0") * Math.PI / 180;
+    const szDefault    = entity.size || "110";
+    const w            = 0.02 * parseFloat(entity.width  || szDefault);
+    const h            = 0.02 * parseFloat(entity.height || szDefault);
+    const opacity      = Math.max(0, Math.min(1, parseFloat(entity.opacity ?? "0.78")));
+    const px = 0.02 * ox, py = 0.02 * oz, pz = 0.02 * -oy;
+
+    const geo  = new THREE.PlaneGeometry(w, h);
+    const mesh = new THREE.Mesh(geo, new THREE.MeshBasicMaterial({
+        color, transparent: true, opacity, side: THREE.DoubleSide, depthWrite: false,
+    }));
+    mesh.position.set(px, py, pz);
+    mesh.rotation.y = angle;
+    scene.add(mesh);
+    mesh.add(new THREE.LineSegments(
+        new THREE.EdgesGeometry(geo),
+        new THREE.LineBasicMaterial({ color, opacity, transparent: true })
+    ));
+
+    const isMedia = isPortalMediaLabel(label);
+    isMedia ? applyPortalMediaTexture(label, mesh) : buildPortalLabel(label, color, mesh);
+    portals.push({ x: px, y: py, z: pz, url, label, col: color, mesh, opacity, isMedia });
+}
+
+// ── Light sprites ─────────────────────────────────────────────────────────────
+
+function makeSpriteTexture(r, g, b) {
+    const canvas = document.createElement("canvas");
+    canvas.width = canvas.height = 128;
+    const ctx = canvas.getContext("2d");
+    const rg = ctx.createRadialGradient(64, 64, 0, 64, 64, 64);
+    const rgb = `${Math.round(255*r)},${Math.round(255*g)},${Math.round(255*b)}`;
+    rg.addColorStop(0,    `rgba(${rgb},0.9)`);
+    rg.addColorStop(0.25, `rgba(${rgb},0.5)`);
+    rg.addColorStop(0.6,  `rgba(${rgb},0.12)`);
+    rg.addColorStop(1,    `rgba(${rgb},0)`);
+    ctx.fillStyle = rg; ctx.fillRect(0, 0, 128, 128);
+    const rg2 = ctx.createRadialGradient(64, 64, 0, 64, 64, 15.36);
+    rg2.addColorStop(0,   "#ffffff");
+    rg2.addColorStop(0.5, `rgba(${rgb},0.9)`);
+    rg2.addColorStop(1,   `rgba(${rgb},0)`);
+    ctx.fillStyle = rg2; ctx.fillRect(0, 0, 128, 128);
+    const tex = new THREE.CanvasTexture(canvas);
+    tex.colorSpace = THREE.SRGBColorSpace;
+    tex.needsUpdate = true;
+    return tex;
+}
+
+const _spriteTexCache = new Map;
+function getSpriteTex(r, g, b) {
+    const key = `${r*15|0}:${g*15|0}:${b*15|0}`;
+    if (!_spriteTexCache.has(key)) _spriteTexCache.set(key, makeSpriteTexture(r, g, b));
+    return _spriteTexCache.get(key);
+}
+
+function addLightSprites(scene, lights) {
+    if (!lights?.length) return;
+    let spriteCount = 0;
+    for (const l of lights) {
+        const color  = new THREE.Color(l.r, l.g, l.b);
+        const dist   = Math.min(20, Math.max(2,   0.05  * l.intensity));
+        const intens = Math.min(5,  Math.max(0.2, 0.015 * l.intensity));
+        const pt     = new THREE.PointLight(color, intens, dist);
+        pt.position.set(l.x, l.y, l.z);
+        scene.add(pt);
+        if (!l.sprite) continue;
+        const mat    = new THREE.SpriteMaterial({
+            map: getSpriteTex(l.r, l.g, l.b),
+            transparent: true, depthWrite: false,
+            blending: THREE.AdditiveBlending, color,
+        });
+        const sprite = new THREE.Sprite(mat);
+        sprite.position.set(l.x, l.y, l.z);
+        sprite.scale.setScalar(0.5);
+        sprite.userData.noclip = true;
+        scene.add(sprite);
+        spriteCount++;
+    }
+    console.log(`[Engine] Lights: ${lights.length} total, ${spriteCount} with sprite`);
+}
+
+// ── Fallback room (BSP load error) ───────────────────────────────────────────
+
+function _fallbackRoom(scene) {
+    const floorMat = new THREE.MeshLambertMaterial({ color: 1710638 });
+    const ceilMat  = new THREE.MeshLambertMaterial({ color: 1447454 });
+    const wallMat  = new THREE.MeshLambertMaterial({ color:  657946 });
+    const floor = new THREE.Mesh(new THREE.PlaneGeometry(20, 20), floorMat);
+    floor.rotation.x = -Math.PI / 2;
+    scene.add(floor);
+    const ceil = new THREE.Mesh(new THREE.PlaneGeometry(20, 20), ceilMat);
+    ceil.rotation.x = Math.PI / 2;
+    ceil.position.y = 5;
+    scene.add(ceil);
+    for (const [wx, wy, wz, wr] of [
+        [-10, 2.5, 0, 0], [10, 2.5, 0, Math.PI],
+        [0, 2.5, -10, Math.PI / 2], [0, 2.5, 10, -Math.PI / 2],
+    ]) {
+        const wall = new THREE.Mesh(new THREE.PlaneGeometry(20, 5), wallMat);
+        wall.position.set(wx, wy, wz);
+        wall.rotation.y = wr;
+        scene.add(wall);
+    }
+    scene.add(new THREE.AmbientLight(0x334466, 3));
+}
+
+// ── Main entry point ──────────────────────────────────────────────────────────
+
+export async function initEngine({
+    canvas,
+    mapUrl        = "map.bsp",
+    textureBase   = "textures/",
+    mapName       = "MAP",
+    onReady       = null,
+    onProgress    = null,
+    physicsConfig = {},
+    bloomStrength  = 0.4,
+    bloomRadius    = 0.4,
+    bloomThreshold = 0.2,
+    renderDistance = 180,
+    maxPixelRatio  = 1,
+    fogColor       = 0,
+    // ── Camera bob ─────────────────────────────────────────────────────────
+    // bobStrength: vertical sine amplitude in world units (0 = disabled).
+    //   0.02 = barely noticeable, 0.05 = natural, 0.10 = very pronounced.
+    // bobSpeed: phase advance in radians per world unit traveled.
+    //   Phase is driven by actual horizontal displacement, so walking into
+    //   a wall or up a steep slope naturally slows/stops the bob.
+    //   At MOVE_SPEED 5.6 u/s: 2.0 ≈ 1.8 Hz (comfortable walking rhythm).
+    bobStrength = 0,
+    bobSpeed    = 2.0,
+}) {
+    // ── Renderer ──────────────────────────────────────────────────────────────
+    const renderer = new THREE.WebGLRenderer({
+        canvas, antialias: true,
+        powerPreference: "high-performance",
+        logarithmicDepthBuffer: false,
+    });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, maxPixelRatio));
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.toneMapping         = THREE.ACESFilmicToneMapping;
+    renderer.toneMappingExposure = 2;
+    window._rendererInfo = renderer.info;
+    initTexLoader(renderer);
+
+    // ── Scene / fog ───────────────────────────────────────────────────────────
+    const scene  = new THREE.Scene;
+    const fogCol = new THREE.Color(fogColor).convertSRGBToLinear();
+    scene.fog        = new THREE.Fog(fogCol, 0.2 * renderDistance, renderDistance);
+    scene.background = new THREE.Color(fogCol);
+
+    // ── Camera ────────────────────────────────────────────────────────────────
+    const cam = new THREE.PerspectiveCamera(90, window.innerWidth / window.innerHeight, 0.01, renderDistance);
+    cam.position.set(0, 1.6, 0);
+
+    // ── Ambient light ─────────────────────────────────────────────────────────
+    const ambient = new THREE.AmbientLight(0xffffff, 1);
+    scene.add(ambient);
+
+    // ── Post-processing ───────────────────────────────────────────────────────
+    const composer = new EffectComposer(renderer);
+    composer.addPass(new RenderPass(scene, cam));
+    let bloomPass = null;
+    if (bloomStrength > 0) {
+        bloomPass = new UnrealBloomPass(
+            new THREE.Vector2(Math.floor(window.innerWidth / 2), Math.floor(window.innerHeight / 2)),
+            bloomStrength, bloomRadius, bloomThreshold
+        );
+        composer.addPass(bloomPass);
+    }
+
+    // ── Scene-ready gate (bloom off until BSP is fully loaded) ───────────────
+    let sceneReady = false;
+
+    // ── Portal / mesh lists for raycasting ───────────────────────────────────
+    const portals     = [];
+    const solidMeshes = [];   // visible, depthWrite=true → collidable for raycasts
+    const invisMeshes = [];   // invisible clip brushes
+
+    // ── Background music (start fetching early) ───────────────────────────────
+    const bgMusicPromise = findBackgroundMusic(mapBaseFromUrl(mapUrl));
+
+    // ── Yaw (shared between spawn, physics loop, and hash writes) ────────────
+    let yaw = 0;
+
+    // ── Load BSP ──────────────────────────────────────────────────────────────
+    try {
+        const bsp = await loadBSP({
+            url: mapUrl, scene,
+            textureBase,
+            fallbackTexBase: "/expore/textures/",
+            onProgress,
+        });
+
+        if (bsp.ambientColor    !== undefined) ambient.color.set(bsp.ambientColor);
+        if (bsp.ambientIntensity !== undefined) ambient.intensity = bsp.ambientIntensity;
+
+        for (const portal of bsp.portals) buildPortal(portal, scene, portals);
+        addLightSprites(scene, bsp.lights ?? []);
+
+        // Spawn position
+        const hash = readHashState();
+        if (hash) {
+            cam.position.set(hash.x, hash.y, hash.z);
+            yaw = hash.yaw;
+        } else if (bsp.playerStart) {
+            const ps = bsp.playerStart;
+            cam.position.set(ps.x, ps.y + 1.6, ps.z);
+            yaw = ps.angle * Math.PI / 180;
+        }
+
+        // Collect meshes for portal occlusion raycasting
+        const portalMeshSet = new Set(portals.map(p => p.mesh));
+        scene.traverse(obj => {
+            if (!obj.isMesh || !obj.geometry) return;
+            if (portalMeshSet.has(obj)) return;
+            if (obj.userData.invisible)            invisMeshes.push(obj);
+            else if (obj.material?.depthWrite !== false) solidMeshes.push(obj);
+        });
+
+        setTimeout(() => {
+            sceneReady = true;
+            console.log("[Engine] Scene ready — full render pipeline active");
+        }, 500);
+
+    } catch (err) {
+        console.error("[Engine] BSP load failed:", err);
+        _fallbackRoom(scene);
+        ambient.intensity = 3;
+        scene.traverse(obj => {
+            if (!obj.isMesh || !obj.geometry) return;
+            if (obj.userData.invisible)            invisMeshes.push(obj);
+            else if (obj.material?.depthWrite !== false) solidMeshes.push(obj);
+        });
+        sceneReady = true;
+    }
+
+    // ── Physics ───────────────────────────────────────────────────────────────
+    const physics = createPhysics(scene, physicsConfig);
+    physics.refreshCollidables();
+    window._cam     = cam;
+    window._physics = physics;
+    window._scene   = scene;
+
+    // ── Background music ──────────────────────────────────────────────────────
+    const bgMusic  = await bgMusicPromise;
+    let bgStarted  = false;
+    function startBgMusic() {
+        if (!bgStarted && bgMusic) {
+            bgStarted = true;
+            bgMusic.play().catch(e => console.warn("[Engine] BG music failed:", e));
+        }
+    }
+
+    // ── Portal hover raycasting ───────────────────────────────────────────────
+    let _lastPortal    = null;
+    let _rayFrame      = 0;
+    const _centerUV    = new THREE.Vector2(0, 0);
+    const _fwdRay      = new THREE.Raycaster;
+    const _occRay      = new THREE.Raycaster;
+    const _portalMeshes = portals.map(p => p.mesh);
+
+    function getHoveredPortal() {
+        if (!_portalMeshes.length) return null;
+        if (++_rayFrame % 4 !== 0) return _lastPortal;
+        _fwdRay.setFromCamera(_centerUV, cam);
+        const hits = _fwdRay.intersectObjects(_portalMeshes, false);
+        if (!hits.length) return (_lastPortal = null);
+        const dist = hits[0].distance;
+        _occRay.ray.copy(_fwdRay.ray);
+        _occRay.near = _fwdRay.near;
+        _occRay.far  = dist - 0.05;
+        const blocked =
+            _occRay.intersectObjects(solidMeshes, false).length > 0 ||
+            (invisMeshes.length && _occRay.intersectObjects(invisMeshes, false).length > 0);
+        return (_lastPortal = blocked ? null : (portals.find(p => p.mesh === hits[0].object) ?? null));
+    }
+
+    // ── Input ─────────────────────────────────────────────────────────────────
+    const keys = {};
+
+    window.addEventListener("mousemove", e => {
+        _centerUV.x =  e.clientX / window.innerWidth  * 2 - 1;
+        _centerUV.y = -e.clientY / window.innerHeight * 2 + 1;
+    });
+
+    window.addEventListener("keydown", e => {
+        keys[e.key.toLowerCase()] = true;
+        if (e.key === " ") e.preventDefault();
+        startBgMusic();
+        unmuteVideos();
+        document.querySelectorAll("video[data-spelec-bsp-video]").forEach(v => v.play().catch(() => {}));
+
+        // Debug: F = ground probe
+        if (e.key.toLowerCase() === "f") {
+            const pos = cam.position;
+            console.log("=== GROUND DEBUG ===");
+            console.log("Camera pos:", `(${pos.x.toFixed(4)}, ${pos.y.toFixed(4)}, ${pos.z.toFixed(4)})`);
+            const ray   = new THREE.Raycaster; ray.firstHitOnly = true;
+            const world = solidMeshes.filter(m => !m.userData.noclip);
+            for (const [ox, oz] of [[0,0],[.2,0],[-.2,0],[0,.2],[0,-.2]]) {
+                ray.set(new THREE.Vector3(pos.x+ox, pos.y+0.25, pos.z+oz), new THREE.Vector3(0,-1,0));
+                ray.far = 5;
+                const res = ray.intersectObjects(world, false);
+                if (res.length) {
+                    const h = res[0], n = h.face?.normal?.clone().transformDirection(h.object.matrixWorld);
+                    console.log(`  [${ox.toFixed(1)},${oz.toFixed(1)}]`,
+                        "dist="+h.distance.toFixed(3), "hitY="+h.point.y.toFixed(3),
+                        "n="+(n?`(${n.x.toFixed(2)},${n.y.toFixed(2)},${n.z.toFixed(2)})`:"N/A"),
+                        h.object.name||h.object.uuid.slice(0,8));
+                } else {
+                    console.log(`  [${ox.toFixed(1)},${oz.toFixed(1)}] NO HIT`);
+                }
+            }
+            console.log("====================");
+        }
+        // Debug: P = renderer stats
+        if (e.key.toLowerCase() === "p") {
+            const info = renderer.info;
+            console.log("=== RENDERER STATS ===");
+            console.log(`Draw calls:  ${info.render.calls}`);
+            console.log(`Triangles:   ${info.render.triangles}`);
+            console.log(`Geometries:  ${info.memory.geometries}`);
+            console.log(`Textures:    ${info.memory.textures}`);
+            console.log(`Programs:    ${info.programs?.length ?? "N/A"}`);
+            console.log("======================");
+        }
+    }, { passive: true });
+
+    window.addEventListener("keyup", e => { keys[e.key.toLowerCase()] = false; });
+
+    window.addEventListener("click", () => {
+        startBgMusic();
+        unmuteVideos();
+        const portal = getHoveredPortal();
+        if (portal) {
+            if (isAudioUrl(portal.url)) {
+                playPortalAudio(portal.url);
+            } else {
+                document.getElementById("fade")?.classList.add("out");
+                setTimeout(() => { window.location.href = portal.url; }, 350);
+            }
+        }
+    });
+
+    // ── Resize ────────────────────────────────────────────────────────────────
+    let _resizeTimer = null;
+    window.addEventListener("resize", () => {
+        clearTimeout(_resizeTimer);
+        _resizeTimer = setTimeout(() => {
+            cam.aspect = window.innerWidth / window.innerHeight;
+            cam.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            composer.setSize(window.innerWidth, window.innerHeight);
+            if (bloomPass) bloomPass.resolution.set(
+                Math.floor(window.innerWidth  / 2),
+                Math.floor(window.innerHeight / 2)
+            );
+        }, 150);
+    });
+
+    onReady?.();
+
+    let _bobPhase=0,_bobFactor=0;
+
+    // ── Render loop ───────────────────────────────────────────────────────────
+    const clock   = new THREE.Clock;
+    let frameN    = 0;
+    let lastHash  = 0;
+
+    (function loop() {
+        requestAnimationFrame(loop);
+        frameN++;
+
+        let dt = clock.getDelta();
+        if (dt > 0.1) dt = 0.1;
+
+        // 1. Save camera XZ before physics so we can measure actual movement
+        const prevX=cam.position.x,prevZ=cam.position.z;
+
+        // 2. Physics — moves cam.position based on Rapier KCC
+        yaw = physics.update(cam, keys, yaw, dt);
+
+        // Actual horizontal distance traveled this frame.
+        // This is the ground truth for bob activation and phase advance:
+        //   • Against a wall: displacement ≈ 0 → bob stops
+        //   • On a steep slope: horizontal component is smaller → bob slows
+        const dx=cam.position.x-prevX,dz=cam.position.z-prevZ;
+        const horizDist=Math.sqrt(dx*dx+dz*dz);
+
+        // 3. Animated textures every 3rd frame
+        if (frameN % 3 === 0) tickAnimatedTextures();
+
+        // 3. Portal opacity
+        for (const p of portals) p.mesh.material.opacity = p.opacity;
+
+        // 4. Hash save every 3 s — uses raw physics Y, not bobbed Y
+        const now = performance.now();
+        if (now - lastHash >= 3000) {
+            lastHash = now;
+            writeHashState(cam.position.x, cam.position.y, cam.position.z, yaw);
+        }
+
+        // 5. Portal hover cursor — uses raw physics cam position
+        canvas.style.cursor = getHoveredPortal() ? "pointer" : "default";
+
+        // 6. Camera bob — pitch rotation, time-based phase.
+        // _bobFactor gated by horizDist: fades out when not actually moving
+        // (wall press). Phase advances at fixed dt*bobSpeed so frequency is
+        // identical on flat ground, uphill, downhill and wall-sliding.
+        const isWalkKey=keys.w||keys.s||keys.a||keys.d||keys.arrowup||keys.arrowdown||keys.arrowleft||keys.arrowright;
+        const bobActive=bobStrength>0&&physics.isOnGround&&isWalkKey&&horizDist>0.001;
+        const fadeRate=horizDist<0.005?20:8;
+        _bobFactor+=((bobActive?1:0)-_bobFactor)*(1-Math.exp(-dt*fadeRate));
+        if(bobActive)_bobPhase+=dt*bobSpeed;
+        else if(_bobFactor<0.05)_bobPhase=Math.round(_bobPhase/Math.PI)*Math.PI;
+        const bobAngle=Math.sin(_bobPhase)*bobStrength*_bobFactor;
+
+        // Save physics pitch, apply bob, render, restore — physics never sees it.
+        const savedPitch=cam.rotation.x;
+        cam.rotation.x=savedPitch+bobAngle;
+
+        // 7. Render
+        if (sceneReady) composer.render();
+        else            renderer.render(scene, cam);
+
+        cam.rotation.x=savedPitch;
+    })();
+}
