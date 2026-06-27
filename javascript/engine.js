@@ -566,6 +566,9 @@ export async function initEngine({
 
     onReady?.();
 
+    // Debug: log received bobStrength so we can verify the parameter arrived.
+    console.log(`[Engine] bobStrength=${bobStrength}, bobSpeed=${bobSpeed}`);
+
     let _bobPhase=0,_bobFactor=0;
 
     // ── Render loop ───────────────────────────────────────────────────────────
@@ -623,7 +626,8 @@ export async function initEngine({
         //     the bob value sin(_bobPhase)*_bobFactor decays smoothly through
         //     zero with no mid-sine jitter or sudden snap.
         const isWalkKey=keys.w||keys.s||keys.a||keys.d||keys.arrowup||keys.arrowdown||keys.arrowleft||keys.arrowright;
-        const bobActive=bobStrength>0&&physics.isOnGround&&isWalkKey&&horizDist>0.001;
+        const onGround = physics.isOnGround;
+        const bobActive=bobStrength>0&&onGround&&isWalkKey&&horizDist>0.001;
         // fadeRate: maps horizDist 0→0.001 to rate 20→8 smoothly.
         const fadeRate=bobActive?8:20;
         _bobFactor+=((bobActive?1:0)-_bobFactor)*(1-Math.exp(-dt*fadeRate));
@@ -638,6 +642,15 @@ export async function initEngine({
             _bobPhase+=Math.abs(diff)<=step?diff:Math.sign(diff)*step;
         }
         const bobOffset=Math.sin(_bobPhase)*bobStrength*_bobFactor;
+
+        // Live diagnostics — inspect via window._bobDebug in the browser console.
+        window._bobDebug={
+            bobStrength, bobSpeed, bobActive, onGround, isWalkKey,
+            horizDist: +horizDist.toFixed(5),
+            factor:    +_bobFactor.toFixed(4),
+            phase:     +_bobPhase.toFixed(4),
+            offset:    +bobOffset.toFixed(6),
+        };
 
         // Apply bob as Y-position offset — save physics Y, shift cam up/down,
         // render, restore. Rapier and hash saves never see the offset.
