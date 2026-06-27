@@ -1,5 +1,10 @@
-// engine.js v7.19
+// engine.js v7.20
 // Changelog:
+// v7.20 — Add targetFps parameter to initEngine().
+//         0 = unlimited (native requestAnimationFrame rate).
+//         e.g. 30 = cap at 30 fps, 60 = cap at 60 fps.
+//         Uses elapsed-time gating inside rAF — browser throttling
+//         and tab visibility handling still work correctly.
 // v7.19 — Add shaderTexSize parameter to initEngine().
 //         Calls setShaderTexSize() from bsp_loader.js before BSP load,
 //         so .frag shader canvas textures render at the chosen resolution
@@ -329,6 +334,13 @@ export async function initEngine({
     //   1024 = high quality
     //   2048 = very high (use only if few shader textures in the map)
     shaderTexSize = 512,
+    // ── Frame rate cap ────────────────────────────────────────────────────
+    // targetFps: maximum frames per second to render.
+    //   0  = unlimited — renders every requestAnimationFrame tick (default).
+    //   30 = cap at 30 fps (saves GPU on simple maps or slow machines).
+    //   60 = cap at 60 fps (good default if monitor is 144 Hz+).
+    //   Values above the display refresh rate have no effect.
+    targetFps = 0,
 }) {
     // Apply shader texture size before BSP load so every .frag face uses it
     setShaderTexSize(shaderTexSize);
@@ -573,9 +585,13 @@ export async function initEngine({
     });
 
     onReady?.();
-    console.log(`[Engine] bobStrength=${bobStrength}, bobSpeed=${bobSpeed}, shaderTexSize=${shaderTexSize}`);
+    console.log(`[Engine] bobStrength=${bobStrength}, bobSpeed=${bobSpeed}, shaderTexSize=${shaderTexSize}, targetFps=${targetFps||"unlimited"}`);
 
     let _bobPhase = 0, _bobFactor = 0;
+
+    // Frame rate cap: minimum ms between rendered frames (0 = unlimited)
+    const _frameInterval = targetFps > 0 ? 1000 / targetFps : 0;
+    let _lastFrameTime   = 0;
 
     // ── Render loop ───────────────────────────────────────────────────────────
     const clock  = new THREE.Clock;
@@ -585,6 +601,15 @@ export async function initEngine({
     (function loop() {
         requestAnimationFrame(loop);
         frameN++;
+
+        // Frame rate cap — skip render if not enough time has elapsed.
+        // Drift-corrected: _lastFrameTime tracks the ideal tick boundary
+        // so missed frames don't cause catch-up bursts.
+        if (_frameInterval > 0) {
+            const _now = performance.now();
+            if (_now - _lastFrameTime < _frameInterval) return;
+            _lastFrameTime = _now - ((_now - _lastFrameTime) % _frameInterval);
+        }
 
         let dt = clock.getDelta();
         if (dt > 0.1) dt = 0.1;
