@@ -1,5 +1,10 @@
-// engine.js v7.17
+// engine.js v7.18
 // Changelog:
+// v7.18 — Portal label texture resolution 512×80 → 2048×320 (4× upscale).
+//         Font 30px → 120px, shadowBlur 18 → 72, all canvas coords ×4.
+//         Added auto font-shrink loop for long text (down to 48px).
+//         Enabled generateMipmaps + LinearMipmapLinearFilter on label tex
+//         for crisp rendering at any distance.
 // v7.17 — Fix three camera bob bugs:
 //         1. Jitter: phase was frozen mid-sine during fade-out, so
 //            sin(_bobPhase)*_bobFactor decayed from a non-zero value,
@@ -23,38 +28,6 @@
 // v7.16 — MSAA 2x support via WebGLRenderTarget with samples.
 // v7.15 — Fix inconsistent bob frequency on slopes and walls.
 // v7.14 — Bob as pitch rotation instead of Y position offset.
-// v7.14 — Bob as pitch rotation instead of Y position offset.
-//         Root cause: position-lerp _renderY lags behind physicsY when
-//         climbing → camera rendered lower than physics → floor appears
-//         closer → bob looks bigger. Descending: opposite lag, floor farther,
-//         bob looks smaller.
-//         Fix: replace position-lerp with a VELOCITY-FOLLOWING smoother.
-//         Instead of lerping _renderY toward physicsY (which lags on any
-//         sustained vertical movement), we smooth the Y *velocity* each frame
-//         and integrate it into _renderY. DC component (slope trend) passes
-//         through immediately with zero lag; high-frequency step-snap noise
-//         is attenuated ~77 % at 10 Hz and ~92 % at 30 Hz. A very slow drift
-//         correction (K=2, τ≈500 ms) prevents long-term numerical divergence
-//         without introducing any perceptible position lag.
-// v7.11 — Frame-rate independent bob: lerp factors use 1-exp(-dt*K).
-// v7.10 — Fix: camera bob appeared larger on slopes (added _renderY filter).
-// v7.9  — Bob phase driven by actual horizontal displacement instead of time.
-// v7.8  — Camera bob while walking on ground.
-// v7.7  — (previous version)
-//         on slopes or alongside walls. Root cause: Rapier's step-snapping
-//         and ground-snap produce per-frame Y noise that adds to the sine
-//         offset, making the apparent amplitude larger than bobStrength.
-//         Fix: render uses a low-pass-filtered _renderY (smoothing constant
-//         25) instead of raw physicsY, which kills high-frequency Y jitter
-//         while still tracking real terrain changes within ~130 ms.
-//         Also: bobFactor fades out 2.5× faster when the player is truly
-//         not moving (horizDist < 0.005), preventing the sine wave from
-//         lingering at its peak after the player hits a wall.
-//         Raw physicsY is fully restored after render — Rapier never sees
-//         any of the visual smoothing or bob offset.
-// v7.9 — Bob phase driven by actual horizontal displacement instead of time.
-// v7.8 — Camera bob while walking on ground.
-// v7.7 — (previous version)
 
 import * as THREE from "https://cdn.jsdelivr.net/npm/three@0.165.0/build/three.module.js";
 import { EffectComposer } from "https://cdn.jsdelivr.net/npm/three@0.165.0/examples/jsm/postprocessing/EffectComposer.js";
@@ -174,21 +147,38 @@ function mapBaseFromUrl(url) {
 
 // ── Portal helpers ────────────────────────────────────────────────────────────
 
+// Label canvas is 2048×320 (4× the old 512×80) so text renders at 120 px on
+// the same 2.8×0.44 world-unit plane — roughly 731 px/unit vs the old 183.
+// generateMipmaps + LinearMipmapLinearFilter keep it sharp at any view distance.
 function buildPortalLabel(text, color, parent) {
     if (!text) return null;
+    const W = 2048, H = 320;
     const canvas = document.createElement("canvas");
-    canvas.width = 512; canvas.height = 80;
+    canvas.width = W; canvas.height = H;
     const ctx = canvas.getContext("2d");
-    ctx.clearRect(0, 0, 512, 80);
+    ctx.clearRect(0, 0, W, H);
+
+    // Auto-shrink font for long strings (minimum 48 px keeps it legible)
+    let fontSize = 120;
+    ctx.font = `bold ${fontSize}px "Share Tech Mono", monospace`;
+    while (ctx.measureText(text.toUpperCase()).width > W - 120 && fontSize > 48) {
+        fontSize -= 4;
+        ctx.font = `bold ${fontSize}px "Share Tech Mono", monospace`;
+    }
+
     ctx.shadowColor  = `#${color.getHexString()}`;
-    ctx.shadowBlur   = 18;
-    ctx.font         = 'bold 30px "Share Tech Mono", monospace';
+    ctx.shadowBlur   = 72;   // was 18 — scaled 4×
     ctx.fillStyle    = `#${color.getHexString()}`;
     ctx.textAlign    = "center";
     ctx.textBaseline = "middle";
-    ctx.fillText(text.toUpperCase(), 256, 40);
+    ctx.fillText(text.toUpperCase(), W / 2, H / 2);
+
     const tex = new THREE.CanvasTexture(canvas);
-    tex.needsUpdate = true;
+    tex.needsUpdate       = true;
+    tex.generateMipmaps   = true;
+    tex.minFilter         = THREE.LinearMipmapLinearFilter;
+    tex.magFilter         = THREE.LinearFilter;
+
     const mesh = new THREE.Mesh(
         new THREE.PlaneGeometry(2.8, 0.44),
         new THREE.MeshBasicMaterial({ map: tex, transparent: true, depthWrite: false, side: THREE.DoubleSide })

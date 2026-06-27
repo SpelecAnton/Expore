@@ -18,8 +18,6 @@
 
 <script type="module">
   import { initEngine }        from 'https://spelecanton.github.io/Expore/javascript/engine.js';
-  import { createMultiplayer } from 'https://spelecanton.github.io/Expore/javascript/multiplayer.js';
-  import { createChatOverlay } from 'https://spelecanton.github.io/Expore/javascript/chat_overlay.js';
 
   // ── 3D engine ─────────────────────────────────────────────────────────────
   await initEngine({
@@ -67,26 +65,6 @@
     },
   });
 
-  // ── Multiplayer ────────────────────────────────────────────────────────────
-  const mp = createMultiplayer(window._scene, {
-    playersUrl: 'https://spelec.cz/chat/players.php',
-  });
-
-  // ── Chat overlay ───────────────────────────────────────────────────────────
-  createChatOverlay({
-    apiUrl:    'https://spelec.cz/chat/api.php',
-    onlineUrl: 'https://spelec.cz/chat/online.php',
-
-    getPlayers: () => mp.getPlayers(),
-
-    onTeleport: (x, y, z) => {
-      window._physics?.teleport(window._cam, x, y, z);
-    },
-
-    onAdminPassChange: (pass) => {
-      mp.setAdminPass(pass);
-    },
-  });
 </script>
 
 <script type="importmap">
@@ -131,6 +109,5 @@
   }
   #fade.out { opacity: 1; }
 </style>
-
 </body>
 </html>

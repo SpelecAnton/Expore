@@ -19,11 +19,15 @@ cd ..\..
 set "BASEPATH=%CD%"
 popd
 
+set "THREADS=%NUMBER_OF_PROCESSORS%"
+if "%THREADS%"=="" set "THREADS=4"
+
 echo.
 echo %BLD%%CYN% ===================================================%RST%
-echo %BLD%%CYN%   Universal Quake 3 Compiler  ^(q3map2^)%RST%
+echo %BLD%%CYN%   EXPORE Map Compiler (q3map2) %RST%
 echo %BLD%%CYN% ===================================================%RST%
 echo %DIM%   Basepath : %BASEPATH%%RST%
+echo %DIM%   Threads  : %THREADS% (auto-detected)%RST%
 echo %CYN% ---------------------------------------------------%RST%
 echo %WHT%   Maps found in this folder:%RST%
 echo %CYN% ---------------------------------------------------%RST%
@@ -61,78 +65,96 @@ echo.
 echo %BLD%%CYN% ===================================================%RST%
 echo %BLD%%WHT%   Select compile mode:%RST%
 echo %CYN% ---------------------------------------------------%RST%
-echo  %YLW% [1]%RST% %BLD%DRAFT%RST%    - no bounce, fast geometry preview
-echo       %DIM%  BSP + VIS (fast) + LIGHT (fast, no bounce, samplesize 8)%RST%
+echo  %YLW% [1]%RST% %BLD%PREVIEW%RST%
+echo       %DIM%  Use this when you only use ambient light%RST%
 echo.
-echo  %YLW% [2]%RST% %BLD%MEDIUM%RST%   - bounced light, good for iteration
-echo       %DIM%  BSP + VIS (fast) + LIGHT (8 samples, 4 bounce, AO, samplesize 4)%RST%
+echo  %YLW% [2]%RST% %BLD%MEDIUM%RST%
+echo       %DIM%  Very solid lights%RST%
 echo.
-echo  %YLW% [3]%RST% %BLD%FINAL%RST%    - full quality, slow
-echo       %DIM%  BSP + VIS (full) + LIGHT (32 samples, 16 bounce, AO, samplesize 2)%RST%
+echo  %YLW% [3]%RST% %RED%EXTREME%RST%
+echo       %DIM%  Intended for final version%RST%
 echo.
-echo  %YLW% [4]%RST% %RED%EXPERIMENTAL%RST%    - I have no idea if it's going to work
-echo       %DIM% Highest quality%RST%
 echo %CYN% ---------------------------------------------------%RST%
-echo %DIM%   Note: quality is controlled by samplesize, not lightmapsize.%RST%
-echo %DIM%   Lower samplesize = sharper shadows. lightmapsize is left at%RST%
-echo %DIM%   default (128) to avoid StoreSurfaceLightmaps errors.%RST%
+echo %DIM%   All modes use -threads %THREADS% for parallel light computation.%RST%
 echo %CYN% ---------------------------------------------------%RST%
-set /p MODE_CHOICE="  Enter mode [1-4]: "
+set /p MODE_CHOICE="  Enter mode [1-5]: "
 
-if "!MODE_CHOICE!"=="" set "MODE_CHOICE=2"
-if "!MODE_CHOICE!" NEQ "1" if "!MODE_CHOICE!" NEQ "2" if "!MODE_CHOICE!" NEQ "3" if "!MODE_CHOICE!" NEQ "4" (
-    echo %RED%  Invalid choice, defaulting to MEDIUM.%RST%
-    set "MODE_CHOICE=2"
+if "!MODE_CHOICE!"=="" set "MODE_CHOICE=3"
+if "!MODE_CHOICE!" NEQ "1" if "!MODE_CHOICE!" NEQ "2" if "!MODE_CHOICE!" NEQ "3" (
+    echo %RED%  Invalid choice, defaulting to PREVIEW.%RST%
+    set "MODE_CHOICE=1"
 )
 
 set "MAPFILE=%~dp0!MAPNAME!.map"
 set "BSPFILE=%~dp0!MAPNAME!.bsp"
+set "GZFILE=%~dp0!MAPNAME!.expore"
 set "SRFFILE=%~dp0!MAPNAME!.srf"
 
 echo.
 echo %BLD%%CYN% ===================================================%RST%
 echo %WHT%   Map     :%RST% %YLW%!MAPNAME!.map%RST%
 echo %WHT%   Basepath:%RST% %DIM%!BASEPATH!%RST%
-if "!MODE_CHOICE!"=="1" echo %WHT%   Mode    :%RST% %DIM%DRAFT%RST%
-if "!MODE_CHOICE!"=="2" echo %WHT%   Mode    :%RST% %CYN%MEDIUM%RST%
-if "!MODE_CHOICE!"=="3" echo %WHT%   Mode    :%RST% %GRN%FINAL%RST%
-if "!MODE_CHOICE!"=="4" echo %WHT%   Mode    :%RST% %RED%EXPERIMENT%RST%
+echo %WHT%   Threads :%RST% %CYN%!THREADS!%RST%
+if "!MODE_CHOICE!"=="1" echo %WHT%   Mode    :%RST% %DIM%PREVIEW%RST%
+if "!MODE_CHOICE!"=="2" echo %WHT%   Mode    :%RST% %DIM%MEDIUM%RST%
+if "!MODE_CHOICE!"=="3" echo %WHT%   Mode    :%RST% %RED%FINAL%RST%
 echo %BLD%%CYN% ===================================================%RST%
 echo.
 
-:: --- [1/3] BSP ---
-echo %BLD%%MAG% --- [1/3] BSP pass -----------------------------------%RST%
-"%~dp0q3map2\q3map2" -meta -fs_basepath "!BASEPATH!" -fs_game baseq3 "!MAPFILE!"
+echo %BLD%%MAG% --- [1/4] BSP pass -----------------------------------%RST%
+"%~dp0q3map2\q3map2" -meta -patchmeta -np 45 -maxmapdrawsurfs 524288 -fs_basepath "!BASEPATH!" -fs_game baseq3 "!MAPFILE!"
 if errorlevel 1 goto :error
 
-:: --- [2/3] VIS ---
 echo.
-echo %BLD%%MAG% --- [2/3] VIS pass -----------------------------------%RST%
+echo %BLD%%MAG% --- [2/4] VIS pass -----------------------------------%RST%
 if "!MODE_CHOICE!"=="1" "%~dp0q3map2\q3map2" -vis -fast -fs_basepath "!BASEPATH!" -fs_game baseq3 "!BSPFILE!"
 if "!MODE_CHOICE!"=="2" "%~dp0q3map2\q3map2" -vis -fast -fs_basepath "!BASEPATH!" -fs_game baseq3 "!BSPFILE!"
 if "!MODE_CHOICE!"=="3" "%~dp0q3map2\q3map2" -vis -fs_basepath "!BASEPATH!" -fs_game baseq3 "!BSPFILE!"
-if "!MODE_CHOICE!"=="4" "%~dp0q3map2\q3map2" -vis -fs_basepath "!BASEPATH!" -fs_game baseq3 "!BSPFILE!"
 if errorlevel 1 goto :error
 
-:: --- [3/3] LIGHT ---
-:: Quality is driven by -samplesize (luxel density in world units):
-::   samplesize 8  = default, coarse (DRAFT)
-::   samplesize 4  = 2x sharper shadows (MEDIUM)
-::   samplesize 2  = 4x sharper shadows (FINAL)
-:: -lightmapsize is intentionally omitted — this version of q3map2
-:: triggers "Storing all lightmaps externally" + exit code 3 when it
-:: is set above 128, regardless of map size.
 echo.
-echo %BLD%%MAG% --- [3/3] LIGHT pass ----------------------------------%RST%
-if "!MODE_CHOICE!"=="1" "%~dp0q3map2\q3map2" -light -fast -samplesize 8 -fs_basepath "!BASEPATH!" -fs_game baseq3 "!BSPFILE!"
-if "!MODE_CHOICE!"=="2" "%~dp0q3map2\q3map2" -light -fast -samplesize 4 -samples 8 -bounce 4 -bouncescale 1.2 -patchshadows -dirty -randomsamples -fs_basepath "!BASEPATH!" -fs_game baseq3 "!BSPFILE!"
-if "!MODE_CHOICE!"=="3" "%~dp0q3map2\q3map2" -light -samplesize 2 -samples 32 -bounce 16 -bouncescale 1.2 -patchshadows -dirty -randomsamples -filter -fs_basepath "!BASEPATH!" -fs_game baseq3 "!BSPFILE!"
-if "!MODE_CHOICE!"=="4" "%~dp0q3map2\q3map2" -light -samplesize 1 -samples 64 -bounce 32 -bouncescale 2.0 -patchshadows -dirty -randomsamples -filter -fs_basepath "!BASEPATH!" -fs_game baseq3 "!BSPFILE!"
+echo %BLD%%MAG% --- [3/4] LIGHT pass ----------------------------------%RST%
+
+if "!MODE_CHOICE!"=="1" (
+    "%~dp0q3map2\q3map2" -light -fast -threads !THREADS! -samplesize 16 -samples 1 -bounce 0 -dirty -randomsamples -filter -fs_basepath "!BASEPATH!" -fs_game baseq3 "!BSPFILE!"
+)
+
+if "!MODE_CHOICE!"=="2" (
+    "%~dp0q3map2\q3map2" -light -threads !THREADS! -samplesize 8 -samples 2 -bounce 2 -bouncescale 0.8 -dirty -randomsamples -filter -fs_basepath "!BASEPATH!" -fs_game baseq3 "!BSPFILE!"
+)
+
+if "!MODE_CHOICE!"=="3" (
+    "%~dp0q3map2\q3map2" -light -threads !THREADS! -samplesize 8 -samples 4 -bounce 4 -bouncescale 0.6 -dirty -randomsamples -filter -fs_basepath "!BASEPATH!" -fs_game baseq3 "!BSPFILE!"
+)
+
 if errorlevel 1 goto :error
 
 if exist "!SRFFILE!" del /q "!SRFFILE!"
 
-:: --- Texture report ---
+echo.
+echo %BLD%%MAG% --- [4/4] Compressing ------------%RST%
+echo %DIM%   Creating !MAPNAME!.expore file%RST%
+
+:: Pass the path via environment variable to avoid all cmd escaping nightmares
+:: with backslashes and percent signs inside the PowerShell -Command string.
+set "BSPPATH=!BSPFILE!"
+set "GZPATH=!GZFILE!"
+
+powershell -NoProfile -NonInteractive -Command ^
+  "$s=$env:BSPPATH; $d=$env:GZPATH;" ^
+  "try {" ^
+  "  $i=[IO.File]::OpenRead($s);" ^
+  "  $o=[IO.File]::Create($d);" ^
+  "  $g=[IO.Compression.GZipStream]::new($o,[IO.Compression.CompressionLevel]::Optimal);" ^
+  "  $i.CopyTo($g); $g.Close(); $o.Close(); $i.Close();" ^
+  "  $a=[IO.FileInfo]::new($s).Length;" ^
+  "  $b=[IO.FileInfo]::new($d).Length;" ^
+  "  $ratio=[Math]::Round((1-$b/$a)*100,1);" ^
+  "  Write-Host ('     BSP: '+[Math]::Round($a/1MB,2)+' MB');" ^
+  "  Write-Host ('  Expore: '+[Math]::Round($b/1MB,2)+' MB  ('+$ratio+' pcnt smaller)');" ^
+  "} catch { Write-Host ('  WARN: gzip failed — '+$_.Exception.Message); exit 0 }"
+
+
 echo.
 echo %BLD%%CYN% ===================================================%RST%
 echo %BLD%%WHT%   Textures referenced in !MAPNAME!.map%RST%
@@ -177,6 +199,7 @@ echo %DIM%   Total: !TEXCOUNT! unique textures%RST%
 echo.
 echo %BLD%%GRN% ===================================================%RST%
 echo %BLD%%GRN%   Compilation complete^^!%RST%
+echo %BLD%%GRN%   Made by SPELEC.CZ
 echo %BLD%%GRN% ===================================================%RST%
 pause
 exit /b 0
@@ -190,7 +213,7 @@ if exist "%~dp0tex_unsorted.tmp" del "%~dp0tex_unsorted.tmp"
 if exist "%~dp0tex_sorted.tmp" del "%~dp0tex_sorted.tmp"
 echo.
 echo %BLD%%RED% ===================================================%RST%
-echo %BLD%%RED%   ERROR: Compilation failed ^(exit code %ERRORLEVEL%^)%RST%
+echo %BLD%%RED%   ERROR: Compilation failed (exit code %ERRORLEVEL%)%RST%
 echo %BLD%%RED% ===================================================%RST%
 pause
 exit /b 1
