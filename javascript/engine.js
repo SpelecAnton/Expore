@@ -627,6 +627,8 @@ export async function initEngine({
         //     zero with no mid-sine jitter or sudden snap.
         const isWalkKey=keys.w||keys.s||keys.a||keys.d||keys.arrowup||keys.arrowdown||keys.arrowleft||keys.arrowright;
         const onGround = physics.isOnGround;
+        // bobActive: requires isOnGround (physics.js v1.3 fixes computedGrounded
+        // flickering), isWalkKey, and actual horizontal displacement.
         const bobActive=bobStrength>0&&onGround&&isWalkKey&&horizDist>0.001;
         // fadeRate: maps horizDist 0→0.001 to rate 20→8 smoothly.
         const fadeRate=bobActive?8:20;

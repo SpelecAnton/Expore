@@ -1,5 +1,15 @@
-// physics.js v1.2
+// physics.js v1.3
 // Changelog:
+// v1.3 — Fix computedGrounded() returning false when standing still.
+//         Root cause: when grounded, u.y is reset to 0. With no WASD
+//         input the movement vector becomes {x:0,y:0,z:0}. Rapier
+//         performs no downward sweep for zero movement, so
+//         computedGrounded() returns false every other frame — causing
+//         isOnGround to flicker between true/false while standing still.
+//         Fix: always subtract SKIN_WIDTH from the y component of the
+//         movement vector so Rapier always does a ground-detection sweep.
+//         enableSnapToGround(0.5) absorbs the small downward probe
+//         without visually moving the player.
 // v1.2 — Guard jump attempt with JUMP_SPEED>0. Previously, with JUMP_SPEED=0
 //         the jump code still ran: R was set false, gravity accumulated
 //         u.y=-GRAVITY*dt, KCC sent a tiny downward vector into Rapier every
@@ -11,4 +21,4 @@ import RAPIER from"https://cdn.jsdelivr.net/npm/@dimforge/rapier3d-compat@0.14.0
 // With JUMP_SPEED=0 the old code still set R=false and let gravity accumulate
 // u.y each frame, producing per-frame Y noise that amplified camera bob.
 o.JUMP_SPEED>0&&(t[" "]||t.space)&&R&&(u.y=o.JUMP_SPEED,R=!1),
-R?u.y=Math.min(u.y,0):(u.y+=o.GRAVITY*p,u.y=Math.max(u.y,o.TERMINAL_VEL)),E&&(E=!1,n.setNextKinematicTranslation({x:e.position.x,y:e.position.y-A,z:e.position.z}),i.step());const _={x:m.x,y:u.y*p,z:m.z};r.computeColliderMovement(s,_);const h=r.computedMovement();return R=r.computedGrounded(),R&&u.y<0&&(u.y=0),e.position.x+=h.x,e.position.y+=h.y,e.position.z+=h.z,n.setNextKinematicTranslation({x:e.position.x,y:e.position.y-A,z:e.position.z}),i.step(),c},refreshCollidables:function(){l?_():c=!0},teleport(e,t,o,i){e.position.set(t,o,i),u.set(0,0,0),R=!1,d=0,E=!0},get isOnGround(){return R},get velocityY(){return u.y}}}
+R?u.y=Math.min(u.y,0):(u.y+=o.GRAVITY*p,u.y=Math.max(u.y,o.TERMINAL_VEL)),E&&(E=!1,n.setNextKinematicTranslation({x:e.position.x,y:e.position.y-A,z:e.position.z}),i.step());const _={x:m.x,y:u.y*p-o.SKIN_WIDTH,z:m.z};r.computeColliderMovement(s,_);const h=r.computedMovement();return R=r.computedGrounded(),R&&u.y<0&&(u.y=0),e.position.x+=h.x,e.position.y+=h.y,e.position.z+=h.z,n.setNextKinematicTranslation({x:e.position.x,y:e.position.y-A,z:e.position.z}),i.step(),c},refreshCollidables:function(){l?_():c=!0},teleport(e,t,o,i){e.position.set(t,o,i),u.set(0,0,0),R=!1,d=0,E=!0},get isOnGround(){return R},get velocityY(){return u.y}}}
