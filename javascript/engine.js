@@ -60,11 +60,52 @@ import * as THREE from "https://cdn.jsdelivr.net/npm/three@0.165.0/build/three.m
 import { EffectComposer } from "https://cdn.jsdelivr.net/npm/three@0.165.0/examples/jsm/postprocessing/EffectComposer.js";
 import { RenderPass }     from "https://cdn.jsdelivr.net/npm/three@0.165.0/examples/jsm/postprocessing/RenderPass.js";
 import { UnrealBloomPass } from "https://cdn.jsdelivr.net/npm/three@0.165.0/examples/jsm/postprocessing/UnrealBloomPass.js";
+import { ShaderPass }      from "https://cdn.jsdelivr.net/npm/three@0.165.0/examples/jsm/postprocessing/ShaderPass.js";
 import { loadBSP, tickAnimatedTextures, initTexLoader, unmuteVideos, loadTextureFromUrl }
     from "https://spelecanton.github.io/Expore/javascript/bsp_loader.js";
 import { createPhysics } from "https://spelecanton.github.io/Expore/javascript/physics.js";
 
 const PLAYER_HEIGHT = 80, FOV = 90, UNIT = 0.02;
+
+const ColorAdjustShader = {
+    uniforms: {
+        tDiffuse: { value: null },
+        brightness: { value: 0.0 },
+        contrast: { value: 1.0 },
+        tintColor: { value: new THREE.Vector3(1, 1, 1) },
+        tintAlpha: { value: 0.0 }
+    },
+    vertexShader: `
+        varying vec2 vUv;
+        void main() {
+            vUv = uv;
+            gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+        }
+    `,
+    fragmentShader: `
+        uniform sampler2D tDiffuse;
+        uniform float brightness;
+        uniform float contrast;
+        uniform vec3 tintColor;
+        uniform float tintAlpha;
+        varying vec2 vUv;
+
+        void main() {
+            vec4 tex = texture2D(tDiffuse, vUv);
+            
+            // Apply contrast
+            tex.rgb = (tex.rgb - 0.5) * max(contrast, 0.0) + 0.5;
+            
+            // Apply brightness
+            tex.rgb += brightness;
+            
+            // Apply RGBA tint
+            tex.rgb = mix(tex.rgb, tintColor, tintAlpha);
+            
+            gl_FragColor = tex;
+        }
+    `
+};
 
 // ── URL hash helpers ──────────────────────────────────────────────────────────
 
@@ -316,6 +357,10 @@ export async function initEngine({
     //   At MOVE_SPEED 5.6 u/s and bobSpeed 7.0: ~1.1 Hz walking rhythm.
     bobStrength = 0,
     bobSpeed    = 7.0,
+    // ── Color Adjustments ──────────────────────────────────────────────────
+    brightness  = 0.0,
+    contrast    = 1.0,
+    tintRgba    = [1, 1, 1, 0], // [r, g, b, alpha]
 }) {
     // ── Renderer ──────────────────────────────────────────────────────────────
     const renderer = new THREE.WebGLRenderer({
@@ -364,6 +409,14 @@ export async function initEngine({
         ? new EffectComposer(renderer, msaaTarget)
         : new EffectComposer(renderer);
     composer.addPass(new RenderPass(scene, cam));
+    
+    const colorAdjustPass = new ShaderPass(ColorAdjustShader);
+    colorAdjustPass.uniforms["brightness"].value = brightness;
+    colorAdjustPass.uniforms["contrast"].value = contrast;
+    colorAdjustPass.uniforms["tintColor"].value.set(tintRgba[0], tintRgba[1], tintRgba[2]);
+    colorAdjustPass.uniforms["tintAlpha"].value = tintRgba[3] !== undefined ? tintRgba[3] : 0.0;
+    composer.addPass(colorAdjustPass);
+
     let bloomPass = null;
     if (bloomStrength > 0) {
         bloomPass = new UnrealBloomPass(
