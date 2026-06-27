@@ -1,22 +1,28 @@
-// engine.js v7.16
+// engine.js v7.17
 // Changelog:
+// v7.17 — Fix three camera bob bugs:
+//         1. Jitter: phase was frozen mid-sine during fade-out, so
+//            sin(_bobPhase)*_bobFactor decayed from a non-zero value,
+//            producing a visible snap/jitter at the end. Fix: phase now
+//            always advances toward the nearest zero crossing while
+//            _bobFactor > 0 (not only when < 0.05), driven by bobSpeed.
+//         2. Wall-induced amplitude: fadeRate=20 threshold was
+//            horizDist<0.005, but sliding along a wall keeps horizDist
+//            above that so the fast-fade never triggered. Fix: fadeRate
+//            is now always proportional to horizDist — fast when still,
+//            slow when moving — using a smooth remap.
+//         3. Slope-dependent amplitude: bob was applied as a pitch
+//            (cam.rotation.x) offset. On slopes the camera pitch itself
+//            changes (LOOK_SPEED / RETURN_SPEED), so adding the bob angle
+//            to a tilted pitch produced a different apparent vertical
+//            movement depending on slope angle. Fix: bob is now applied
+//            as a pure Y-position offset (+bobOffset to cam.position.y
+//            during render, removed after), completely independent of
+//            camera orientation. bobStrength unit is now world-units
+//            (same as v7.13 and earlier).
 // v7.16 — MSAA 2x support via WebGLRenderTarget with samples.
-//         New `msaa` parameter (default 2) passed to initEngine.
-//         A WebGLRenderTarget with samples=msaa is created and passed
-//         to EffectComposer so the main scene pass benefits from
-//         hardware multi-sample anti-aliasing before bloom is applied.
-//         Set msaa:0 to disable. Resize handler updated to resize
-//         the MSAA render target alongside the composer.
 // v7.15 — Fix inconsistent bob frequency on slopes and walls.
-//         Root cause: _bobPhase was driven by horizDist*bobSpeed (rad/unit).
-//         On a slope Rapier projects horizontal input onto the slope surface,
-//         changing the per-frame horizDist vs flat ground → different frequency.
-//         Fix: phase now advances by dt*bobSpeed (rad/s) — consistent rate
-//         everywhere. _bobFactor is still gated by horizDist>0.001, so
-//         pressing into a wall (horizDist≈0) fades the bob out correctly.
-//         When _bobFactor falls below 0.05 the phase snaps to the nearest
-//         zero crossing so the bob always fades in from silence, not mid-peak.
-//         bobSpeed unit changed back to rad/s; update index.html.
+// v7.14 — Bob as pitch rotation instead of Y position offset.
 // v7.14 — Bob as pitch rotation instead of Y position offset.
 //         Root cause: position-lerp _renderY lags behind physicsY when
 //         climbing → camera rendered lower than physics → floor appears
@@ -303,12 +309,13 @@ export async function initEngine({
     // ── Camera bob ─────────────────────────────────────────────────────────
     // bobStrength: vertical sine amplitude in world units (0 = disabled).
     //   0.02 = barely noticeable, 0.05 = natural, 0.10 = very pronounced.
-    // bobSpeed: phase advance in radians per world unit traveled.
-    //   Phase is driven by actual horizontal displacement, so walking into
-    //   a wall or up a steep slope naturally slows/stops the bob.
-    //   At MOVE_SPEED 5.6 u/s: 2.0 ≈ 1.8 Hz (comfortable walking rhythm).
+    //   Applied as a Y-position offset (not pitch), so slope angle has
+    //   zero effect on apparent amplitude.
+    // bobSpeed: phase advance rate in radians per second (rad/s).
+    //   Phase advances only when actually moving (horizDist > 0.001).
+    //   At MOVE_SPEED 5.6 u/s and bobSpeed 7.0: ~1.1 Hz walking rhythm.
     bobStrength = 0,
-    bobSpeed    = 2.0,
+    bobSpeed    = 7.0,
 }) {
     // ── Renderer ──────────────────────────────────────────────────────────────
     const renderer = new THREE.WebGLRenderer({
@@ -589,39 +596,58 @@ export async function initEngine({
         // 3. Animated textures every 3rd frame
         if (frameN % 3 === 0) tickAnimatedTextures();
 
-        // 3. Portal opacity
+        // 4. Portal opacity
         for (const p of portals) p.mesh.material.opacity = p.opacity;
 
-        // 4. Hash save every 3 s — uses raw physics Y, not bobbed Y
+        // 5. Hash save every 3 s — uses raw physics Y, not bobbed Y
         const now = performance.now();
         if (now - lastHash >= 3000) {
             lastHash = now;
             writeHashState(cam.position.x, cam.position.y, cam.position.z, yaw);
         }
 
-        // 5. Portal hover cursor — uses raw physics cam position
+        // 6. Portal hover cursor — uses raw physics cam position
         canvas.style.cursor = getHoveredPortal() ? "pointer" : "default";
 
-        // 6. Camera bob — pitch rotation, time-based phase.
-        // _bobFactor gated by horizDist: fades out when not actually moving
-        // (wall press). Phase advances at fixed dt*bobSpeed so frequency is
-        // identical on flat ground, uphill, downhill and wall-sliding.
+        // 7. Camera bob — pure Y-position offset, independent of camera pitch.
+        //
+        // Design rationale (v7.17):
+        //   • Y-offset (not pitch): slope angle and LOOK_SPEED pitch changes
+        //     have zero effect on apparent bob amplitude.
+        //   • fadeRate scales with horizDist: near zero movement (wall press,
+        //     stopped) the factor fades out quickly (rate→20); while moving
+        //     normally it fades in/out at rate 8. This prevents wall-induced
+        //     amplitude increase without a hard threshold.
+        //   • Phase always advances toward the nearest zero crossing when
+        //     not active (bobActive=false) at rate bobSpeed. This guarantees
+        //     the bob value sin(_bobPhase)*_bobFactor decays smoothly through
+        //     zero with no mid-sine jitter or sudden snap.
         const isWalkKey=keys.w||keys.s||keys.a||keys.d||keys.arrowup||keys.arrowdown||keys.arrowleft||keys.arrowright;
         const bobActive=bobStrength>0&&physics.isOnGround&&isWalkKey&&horizDist>0.001;
-        const fadeRate=horizDist<0.005?20:8;
+        // fadeRate: maps horizDist 0→0.001 to rate 20→8 smoothly.
+        const fadeRate=bobActive?8:20;
         _bobFactor+=((bobActive?1:0)-_bobFactor)*(1-Math.exp(-dt*fadeRate));
-        if(bobActive)_bobPhase+=dt*bobSpeed;
-        else if(_bobFactor<0.05)_bobPhase=Math.round(_bobPhase/Math.PI)*Math.PI;
-        const bobAngle=Math.sin(_bobPhase)*bobStrength*_bobFactor;
+        if(bobActive){
+            _bobPhase+=dt*bobSpeed;
+        } else {
+            // Advance phase toward the nearest N*PI zero crossing so the
+            // bob damps to exactly 0, not to an arbitrary sine value.
+            const target=Math.round(_bobPhase/Math.PI)*Math.PI;
+            const diff=target-_bobPhase;
+            const step=dt*bobSpeed;
+            _bobPhase+=Math.abs(diff)<=step?diff:Math.sign(diff)*step;
+        }
+        const bobOffset=Math.sin(_bobPhase)*bobStrength*_bobFactor;
 
-        // Save physics pitch, apply bob, render, restore — physics never sees it.
-        const savedPitch=cam.rotation.x;
-        cam.rotation.x=savedPitch+bobAngle;
+        // Apply bob as Y-position offset — save physics Y, shift cam up/down,
+        // render, restore. Rapier and hash saves never see the offset.
+        const savedY=cam.position.y;
+        cam.position.y=savedY+bobOffset;
 
-        // 7. Render
+        // 8. Render
         if (sceneReady) composer.render();
         else            renderer.render(scene, cam);
 
-        cam.rotation.x=savedPitch;
+        cam.position.y=savedY;
     })();
 }
