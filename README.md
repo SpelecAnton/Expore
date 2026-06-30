@@ -8,11 +8,11 @@ A 3D walking simulator engine made specifically for people who don't know how to
 
 ### 1. Get TrenchBroom
 Expore uses **TrenchBroom** as its level editor. If you don't have it yet, download and install it first.
-* [Download TrenchBroom](https://trenchbroom.github.io/)
+* [Download TrenchBroom](https://github.com/TrenchBroom/TrenchBroom/releases/)
 
 ### 2. Download the Expore Package
 Grab the latest release of the Expore Map Maker package and extract it to your computer.
-* 📦 [Download Latest Release](https://github.com/SpelecAnton/Expore/releases/download/1.6/ExporeMapMaker.zip)
+* 📦 [Download Latest Release](https://github.com/SpelecAnton/Expore/releases/)
 
 ### 3. (Optional) Download VSCodium with live preview addon
 For easy editing html files and testing the maps on local PC.
