@@ -6,8 +6,6 @@
   <meta http-equiv="Content-Security-Policy" content="connect-src *;">
   <link rel="icon" type="image/x-icon" href="https://spelecanton.github.io/Expore/favicon.ico">
   <title>EXPORE</title>
-
-
 </head>
 <body>
 
@@ -26,8 +24,10 @@
   // ── 3D engine ─────────────────────────────────────────────────────────────
   await initEngine({
     canvas:      document.getElementById('c'),
-    mapUrl:      'teaching.expore',
+    mapUrl:      'teaching.bsp',
     textureBase: 'textures/',
+
+    targetFps: 0,
 
     fogColor:       0x000000,
     renderDistance: 180,
@@ -37,15 +37,16 @@
     bloomThreshold: 0.2,
     maxPixelRatio:  1.5,
 
-    //experimental
-    bobStrength: 0,
+    bobStrength: 0.00,
     bobSpeed: 10,
 
-    brightness: 0.0,
-    contrast: 1.0,
-    tintRgba: [1, 1, 1, 0],
+    brightness: 0.00,
+    contrast: 1.00,
+    tintRgba: [1.00, 1.00, 1.00, 0.00],
 
     shaderTexSize: 1024,
+    shaderFps: 30,      
+    shaderFilter: 1,    
 
     physicsConfig: {
       MOVE_SPEED:      280 * 0.02,
@@ -94,48 +95,48 @@
   });
 </script>
 
-  <script type="importmap">
-    {
-      "imports": {
-        "three": "https://cdn.jsdelivr.net/npm/three@0.165.0/build/three.module.js",
-        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.165.0/examples/jsm/"
-      }
+<script type="importmap">
+  {
+    "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.165.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.165.0/examples/jsm/"
     }
-  </script>
+  }
+</script>
 
-  <style>
-    * { margin: 0; padding: 0; box-sizing: border-box; }
-    body { background: #000; overflow: hidden; }
-    canvas { display: block; }
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #000; overflow: hidden; }
+  canvas { display: block; }
 
-    #loading {
-      position: fixed; inset: 0;
-      display: flex; flex-direction: column;
-      align-items: center; justify-content: center;
-      background: #000; color: #fff;
-      font-family: "Share Tech Mono", monospace;
-      font-size: 14px; gap: 16px; z-index: 100;
-      transition: opacity 0.4s;
-    }
-    #loading.hidden { opacity: 0; pointer-events: none; }
+  #loading {
+    position: fixed; inset: 0;
+    display: flex; flex-direction: column;
+    align-items: center; justify-content: center;
+    background: #000; color: #fff;
+    font-family: "Share Tech Mono", monospace;
+    font-size: 14px; gap: 16px; z-index: 100;
+    transition: opacity 0.4s;
+  }
+  #loading.hidden { opacity: 0; pointer-events: none; }
 
-    #progress-bar {
-      width: 260px; height: 4px;
-      background: rgba(255,255,255,0.15);
-      border-radius: 2px; overflow: hidden;
-    }
-    #progress-fill {
-      height: 100%; width: 0%;
-      background: #fff; transition: width 0.2s;
-    }
+  #progress-bar {
+    width: 260px; height: 4px;
+    background: rgba(255,255,255,0.15);
+    border-radius: 2px; overflow: hidden;
+  }
+  #progress-fill {
+    height: 100%; width: 0%;
+    background: #fff; transition: width 0.2s;
+  }
 
-    #fade {
-      position: fixed; inset: 0; background: #000;
-      opacity: 0; pointer-events: none;
-      transition: opacity 0.35s; z-index: 50;
-    }
-    #fade.out { opacity: 1; }
-  </style>
+  #fade {
+    position: fixed; inset: 0; background: #000;
+    opacity: 0; pointer-events: none;
+    transition: opacity 0.35s; z-index: 50;
+  }
+  #fade.out { opacity: 1; }
+</style>
 
 </body>
 </html>
