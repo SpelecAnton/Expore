@@ -1,5 +1,16 @@
-// engine.js v7.20
+// engine.js v7.21
 // Changelog:
+// v7.21 — FIX: shader (.frag) textures on portal media planes never animate.
+//         Portal meshes (buildPortal/applyPortalMediaTexture) had no
+//         onBeforeRender hook, so a shader texture's _lastVisibleFrame
+//         (used by tickAnimatedTextures() in bsp_loader.js to decide
+//         whether to keep ticking a GlslCanvas sandbox) stayed stuck at 0
+//         forever, getting the shader auto-paused after a couple of
+//         frames even though the portal was clearly on screen. BSP face
+//         meshes never had this issue because they already refresh
+//         _lastVisibleFrame every frame in their own onBeforeRender.
+//         Fix: import touchTexture() from bsp_loader.js and call it from
+//         the portal mesh's onBeforeRender, exactly like BSP faces do.
 // v7.20 — Add targetFps parameter to initEngine().
 //         0 = unlimited (native requestAnimationFrame rate).
 //         e.g. 30 = cap at 30 fps, 60 = cap at 60 fps.
@@ -20,7 +31,7 @@ import { EffectComposer } from "https://cdn.jsdelivr.net/npm/three@0.165.0/examp
 import { RenderPass }     from "https://cdn.jsdelivr.net/npm/three@0.165.0/examples/jsm/postprocessing/RenderPass.js";
 import { UnrealBloomPass } from "https://cdn.jsdelivr.net/npm/three@0.165.0/examples/jsm/postprocessing/UnrealBloomPass.js";
 import { ShaderPass }      from "https://cdn.jsdelivr.net/npm/three@0.165.0/examples/jsm/postprocessing/ShaderPass.js";
-import { loadBSP, tickAnimatedTextures, initTexLoader, unmuteVideos, loadTextureFromUrl, setShaderTexSize, setShaderConfig }
+import { loadBSP, tickAnimatedTextures, initTexLoader, unmuteVideos, loadTextureFromUrl, setShaderTexSize, setShaderConfig, touchTexture }
     from "https://spelecanton.github.io/Expore/javascript/bsp_loader.js";
 import { createPhysics } from "https://spelecanton.github.io/Expore/javascript/physics.js";
 
@@ -200,6 +211,17 @@ function buildPortal(entity, scene, portals) {
     }));
     mesh.position.set(px, py, pz);
     mesh.rotation.y = angle;
+
+    // FIX v7.21: without this, a shader (.frag) texture applied to this
+    // portal plane via applyPortalMediaTexture() never got its
+    // _lastVisibleFrame refreshed, so tickAnimatedTextures() in
+    // bsp_loader.js paused the GlslCanvas sandbox after a couple of frames
+    // and it never resumed — even though the portal was clearly visible.
+    // BSP face meshes already do this in buildMeshesProgressively().
+    mesh.onBeforeRender = function () {
+        if (mesh.material.map) touchTexture(mesh.material.map);
+    };
+
     scene.add(mesh);
     mesh.add(new THREE.LineSegments(
         new THREE.EdgesGeometry(geo),
