@@ -1,1 +1,425 @@
-"use strict";import*as THREE from"https://cdn.jsdelivr.net/npm/three@0.165.0/build/three.module.js";const BROADCAST_MS=150,REQ_TIMEOUT=2500,SPRITE_SIZE=.44,LABEL_W=1.83,LABEL_H=.2,LABEL_Y=.6,BODY_Y=-.28,LERP_SPEED=10,SKINS_URL="https://spelecanton.github.io/Expore/player_skins.txt",SKIN_SCALE=2.2,RESERVED_NAME="Anton Špelec";function _autoMapName(){return window.location.pathname.toLowerCase().replace(/^\/|\/$/g,"")||"root"}function _idToHue(e){let t=0;for(let n=0;n<e.length;n++)t=e.charCodeAt(n)+((t<<5)-t);return(t%360+360)%360}function _makeBodyTex(e){const t=128,n=document.createElement("canvas");n.width=n.height=t;const a=n.getContext("2d"),i=a.createRadialGradient(64,64,10.24,64,64,64);i.addColorStop(0,`hsla(${e},100%,78%,0.90)`),i.addColorStop(.45,`hsla(${e},100%,55%,0.60)`),i.addColorStop(1,`hsla(${e},100%,40%,0.00)`),a.fillStyle=i,a.fillRect(0,0,t,t),a.beginPath(),a.arc(64,64,25.6,0,2*Math.PI),a.fillStyle=`hsl(${e},100%,82%)`,a.fill(),a.beginPath(),a.arc(64,64,8.96,0,2*Math.PI),a.fillStyle="rgba(255,255,255,0.95)",a.fill();const o=new THREE.CanvasTexture(n);return o.needsUpdate=!0,o}function _makeLabelTex(e,t){const n=512,a=56,i=document.createElement("canvas");i.width=n,i.height=a;const o=i.getContext("2d");o.clearRect(0,0,n,a);o.fillStyle="rgba(0,0,0,0.72)",o.beginPath(),o.moveTo(10,0),o.arcTo(n,0,n,a,10),o.arcTo(n,a,0,a,10),o.arcTo(0,a,0,0,10),o.arcTo(0,0,n,0,10),o.closePath(),o.fill();let r=23;for(o.font=`bold ${r}px "Share Tech Mono","Courier New",monospace`;o.measureText(e).width>488&&r>8;)r--,o.font=`bold ${r}px "Share Tech Mono","Courier New",monospace`;o.textAlign="center",o.textBaseline="middle",o.fillStyle=`hsl(${t},100%,72%)`,o.fillText(e,256,28);const s=new THREE.CanvasTexture(i);return s.needsUpdate=!0,s}const _skinLoader=new THREE.TextureLoader;async function _loadSkinMap(e){const t=new Map;if(!e)return t;try{const n=new AbortController,a=setTimeout(()=>n.abort(),2500),i=await fetch(e,{signal:n.signal});if(clearTimeout(a),!i.ok)return t;const o=await i.text();for(const e of o.split("\n")){const n=e.trim();if(!n||n.startsWith("#"))continue;const a=n.indexOf("=");if(-1===a)continue;const i=n.slice(0,a).trim(),o=n.slice(a+1).trim();i&&/^https?:\/\//i.test(o)&&t.set(i.toLowerCase(),o)}console.log(`[Multiplayer] Skin list loaded: ${t.size} entr${1===t.size?"y":"ies"}`)}catch{console.warn("[Multiplayer] Skin list unreachable — using default sprites")}return t}_skinLoader.setCrossOrigin("anonymous");const SKIN_VIDEO_EXTS=new Set([".mp4",".webm"]),SKIN_ANIM_EXTS=new Set([".gif",".avif",".webp"]);function _extOf(e){try{const t=new URL(e,window.location.origin).pathname;return t.substring(t.lastIndexOf(".")).toLowerCase()}catch{return""}}const _activeAnimSkins=new Set,_activeVideoSkins=new Set;function _loadVideoSkin(e){return new Promise(t=>{const n=document.createElement("video");n.src=e,n.loop=!0,n.muted=!0,n.playsInline=!0,n.autoplay=!0,n.preload="auto",n.crossOrigin="anonymous",n.style.position="absolute",n.style.top="0",n.style.left="0",n.style.width="1px",n.style.height="1px",n.style.opacity="0",n.style.pointerEvents="none",document.body.appendChild(n);let a=!1;n.addEventListener("loadeddata",()=>{if(a)return;a=!0;const e=new THREE.VideoTexture(n);e.colorSpace=THREE.SRGBColorSpace,e.minFilter=THREE.LinearFilter,e.magFilter=THREE.LinearFilter,e.generateMipmaps=!1,e.wrapS=e.wrapT=THREE.ClampToEdgeWrapping,n.play().catch(()=>{}),_activeVideoSkins.add(n),t({tex:e,width:n.videoWidth||1,height:n.videoHeight||1,cleanup:()=>{_activeVideoSkins.delete(n),n.pause(),n.removeAttribute("src"),n.load(),n.remove()}})},{once:!0}),n.addEventListener("error",()=>{a||(a=!0,console.warn("[Multiplayer] Video skin failed to load:",e),n.remove(),t(null))},{once:!0}),n.load()})}async function _loadAnimatedSkin(e){if("undefined"==typeof ImageDecoder)return console.warn("[Multiplayer] ImageDecoder not available, static fallback:",e),_loadStaticSkin(e);try{const t=await fetch(e,{mode:"cors"});if(!t.ok)return null;const n=await t.arrayBuffer(),a=_extOf(e),i={".gif":"image/gif",".avif":"image/avif",".webp":"image/webp"}[a]??"image/gif",s=new ImageDecoder({data:n,type:i,preferAnimation:!0});await s.tracks.ready;await s.completed;const r=s.tracks.selectedTrack?.frameCount??1;if(r<=1){s.close();return _loadStaticSkin(e)}const l=[];let c=0,d=0;for(let e=0;e<r;e++){const t=(await s.decode({frameIndex:e})).image,n=null!=t.duration?t.duration/1e3:100;0===e&&(c=t.displayWidth||t.codedWidth||128,d=t.displayHeight||t.codedHeight||128);const a=await createImageBitmap(t,{resizeWidth:c,resizeHeight:d});t.close(),l.push({bitmap:a,duration:n})}if(s.close(),!l.length)return _loadStaticSkin(e);const p=document.createElement("canvas");p.width=c,p.height=d;const u=p.getContext("2d");u.drawImage(l[0].bitmap,0,0,c,d);const m=new THREE.CanvasTexture(p);m.colorSpace=THREE.SRGBColorSpace,m.needsUpdate=!0;const f={frames:l,canvas:p,ctx:u,tex:m,frameIdx:0,nextFrameTime:performance.now()+l[0].duration};return _activeAnimSkins.add(f),{tex:m,width:c,height:d,cleanup:()=>{_activeAnimSkins.delete(f);for(const e of l)e.bitmap.close()}}}catch(t){return console.warn("[Multiplayer] Animated skin load failed, static fallback:",e,t.message),_loadStaticSkin(e)}}function _loadStaticSkin(e){return new Promise(t=>{_skinLoader.load(e,e=>{e.colorSpace=THREE.SRGBColorSpace,e.needsUpdate=!0;const n=e.image;t({tex:e,width:n?.width||1,height:n?.height||1,cleanup:()=>{}})},void 0,()=>{console.warn("[Multiplayer] Skin image failed to load:",e),t(null)})})}function _loadSkinAsset(e){const t=_extOf(e);return SKIN_VIDEO_EXTS.has(t)?_loadVideoSkin(e):SKIN_ANIM_EXTS.has(t)?_loadAnimatedSkin(e):_loadStaticSkin(e)}function _tickAnimatedSkins(){if(_activeAnimSkins.size){const e=performance.now();for(const t of _activeAnimSkins){if(e<t.nextFrameTime)continue;const n=t.frames[t.frameIdx];t.ctx.clearRect(0,0,t.canvas.width,t.canvas.height),t.ctx.drawImage(n.bitmap,0,0,t.canvas.width,t.canvas.height),t.tex.needsUpdate=!0,t.frameIdx=(t.frameIdx+1)%t.frames.length,t.nextFrameTime=e+n.duration}}if(_activeVideoSkins.size)for(const e of _activeVideoSkins)e.paused&&!e.ended&&e.play().catch(()=>{})}export function createMultiplayer(e,{playersUrl:t="https://spelec.cz/chat/players.php",mapName:n=null,skinsUrl:a=SKINS_URL}={}){const i=n??_autoMapName();console.log(`[Multiplayer] Map key: "${i}"`);let o=localStorage.getItem("chat_user_id")||"",r=localStorage.getItem("chat_nick")||"Anon";o||(o=Array.from(crypto.getRandomValues(new Uint8Array(8))).map(e=>e.toString(16).padStart(2,"0")).join(""),localStorage.setItem("chat_user_id",o));let s="",l=new Map;function c(e,t){const n=(e||"").trim(),a=l.get(n.toLowerCase());return a&&(n!==RESERVED_NAME||t)?a:null}const d=new Map;let p=null,u=null,m=performance.now();function f(e){e.bodyTex&&(e.bodyTex.dispose(),e.bodyTex=null),e.skinCleanup&&(e.skinCleanup(),e.skinCleanup=null);const t=e.skinUrl;if(!t)return e.bodyTex=_makeBodyTex(e.hue),e.bodySprite.scale.set(.44,.44,1),e.bodySprite.material.map=e.bodyTex,void(e.bodySprite.material.needsUpdate=!0);e.bodySprite.material.map=null,e.bodySprite.material.needsUpdate=!0,_loadSkinAsset(t).then(n=>{if(e.destroyed||e.skinUrl!==t)return void(n&&(n.tex.dispose(),n.cleanup()));if(!n)return e.skinUrl=null,void f(e);e.bodyTex=n.tex,e.skinCleanup=n.cleanup,e.bodySprite.material.map=n.tex,e.bodySprite.material.needsUpdate=!0;const a=n.width,i=n.height,o=.44*2.2;a>=i?e.bodySprite.scale.set(o,o*(i/a),1):e.bodySprite.scale.set(o*(a/i),o,1)})}async function S(){try{const e=window._cam;if(!e||!o)return;r=localStorage.getItem("chat_nick")||"Anon";const n=new AbortController,a=setTimeout(()=>n.abort(),2500),l=await fetch(t,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({uid:o,nick:r,x:e.position.x,y:e.position.y,z:e.position.z,map:i,admin_pass:s}),signal:n.signal});if(clearTimeout(a),!l.ok)return;!function(e){const t=new Set;for(const n of e){if(n.uid===o)continue;t.add(n.uid);const e=d.get(n.uid);if(e){e.target.set(n.x,n.y,n.z);const t=e.nick!==n.nick;t&&(e.nick=n.nick,e.labelTex.dispose(),e.labelTex=_makeLabelTex(n.nick,e.hue),e.labelSprite.material.map=e.labelTex,e.labelSprite.material.needsUpdate=!0);const a=!!n.is_admin;if(t||e.isAdmin!==a){e.isAdmin=a;const t=c(n.nick,a);t!==e.skinUrl&&(e.skinUrl=t,f(e))}}else d.set(n.uid,h(n))}for(const[e,n]of d)t.has(e)||(y(n),d.delete(e))}((await l.json()).players??[])}catch{}}function h(t){const n=_idToHue(t.uid),a=new THREE.SpriteMaterial({map:null,transparent:!0,depthWrite:!1}),i=new THREE.Sprite(a);i.scale.set(.44,.44,1),i.position.set(0,-.28,0),i.userData.noclip=!0;const o=_makeLabelTex(t.nick,n),r=new THREE.SpriteMaterial({map:o,transparent:!0,depthWrite:!1}),s=new THREE.Sprite(r);s.scale.set(1.83,.2,1),s.position.set(0,.6,0),s.userData.noclip=!0;const l=new THREE.Group;l.userData.noclip=!0,l.userData.isPlayer=!0,l.position.set(t.x,t.y,t.z),l.add(i,s),e.add(l);const d={uid:t.uid,nick:t.nick,isAdmin:!!t.is_admin,hue:n,group:l,bodySprite:i,bodyTex:null,skinUrl:null,skinCleanup:null,labelTex:o,labelSprite:s,target:new THREE.Vector3(t.x,t.y,t.z),destroyed:!1};return d.skinUrl=c(t.nick,d.isAdmin),f(d),d}function y(e){e.destroyed=!0,e.group.removeFromParent(),e.bodyTex&&e.bodyTex.dispose(),e.skinCleanup&&e.skinCleanup(),e.labelTex.dispose();for(const t of e.group.children)t.material&&t.material.dispose()}return _loadSkinMap(a).then(e=>{l=e,function(){for(const e of d.values()){const t=c(e.nick,e.isAdmin);t!==e.skinUrl&&(e.skinUrl=t,f(e))}}()}),S(),p=setInterval(S,150),u=requestAnimationFrame(function e(){const t=performance.now(),n=Math.min((t-m)/1e3,.1);m=t;const a=Math.min(1,10*n);for(const e of d.values())e.group.position.lerp(e.target,a);_tickAnimatedSkins(),u=requestAnimationFrame(e)}),{getPlayers:()=>[...d.values()].map(e=>({uid:e.uid,nick:e.nick,x:e.target.x,y:e.target.y,z:e.target.z})),setAdminPass(e){s=e||""},destroy(){clearInterval(p),cancelAnimationFrame(u);for(const e of d.values())y(e);d.clear()}}}
+"use strict";
+import * as THREE from "https://cdn.jsdelivr.net/npm/three@0.165.0/build/three.module.js";
+const BROADCAST_MS = 150,
+    REQ_TIMEOUT = 2500,
+    SPRITE_SIZE = 0.44,
+    LABEL_W = 1.83,
+    LABEL_H = 0.2,
+    LABEL_Y = 0.6,
+    BODY_Y = -0.28,
+    LERP_SPEED = 10,
+    SKINS_URL = "https://spelecanton.github.io/Expore/player_skins.txt",
+    SKIN_SCALE = 2.2,
+    RESERVED_NAME = "Anton Špelec";
+function _autoMapName() {
+    return window.location.pathname.toLowerCase().replace(/^\/|\/$/g, "") || "root";
+}
+function _idToHue(e) {
+    let t = 0;
+    for (let n = 0; n < e.length; n++) t = e.charCodeAt(n) + ((t << 5) - t);
+    return ((t % 360) + 360) % 360;
+}
+function _makeBodyTex(e) {
+    const t = 128,
+        n = document.createElement("canvas");
+    n.width = n.height = t;
+    const a = n.getContext("2d"),
+        i = a.createRadialGradient(64, 64, 10.24, 64, 64, 64);
+    i.addColorStop(0, `hsla(${e},100%,78%,0.90)`),
+        i.addColorStop(0.45, `hsla(${e},100%,55%,0.60)`),
+        i.addColorStop(1, `hsla(${e},100%,40%,0.00)`),
+        (a.fillStyle = i),
+        a.fillRect(0, 0, t, t),
+        a.beginPath(),
+        a.arc(64, 64, 25.6, 0, 2 * Math.PI),
+        (a.fillStyle = `hsl(${e},100%,82%)`),
+        a.fill(),
+        a.beginPath(),
+        a.arc(64, 64, 8.96, 0, 2 * Math.PI),
+        (a.fillStyle = "rgba(255,255,255,0.95)"),
+        a.fill();
+    const o = new THREE.CanvasTexture(n);
+    return (o.needsUpdate = !0), o;
+}
+function _makeLabelTex(e, t) {
+    const n = 512,
+        a = 56,
+        i = document.createElement("canvas");
+    (i.width = n), (i.height = a);
+    const o = i.getContext("2d");
+    o.clearRect(0, 0, n, a);
+    (o.fillStyle = "rgba(0,0,0,0.72)"),
+        o.beginPath(),
+        o.moveTo(10, 0),
+        o.arcTo(n, 0, n, a, 10),
+        o.arcTo(n, a, 0, a, 10),
+        o.arcTo(0, a, 0, 0, 10),
+        o.arcTo(0, 0, n, 0, 10),
+        o.closePath(),
+        o.fill();
+    let r = 23;
+    for (o.font = `bold ${r}px "Share Tech Mono","Courier New",monospace`; o.measureText(e).width > 488 && r > 8; )
+        r--, (o.font = `bold ${r}px "Share Tech Mono","Courier New",monospace`);
+    (o.textAlign = "center"), (o.textBaseline = "middle"), (o.fillStyle = `hsl(${t},100%,72%)`), o.fillText(e, 256, 28);
+    const s = new THREE.CanvasTexture(i);
+    return (s.needsUpdate = !0), s;
+}
+const _skinLoader = new THREE.TextureLoader();
+async function _loadSkinMap(e) {
+    const t = new Map();
+    if (!e) return t;
+    try {
+        const n = new AbortController(),
+            a = setTimeout(() => n.abort(), 2500),
+            i = await fetch(e, { signal: n.signal });
+        if ((clearTimeout(a), !i.ok)) return t;
+        const o = await i.text();
+        for (const e of o.split("\n")) {
+            const n = e.trim();
+            if (!n || n.startsWith("#")) continue;
+            const a = n.indexOf("=");
+            if (-1 === a) continue;
+            const i = n.slice(0, a).trim(),
+                o = n.slice(a + 1).trim();
+            i && /^https?:\/\//i.test(o) && t.set(i.toLowerCase(), o);
+        }
+        console.log(`[Multiplayer] Skin list loaded: ${t.size} entr${1 === t.size ? "y" : "ies"}`);
+    } catch {
+        console.warn("[Multiplayer] Skin list unreachable — using default sprites");
+    }
+    return t;
+}
+_skinLoader.setCrossOrigin("anonymous");
+const SKIN_VIDEO_EXTS = new Set([".mp4", ".webm"]),
+    SKIN_ANIM_EXTS = new Set([".gif", ".avif", ".webp"]);
+function _extOf(e) {
+    try {
+        const t = new URL(e, window.location.origin).pathname;
+        return t.substring(t.lastIndexOf(".")).toLowerCase();
+    } catch {
+        return "";
+    }
+}
+const _activeAnimSkins = new Set(),
+    _activeVideoSkins = new Set();
+function _loadVideoSkin(e) {
+    return new Promise((t) => {
+        const n = document.createElement("video");
+        (n.src = e),
+            (n.loop = !0),
+            (n.muted = !0),
+            (n.playsInline = !0),
+            (n.autoplay = !0),
+            (n.preload = "auto"),
+            (n.crossOrigin = "anonymous"),
+            (n.style.position = "absolute"),
+            (n.style.top = "0"),
+            (n.style.left = "0"),
+            (n.style.width = "1px"),
+            (n.style.height = "1px"),
+            (n.style.opacity = "0"),
+            (n.style.pointerEvents = "none"),
+            document.body.appendChild(n);
+        let a = !1;
+        n.addEventListener(
+            "loadeddata",
+            () => {
+                if (a) return;
+                a = !0;
+                const e = new THREE.VideoTexture(n);
+                (e.colorSpace = THREE.SRGBColorSpace),
+                    (e.minFilter = THREE.LinearFilter),
+                    (e.magFilter = THREE.LinearFilter),
+                    (e.generateMipmaps = !1),
+                    (e.wrapS = e.wrapT = THREE.ClampToEdgeWrapping),
+                    n.play().catch(() => {}),
+                    _activeVideoSkins.add(n),
+                    t({
+                        tex: e,
+                        width: n.videoWidth || 1,
+                        height: n.videoHeight || 1,
+                        cleanup: () => {
+                            _activeVideoSkins.delete(n), n.pause(), n.removeAttribute("src"), n.load(), n.remove();
+                        },
+                    });
+            },
+            { once: !0 }
+        ),
+            n.addEventListener(
+                "error",
+                () => {
+                    a || ((a = !0), console.warn("[Multiplayer] Video skin failed to load:", e), n.remove(), t(null));
+                },
+                { once: !0 }
+            ),
+            n.load();
+    });
+}
+async function _loadAnimatedSkin(e) {
+    if ("undefined" == typeof ImageDecoder)
+        return console.warn("[Multiplayer] ImageDecoder not available, static fallback:", e), _loadStaticSkin(e);
+    try {
+        const t = await fetch(e, { mode: "cors" });
+        if (!t.ok) return null;
+        const n = await t.arrayBuffer(),
+            a = _extOf(e),
+            i = { ".gif": "image/gif", ".avif": "image/avif", ".webp": "image/webp" }[a] ?? "image/gif",
+            s = new ImageDecoder({ data: n, type: i, preferAnimation: !0 });
+        await s.tracks.ready;
+        await s.completed;
+        const r = s.tracks.selectedTrack?.frameCount ?? 1;
+        if (r <= 1) {
+            s.close();
+            return _loadStaticSkin(e);
+        }
+        const l = [];
+        let c = 0,
+            d = 0;
+        for (let e = 0; e < r; e++) {
+            const t = (await s.decode({ frameIndex: e })).image,
+                n = null != t.duration ? t.duration / 1e3 : 100;
+            0 === e && ((c = t.displayWidth || t.codedWidth || 128), (d = t.displayHeight || t.codedHeight || 128));
+            const a = await createImageBitmap(t, { resizeWidth: c, resizeHeight: d });
+            t.close(), l.push({ bitmap: a, duration: n });
+        }
+        if ((s.close(), !l.length)) return _loadStaticSkin(e);
+        const p = document.createElement("canvas");
+        (p.width = c), (p.height = d);
+        const u = p.getContext("2d");
+        u.drawImage(l[0].bitmap, 0, 0, c, d);
+        const m = new THREE.CanvasTexture(p);
+        (m.colorSpace = THREE.SRGBColorSpace), (m.needsUpdate = !0);
+        const f = {
+            frames: l,
+            canvas: p,
+            ctx: u,
+            tex: m,
+            frameIdx: 0,
+            nextFrameTime: performance.now() + l[0].duration,
+        };
+        return (
+            _activeAnimSkins.add(f),
+            {
+                tex: m,
+                width: c,
+                height: d,
+                cleanup: () => {
+                    _activeAnimSkins.delete(f);
+                    for (const e of l) e.bitmap.close();
+                },
+            }
+        );
+    } catch (t) {
+        return (
+            console.warn("[Multiplayer] Animated skin load failed, static fallback:", e, t.message), _loadStaticSkin(e)
+        );
+    }
+}
+function _loadStaticSkin(e) {
+    return new Promise((t) => {
+        _skinLoader.load(
+            e,
+            (e) => {
+                (e.colorSpace = THREE.SRGBColorSpace), (e.needsUpdate = !0);
+                const n = e.image;
+                t({ tex: e, width: n?.width || 1, height: n?.height || 1, cleanup: () => {} });
+            },
+            void 0,
+            () => {
+                console.warn("[Multiplayer] Skin image failed to load:", e), t(null);
+            }
+        );
+    });
+}
+function _loadSkinAsset(e) {
+    const t = _extOf(e);
+    return SKIN_VIDEO_EXTS.has(t)
+        ? _loadVideoSkin(e)
+        : SKIN_ANIM_EXTS.has(t)
+          ? _loadAnimatedSkin(e)
+          : _loadStaticSkin(e);
+}
+function _tickAnimatedSkins() {
+    if (_activeAnimSkins.size) {
+        const e = performance.now();
+        for (const t of _activeAnimSkins) {
+            if (e < t.nextFrameTime) continue;
+            const n = t.frames[t.frameIdx];
+            t.ctx.clearRect(0, 0, t.canvas.width, t.canvas.height),
+                t.ctx.drawImage(n.bitmap, 0, 0, t.canvas.width, t.canvas.height),
+                (t.tex.needsUpdate = !0),
+                (t.frameIdx = (t.frameIdx + 1) % t.frames.length),
+                (t.nextFrameTime = e + n.duration);
+        }
+    }
+    if (_activeVideoSkins.size) for (const e of _activeVideoSkins) e.paused && !e.ended && e.play().catch(() => {});
+}
+export function createMultiplayer(
+    e,
+    { playersUrl: t = "https://spelec.cz/chat/players.php", mapName: n = null, skinsUrl: a = SKINS_URL } = {}
+) {
+    const i = n ?? _autoMapName();
+    console.log(`[Multiplayer] Map key: "${i}"`);
+    let o = localStorage.getItem("chat_user_id") || "",
+        r = localStorage.getItem("chat_nick") || "Anon";
+    o ||
+        ((o = Array.from(crypto.getRandomValues(new Uint8Array(8)))
+            .map((e) => e.toString(16).padStart(2, "0"))
+            .join("")),
+        localStorage.setItem("chat_user_id", o));
+    let s = "",
+        l = new Map();
+    function c(e, t) {
+        const n = (e || "").trim(),
+            a = l.get(n.toLowerCase());
+        return a && (n !== RESERVED_NAME || t) ? a : null;
+    }
+    const d = new Map();
+    let p = null,
+        u = null,
+        m = performance.now();
+    function f(e) {
+        e.bodyTex && (e.bodyTex.dispose(), (e.bodyTex = null)),
+            e.skinCleanup && (e.skinCleanup(), (e.skinCleanup = null));
+        const t = e.skinUrl;
+        if (!t)
+            return (
+                (e.bodyTex = _makeBodyTex(e.hue)),
+                e.bodySprite.scale.set(0.44, 0.44, 1),
+                (e.bodySprite.material.map = e.bodyTex),
+                void (e.bodySprite.material.needsUpdate = !0)
+            );
+        (e.bodySprite.material.map = null),
+            (e.bodySprite.material.needsUpdate = !0),
+            _loadSkinAsset(t).then((n) => {
+                if (e.destroyed || e.skinUrl !== t) return void (n && (n.tex.dispose(), n.cleanup()));
+                if (!n) return (e.skinUrl = null), void f(e);
+                (e.bodyTex = n.tex),
+                    (e.skinCleanup = n.cleanup),
+                    (e.bodySprite.material.map = n.tex),
+                    (e.bodySprite.material.needsUpdate = !0);
+                const a = n.width,
+                    i = n.height,
+                    o = 0.44 * 2.2;
+                a >= i ? e.bodySprite.scale.set(o, o * (i / a), 1) : e.bodySprite.scale.set(o * (a / i), o, 1);
+            });
+    }
+    async function S() {
+        try {
+            const e = window._cam;
+            if (!e || !o) return;
+            r = localStorage.getItem("chat_nick") || "Anon";
+            const n = new AbortController(),
+                a = setTimeout(() => n.abort(), 2500),
+                l = await fetch(t, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({
+                        uid: o,
+                        nick: r,
+                        x: e.position.x,
+                        y: e.position.y,
+                        z: e.position.z,
+                        map: i,
+                        admin_pass: s,
+                    }),
+                    signal: n.signal,
+                });
+            if ((clearTimeout(a), !l.ok)) return;
+            !(function (e) {
+                const t = new Set();
+                for (const n of e) {
+                    if (n.uid === o) continue;
+                    t.add(n.uid);
+                    const e = d.get(n.uid);
+                    if (e) {
+                        e.target.set(n.x, n.y, n.z);
+                        const t = e.nick !== n.nick;
+                        t &&
+                            ((e.nick = n.nick),
+                            e.labelTex.dispose(),
+                            (e.labelTex = _makeLabelTex(n.nick, e.hue)),
+                            (e.labelSprite.material.map = e.labelTex),
+                            (e.labelSprite.material.needsUpdate = !0));
+                        const a = !!n.is_admin;
+                        if (t || e.isAdmin !== a) {
+                            e.isAdmin = a;
+                            const t = c(n.nick, a);
+                            t !== e.skinUrl && ((e.skinUrl = t), f(e));
+                        }
+                    } else d.set(n.uid, h(n));
+                }
+                for (const [e, n] of d) t.has(e) || (y(n), d.delete(e));
+            })((await l.json()).players ?? []);
+        } catch {}
+    }
+    function h(t) {
+        const n = _idToHue(t.uid),
+            a = new THREE.SpriteMaterial({ map: null, transparent: !0, depthWrite: !1 }),
+            i = new THREE.Sprite(a);
+        i.scale.set(0.44, 0.44, 1), i.position.set(0, -0.28, 0), (i.userData.noclip = !0);
+        const o = _makeLabelTex(t.nick, n),
+            r = new THREE.SpriteMaterial({ map: o, transparent: !0, depthWrite: !1 }),
+            s = new THREE.Sprite(r);
+        s.scale.set(1.83, 0.2, 1), s.position.set(0, 0.6, 0), (s.userData.noclip = !0);
+        const l = new THREE.Group();
+        (l.userData.noclip = !0), (l.userData.isPlayer = !0), l.position.set(t.x, t.y, t.z), l.add(i, s), e.add(l);
+        const d = {
+            uid: t.uid,
+            nick: t.nick,
+            isAdmin: !!t.is_admin,
+            hue: n,
+            group: l,
+            bodySprite: i,
+            bodyTex: null,
+            skinUrl: null,
+            skinCleanup: null,
+            labelTex: o,
+            labelSprite: s,
+            target: new THREE.Vector3(t.x, t.y, t.z),
+            destroyed: !1,
+        };
+        return (d.skinUrl = c(t.nick, d.isAdmin)), f(d), d;
+    }
+    function y(e) {
+        (e.destroyed = !0),
+            e.group.removeFromParent(),
+            e.bodyTex && e.bodyTex.dispose(),
+            e.skinCleanup && e.skinCleanup(),
+            e.labelTex.dispose();
+        for (const t of e.group.children) t.material && t.material.dispose();
+    }
+    return (
+        _loadSkinMap(a).then((e) => {
+            (l = e),
+                (function () {
+                    for (const e of d.values()) {
+                        const t = c(e.nick, e.isAdmin);
+                        t !== e.skinUrl && ((e.skinUrl = t), f(e));
+                    }
+                })();
+        }),
+        S(),
+        (p = setInterval(S, 150)),
+        (u = requestAnimationFrame(function e() {
+            const t = performance.now(),
+                n = Math.min((t - m) / 1e3, 0.1);
+            m = t;
+            const a = Math.min(1, 10 * n);
+            for (const e of d.values()) e.group.position.lerp(e.target, a);
+            _tickAnimatedSkins(), (u = requestAnimationFrame(e));
+        })),
+        {
+            getPlayers: () =>
+                [...d.values()].map((e) => ({ uid: e.uid, nick: e.nick, x: e.target.x, y: e.target.y, z: e.target.z })),
+            setAdminPass(e) {
+                s = e || "";
+            },
+            destroy() {
+                clearInterval(p), cancelAnimationFrame(u);
+                for (const e of d.values()) y(e);
+                d.clear();
+            },
+        }
+    );
+}

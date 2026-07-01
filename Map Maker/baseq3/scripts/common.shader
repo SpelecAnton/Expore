@@ -8,54 +8,7 @@ textures/common/clip
     surfaceparm monsterclip
 }
 
-textures/lights/1k/*
-{
-    q3map_surfacelight 1000
-    q3map_lightsubdivide 64
-    q3map_lightImage $whiteimage
-    {
-        map $lightmap
-        rgbGen identity
-    }
-    {
-        map textures/lights/*
-        blendFunc GL_DST_COLOR GL_ZERO
-        rgbGen identity
-    }
-}
-
-textures/lights/2k/*
-{
-    q3map_surfacelight 2000
-    q3map_lightsubdivide 64
-    q3map_lightImage $whiteimage
-    {
-        map $lightmap
-        rgbGen identity
-    }
-    {
-        map textures/lights/*
-        blendFunc GL_DST_COLOR GL_ZERO
-        rgbGen identity
-    }
-}
-
-textures/lights/5k/*
-{
-    q3map_surfacelight 5000
-    q3map_lightsubdivide 64
-    q3map_lightImage $whiteimage
-    {
-        map $lightmap
-        rgbGen identity
-    }
-    {
-        map textures/lights/*
-        blendFunc GL_DST_COLOR GL_ZERO
-        rgbGen identity
-    }
-}
-
+// ── Video surface (emissive) ──────────────────────────────────────────────────
 textures/video
 {
     q3map_surfacelight 1000

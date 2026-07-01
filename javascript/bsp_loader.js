@@ -1,52 +1,655 @@
-// bsp_loader.js v5.12 — FIX: shaderTexSize / shaderFps / shaderFilter not
-// actually taking effect (most visible on portal shader textures, but the
-// root cause affects every .frag shader texture in the engine).
-// Root cause: GlslCanvas.js starts its OWN independent render loop inside
-// its constructor (RenderLoop(), driven by its own requestAnimationFrame),
-// completely outside our control:
-//   1) It keeps re-rendering the shader on every single browser frame as
-//      long as the shader references u_time/u_mouse/u_date more than once
-//      (this.animated=true) — so our shaderFps throttle in
-//      tickAnimatedTextures() only ever ADDED extra forced renders on top;
-//      it never actually slowed anything down, because GlslCanvas itself
-//      never stopped rendering at full native rate.
-//   2) Its first render already happens SYNCHRONOUSLY inside the
-//      constructor, before bsp_loader.js gets the instance back — and that
-//      first render calls GlslCanvas's own resize(), which recomputes
-//      canvas.width/height from canvas.clientWidth * devicePixelRatio.
-//      On any display with devicePixelRatio != 1 this immediately grows
-//      the canvas past our configured _shaderTexSize, and the previous
-//      "lock resize after construction" fix (v5.11) was already too late
-//      to prevent that first, silent resize.
-// Fix: after construction, (a) cancel GlslCanvas's own animation frame
-// loop entirely so it never self-drives again, (b) forcibly reset the
-// canvas back to the exact configured _shaderTexSize (undoing any damage
-// from that first internal resize), (c) permanently disable resize().
-// From this point on, tickAnimatedTextures() is the ONLY thing that ever
-// calls sandbox.render() — so shaderFps, shaderTexSize and shaderFilter
-// all behave exactly as configured, with no competing internal loop.
-import*as THREE from"https://cdn.jsdelivr.net/npm/three@0.165.0/build/three.module.js";let _bvhAvailable=!1,_MeshBVH=null,_acceleratedRaycast=null;(async()=>{try{const e=await import("https://cdn.jsdelivr.net/npm/three-mesh-bvh@0.7.3/build/index.module.js");_MeshBVH=e.MeshBVH,_acceleratedRaycast=e.acceleratedRaycast,_bvhAvailable=!0,console.log("[BSP] three-mesh-bvh loaded — BVH raycasting enabled")}catch{console.warn("[BSP] three-mesh-bvh not available — using standard raycasting")}})();const _bvhQueue=[];let _bvhScheduled=!1;function scheduleBVHBuild(e){if(_bvhQueue.push(e),_bvhScheduled)return;_bvhScheduled=!0;const t="function"==typeof requestIdleCallback?e=>requestIdleCallback(e,{timeout:2e3}):e=>setTimeout(e,0);t(function e(a){const n=()=>!a||a.timeRemaining()>2;for(;_bvhQueue.length&&n();){const e=_bvhQueue.shift();try{e.boundsTree=new _MeshBVH(e),e.rawcastFunc=_acceleratedRaycast}catch{}}_bvhQueue.length?t(e):_bvhScheduled=!1})}function buildBVH(e){_bvhAvailable&&_MeshBVH&&_acceleratedRaycast&&scheduleBVHBuild(e)}const VIDEO_EXTS=new Set([".mp4",".webm"]),SHADER_EXTS=new Set([".frag"]),TEX_EXTENSIONS=[".mp4",".webm",".frag",".gif",".avif",".webp",".png",".jpg"],ANIM_EXTS=new Set([".gif",".avif",".webp"]),TEXTURE_BATCH_SIZE=4,MESH_YIELD_EVERY=10,MAX_ATLAS_MIPMAP=4096,TEX_PROBE_TIMEOUT_MS=1e4;let _shaderTexSize=512;let _maxAniso=1;let _shaderFps=0;let _shaderFilter=1;let _lastShaderTick=0;let _currentFrame=0;export function setShaderConfig(f,t){_shaderFps=f|0;_shaderFilter=t|0;console.log(`[BSP] Shader FPS: ${_shaderFps||"unlimited"}, Filter: ${_shaderFilter}`);}export function setShaderTexSize(n){_shaderTexSize=Math.max(64,Math.min(4096,n|0));console.log(`[BSP] Shader texture size: ${_shaderTexSize}px`);}
-export function initTexLoader(e){_maxAniso=Math.min(8,e.capabilities.getMaxAnisotropy()),console.log(`[BSP] Anisotropic filtering: ${_maxAniso}×`)}const _texCache=new Map,_loader=new THREE.TextureLoader,_animList=[],_videoList=[],_shaderList=[];export function tickAnimatedTextures(){_currentFrame++;if(_animList.length){const e=performance.now();for(const t of _animList){if(t.tex._lastVisibleFrame<_currentFrame-2)continue;if(e<t.nextFrameTime)continue;const a=t.frames[t.frameIdx];t.ctx.clearRect(0,0,t.canvas.width,t.canvas.height),t.ctx.drawImage(a.bitmap,0,0,t.canvas.width,t.canvas.height),t.tex.needsUpdate=!0,t.frameIdx=(t.frameIdx+1)%t.frames.length,t.nextFrameTime=e+a.duration}}if(_videoList.length)for(const e of _videoList)e.paused&&!e.ended&&e.play().catch(()=>{});
-// v5.12: GlslCanvas's own internal render loop is now permanently
-// cancelled at creation time (see loadShaderTex below) — this block is
-// the ONLY code that ever renders a shader texture from here on, so
-// shaderFps gating below is finally a real, exclusive throttle.
-if(_shaderList.length){const n=performance.now();let u=!0;if(_shaderFps>0){const i=1e3/_shaderFps;if(n-_lastShaderTick<i)u=!1;else{_lastShaderTick=n-(n-_lastShaderTick)%i;if(isNaN(_lastShaderTick))_lastShaderTick=n}}if(u)for(const e of _shaderList){if(e.tex._lastVisibleFrame<_currentFrame-2)continue;e.sandbox.forceRender=!0,e.sandbox.render(),e.tex.needsUpdate=!0}}}export function unmuteVideos(){for(const e of _videoList)e.muted&&(e.muted=!1,e.play().catch(()=>{}))}export function touchTexture(e){e&&(e._lastVisibleFrame=_currentFrame)}function applyTexFilters(e,{linearMag:t=!1}={}){e.wrapS=e.wrapT=THREE.RepeatWrapping,e.colorSpace=THREE.SRGBColorSpace,e.minFilter=THREE.LinearMipmapLinearFilter,e.magFilter=t?THREE.LinearFilter:THREE.NearestFilter,e.anisotropy=_maxAniso,e.generateMipmaps=!0}function fetchWithTimeout(e,t=1e4,a={}){const n=new AbortController,o=setTimeout(()=>n.abort(),t);return fetch(e,{...a,signal:n.signal}).finally(()=>clearTimeout(o))}async function fetchBSP(e){const t=await fetch(e);if(!t.ok)throw new Error(`BSP fetch failed: ${e} (${t.status})`);if(!e.endsWith(".expore"))return t.arrayBuffer();if("undefined"==typeof DecompressionStream)throw new Error("[BSP] DecompressionStream is not available in this browser. Use a plain .bsp file or upgrade to a recent browser.");console.log("[BSP] Decompressing gzip stream...");const a=performance.now(),n=new DecompressionStream("gzip"),o=t.body.pipeThrough(n).getReader(),r=[];let i=0;for(;;){const{done:e,value:t}=await o.read();if(e)break;r.push(t),i+=t.byteLength}const s=new Uint8Array(i);let l=0;for(const e of r)s.set(e,l),l+=e.byteLength;return console.log(`[BSP] Decompressed ${(i/1024/1024).toFixed(2)} MB in ${(performance.now()-a).toFixed(0)} ms`),s.buffer}function loadVideoTex(e,t=!1){return new Promise(a=>{const n=document.createElement("video");n.src=e,n.loop=!0,n.muted=!0,n.playsInline=!0,n.autoplay=!0,n.preload="auto",n.crossOrigin="anonymous",n.dataset.spelecBspVideo="",n.style.position="absolute",n.style.top="0",n.style.left="0",n.style.width="1px",n.style.height="1px",n.style.opacity="0",n.style.pointerEvents="none",document.body.appendChild(n);const o=new THREE.VideoTexture(n);o._lastVisibleFrame=0;o.colorSpace=THREE.SRGBColorSpace,o.minFilter=THREE.LinearFilter,o.magFilter=THREE.LinearFilter,o.generateMipmaps=!1,o.wrapS=o.wrapT=THREE.RepeatWrapping;let r=!1;const i=e=>{r||(r=!0,clearTimeout(s),a(e))},s=setTimeout(()=>{t||console.warn("[BSP] Video texture timed out:",e),n.remove(),i(null)},1e4);n.addEventListener("loadeddata",()=>{n._tex=o;_videoList.push(n),n.play().catch(()=>{}),console.log(`[BSP] Video texture ready: ${e}`),i(o)},{once:!0}),n.addEventListener("error",()=>{t||console.warn("[BSP] Video texture failed to load:",e),n.remove(),i(null)},{once:!0}),n.load()})}let _glslCanvasLoadPromise=null;function ensureGlslCanvasLoaded(){if(window.GlslCanvas)return Promise.resolve();if(_glslCanvasLoadPromise)return _glslCanvasLoadPromise;const e=import.meta.url,t=e.substring(0,e.lastIndexOf("/")+1);function a(e){return new Promise((t,a)=>{const n=document.createElement("script");n.src=e,n.onload=()=>t(),n.onerror=()=>a(new Error(`Failed to load ${e}`)),document.head.appendChild(n)})}return _glslCanvasLoadPromise=a(t+"GlslCanvas.js").catch(()=>a("https://spelecanton.github.io/Expore/javascript/GlslCanvas.js")).then(()=>{if(!window.GlslCanvas)throw new Error("GlslCanvas.js loaded but window.GlslCanvas is missing");console.log("[BSP] GlslCanvas.js loaded")}),_glslCanvasLoadPromise}function loadShaderTex(e,t=!1){return fetchWithTimeout(e).then(a=>a.ok?a.text():(t||console.warn("[BSP] Shader texture fetch failed:",e,a.status),null)).then(async t=>{if(!t)return null;await ensureGlslCanvasLoaded();const a=document.createElement("canvas");let n;a.width=a.height=_shaderTexSize,a.style.position="absolute",a.style.top="0",a.style.left="0",a.style.width=_shaderTexSize+"px",a.style.height=_shaderTexSize+"px",a.style.opacity="0",a.style.pointerEvents="none",a.dataset.spelecBspShader="",a.setAttribute("data-fragment",t),document.body.appendChild(a);try{n=new window.GlslCanvas(a)}catch(t){return console.warn("[BSP] GlslCanvas init failed:",e,t.message),a.remove(),null}if(!n.isValid)return console.warn("[BSP] Shader failed to compile, skipping texture:",e),n.destroy?.(),a.remove(),null;
-// v5.12: take FULL manual control of this GlslCanvas instance.
-// (1) Cancel its already-scheduled next frame — its constructor already
-//     rendered once synchronously and queued a follow-up via its own
-//     requestAnimationFrame; cancelling here stops it from EVER looping
-//     on its own again.
-// (2) Force the canvas (and GlslCanvas's internal width/height + GL
-//     viewport bookkeeping) back to exactly _shaderTexSize, undoing any
-//     drift the constructor's first synchronous resize() may have caused
-//     on a devicePixelRatio != 1 display.
-// (3) Permanently stub out resize() so nothing can ever change the
-//     backing resolution again.
-// (4) From now on ONLY tickAnimatedTextures() ever calls .render() on
-//     this sandbox — so shaderFps becomes a real, exclusive throttle.
-if(n.animationFrameRequest){cancelAnimationFrame(n.animationFrameRequest);n.animationFrameRequest=void 0}
-a.width=_shaderTexSize;a.height=_shaderTexSize;n.width=_shaderTexSize;n.height=_shaderTexSize;
-if(n.gl)n.gl.viewport(0,0,_shaderTexSize,_shaderTexSize);
-n.resize=()=>!1;n.paused=!0;n.forceRender=!0;n.render();
-const o=new THREE.CanvasTexture(a);o._lastVisibleFrame=0;const filt=0===_shaderFilter?THREE.NearestFilter:THREE.LinearFilter;return o.colorSpace=THREE.SRGBColorSpace,o.minFilter=filt,o.magFilter=filt,o.generateMipmaps=!1,o.wrapS=o.wrapT=THREE.RepeatWrapping,_shaderList.push({canvas:a,sandbox:n,tex:o}),console.log(`[BSP] Shader texture ready: ${e} @ ${_shaderTexSize}px`),o}).catch(a=>(t||console.warn("[BSP] Shader texture load failed:",e,a.message),null))}async function loadAnimatedTex(e,t=!1){if("undefined"==typeof ImageDecoder)return t||console.warn("[BSP] ImageDecoder not available, static fallback:",e),loadStaticTex(e);try{const t=await fetchWithTimeout(e);if(!t.ok)return null;const a=await t.arrayBuffer(),n=e.substring(e.lastIndexOf(".")).toLowerCase(),o={".gif":"image/gif",".avif":"image/avif",".webp":"image/webp"}[n]??"image/gif",r=new ImageDecoder({data:new Blob([a],{type:o}).stream(),type:o,preferAnimation:!0});await r.tracks.ready;const i=r.tracks.selectedTrack?.frameCount??1;if(r.close(),i<=1)return loadStaticTex(e);console.log(`[BSP] Animated texture ${e}: ${i} frames`);const s=new ImageDecoder({data:new Blob([a],{type:o}).stream(),type:o,preferAnimation:!0});await s.tracks.ready;const l=[];let c=0,d=0;for(let e=0;e<i;e++){const t=(await s.decode({frameIndex:e})).image,a=null!=t.duration?t.duration/1e3:100;0===e&&(c=t.displayWidth||t.codedWidth||128,d=t.displayHeight||t.codedHeight||128);const n=await createImageBitmap(t,{resizeWidth:c,resizeHeight:d});t.close(),l.push({bitmap:n,duration:a})}if(s.close(),!l.length)return loadStaticTex(e);const u=document.createElement("canvas");u.width=c,u.height=d;const p=u.getContext("2d");p.drawImage(l[0].bitmap,0,0,c,d);const h=new THREE.CanvasTexture(u);h._lastVisibleFrame=0;return applyTexFilters(h),h.needsUpdate=!0,_animList.push({frames:l,canvas:u,ctx:p,tex:h,frameIdx:0,nextFrameTime:performance.now()+l[0].duration}),h}catch(a){return t||console.warn("[BSP] Animation load failed, fallback static:",e,a.message),loadStaticTex(e)}}function loadStaticTex(e){return new Promise(t=>{let a=!1;const n=setTimeout(()=>{a||(a=!0,t(null))},1e4);_loader.load(e,e=>{a||(a=!0,clearTimeout(n),applyTexFilters(e),t(e))},void 0,()=>{a||(a=!0,clearTimeout(n),t(null))})})}function loadTexByExt(e,t,a=!1){return VIDEO_EXTS.has(t)?loadVideoTex(e,a):SHADER_EXTS.has(t)?loadShaderTex(e,a):ANIM_EXTS.has(t)?loadAnimatedTex(e,a):loadStaticTex(e)}async function tryLoadTex(e){if(_texCache.has(e))return _texCache.get(e);const t=e.substring(e.lastIndexOf(".")).toLowerCase(),a=await loadTexByExt(e,t);return _texCache.set(e,a),a}export async function loadTextureFromUrl(e){if(_texCache.has(e))return _texCache.get(e);const t=e.substring(e.lastIndexOf(".")).toLowerCase(),a=await loadTexByExt(e,t);return _texCache.set(e,a),a}async function findTex(e,t){for(const a of e){if(!a)continue;const e=(await Promise.all(TEX_EXTENSIONS.map(async e=>{const n=a+t+e;if(_texCache.has(n)){const e=_texCache.get(n);return e?{url:n,tex:e}:null}const o=await loadTexByExt(n,e,!0);return _texCache.set(n,o),o?{url:n,tex:o}:null}))).find(e=>null!==e);if(e)return e.tex}return null}const _whiteTex=(()=>{const e=document.createElement("canvas");e.width=e.height=1,e.getContext("2d").fillStyle="#fff",e.getContext("2d").fillRect(0,0,1,1);const t=new THREE.CanvasTexture(e);return t.colorSpace=THREE.SRGBColorSpace,t.minFilter=t.magFilter=THREE.LinearFilter,t})(),_invisibleMat=new THREE.MeshBasicMaterial({colorWrite:!1,depthWrite:!1,transparent:!0,opacity:0,side:THREE.DoubleSide});async function fetchWorkerCode(){const e=import.meta.url,t=e.substring(0,e.lastIndexOf("/")+1)+"bsp_worker.js";for(const e of[t,"https://spelecanton.github.io/Expore/javascript/bsp_worker.js"])try{const t=await fetch(e);if(t.ok)return console.log("[BSP] Worker loaded from:",e),await t.text()}catch{}throw new Error("bsp_worker.js not found")}function runBSPWorker(e,t,a,n){return new Promise(async(o,r)=>{try{const i=await fetchWorkerCode(),s=new Blob([i],{type:"application/javascript"}),l=URL.createObjectURL(s),c=new Worker(l);c.onmessage=({data:e})=>{"progress"===e.type?n?.(e.pct):"done"===e.type?(c.terminate(),URL.revokeObjectURL(l),o(e)):"error"===e.type&&(c.terminate(),URL.revokeObjectURL(l),r(new Error(`[BSP Worker] ${e.message}`)))},c.onerror=e=>{c.terminate(),URL.revokeObjectURL(l),r(e)},c.postMessage({buffer:e,textureBase:t,fallbackTexBase:a},[e])}catch(e){r(e)}})}const MAX_VERTS_PER_DRAW=6e4;function buildGeometry(e){const t=[];let a=[],n=0;function o(){if(!a.length)return;let e=0,o=0;for(const t of a)e+=new Float32Array(t.pos).length/3,o+=new Uint32Array(t.idx).length;const r=new Float32Array(3*e),i=new Float32Array(3*e),s=new Float32Array(2*e),l=new Float32Array(2*e),c=new Uint32Array(o);let d=0,u=0;for(const e of a){const t=new Float32Array(e.pos),a=new Float32Array(e.nrm),n=new Float32Array(e.uv1),o=new Float32Array(e.uv2),p=new Uint32Array(e.idx),h=t.length/3;r.set(t,3*d),i.set(a,3*d),s.set(n,2*d),l.set(o,2*d);for(let e=0;e<p.length;e++)c[u+e]=p[e]+d;d+=h,u+=p.length}const p=new THREE.BufferGeometry;p.setAttribute("position",new THREE.BufferAttribute(r,3)),p.setAttribute("normal",new THREE.BufferAttribute(i,3)),p.setAttribute("uv",new THREE.BufferAttribute(s,2)),p.setAttribute("uv1",new THREE.BufferAttribute(l,2)),p.setIndex(new THREE.BufferAttribute(c,1)),p.computeBoundingSphere(),p.computeBoundingBox(),buildBVH(p),t.push(p),a=[],n=0}for(const t of e){const e=new Float32Array(t.pos).length/3;n+e>6e4&&n>0&&o(),a.push(t),n+=e}return o(),t}function mergeBatchGeometries(e){const t=new Map;for(const a of e){const e=`${a.texIdx}|${a.lmIdx}|${a.noclip?1:0}|${a.invisible?1:0}`;t.has(e)||t.set(e,{texIdx:a.texIdx,lmIdx:a.lmIdx,noclip:a.noclip,invisible:a.invisible,hasLM:a.hasLM,parts:[]}),t.get(e).parts.push(a)}const a=[];for(const[,e]of t){const t=buildGeometry(e.parts);for(const n of t)a.push({geo:n,texIdx:e.texIdx,lmIdx:e.lmIdx,noclip:e.noclip,invisible:e.invisible,hasLM:e.hasLM})}return a}function yieldToEventLoop(){return new Promise(e=>setTimeout(e,0))}async function buildMeshesProgressively(e,t,a,n,o,r){let i=0,s=0,l=0,c=0;const d=new Map;for(let u=0;u<e.length;u++){u>0&&u%10==0&&(r?.(90+u/e.length*10),await yieldToEventLoop());const p=e[u],h=t[p.texIdx]||"default";let m;if(p.invisible)m=_invisibleMat;else{const e=n.get(h)??null;m=new THREE.MeshLambertMaterial({map:e??_whiteTex,side:THREE.DoubleSide,alphaTest:.5}),e||(d.has(h)||d.set(h,[]),d.get(h).push(m))}const f=new THREE.Mesh(p.geo,m);f.onBeforeRender=function(){if(m.map)m.map._lastVisibleFrame=_currentFrame};f.matrixAutoUpdate=!1,f.updateMatrix(),f.frustumCulled=!0,p.invisible&&(f.userData.invisible=!0,c++),p.noclip&&(f.userData.noclip=!0,l++),p.hasLM&&a&&!p.invisible&&(m.lightMap=a,m.lightMapIntensity=1,s++),o.add(f),i++}return console.log(`[BSP] Meshes: ${i} total, with lightmap: ${s}, noclip: ${l}, invisible clip: ${c}`),{totalMeshes:i,pendingSwap:d}}const INITIAL_BATCHES=1;async function loadTexturesInBatches(e,t,a,n){const o=new Map,r=e.length;for(let i=0;i<r;i+=4){const s=e.slice(i,i+4);await Promise.all(s.map(async e=>{const a=await findTex(t,e);if(o.set(e,a||_whiteTex),n&&a){const t=n.get(e);if(t){for(const e of t)e.map=a,e.needsUpdate=!0;n.delete(e)}}})),a?.(82+(i+s.length)/r*8)}return o}export async function loadBSP({url:e,scene:t,textureBase:a="",fallbackTexBase:n="",onProgress:o=null}){o?.(0);const r=await fetchBSP(e);o?.(5);const i=await runBSPWorker(r,a,n,e=>o?.(5+.75*e)),{portals:s,playerStart:l,ambientIntensity:c,ambientColorArr:d,texNames:u,lmAtlas:p,batches:h}=i;let m=null;if(p){0===p.nonZero?console.warn("[BSP] No lightmap — baked light missing."):console.log(`[BSP] Lightmap atlas ${p.W}×${p.H}, non-zero: ${p.nonZero}`);const e=new Uint8Array(p.data);m=new THREE.DataTexture(e,p.W,p.H,THREE.RGBAFormat),m.colorSpace=THREE.SRGBColorSpace,m.channel=1;p.W>4096||p.H>4096?(console.warn(`[BSP] Atlas ${p.W}×${p.H} exceeds 4096px — mipmaps disabled. Consider -lightmapsize 128 in q3map2.`),m.generateMipmaps=!1,m.minFilter=THREE.LinearFilter):(m.generateMipmaps=!0,m.minFilter=THREE.LinearMipmapLinearFilter),m.magFilter=THREE.LinearFilter,m.anisotropy=_maxAniso,m.wrapS=m.wrapT=THREE.ClampToEdgeWrapping,setTimeout(()=>{m.needsUpdate=!0},0)}console.log(`[BSP] Merging ${h.length} batches (vertex budget: 60000)...`);const f=mergeBatchGeometries(h);console.log(`[BSP] After merge: ${f.length} draw calls`);const g=[a,n],w=[...new Set(h.filter(e=>!e.invisible).map(e=>u[e.texIdx]||"default"))];console.log(`[BSP] Loading ${w.length} unique textures (4/batch)...`);const x=w.slice(0,4),E=new Map;await Promise.all(x.map(async e=>{const t=await findTex(g,e);E.set(e,t||_whiteTex)})),o?.(82);const{pendingSwap:T}=await buildMeshesProgressively(f,u,m,E,t,o);o?.(100);const b=w.slice(x.length);b.length>0&&(console.log(`[BSP] Background-loading ${b.length} remaining textures...`),loadTexturesInBatches(b,g,null,T).catch(e=>{console.warn("[BSP] Background texture load error:",e)}));const y={portals:s,playerStart:l};return void 0!==c&&(y.ambientIntensity=c),d&&(y.ambientColor=new THREE.Color(...d)),y.lights=i.lights??[],y}
+import * as THREE from "https://cdn.jsdelivr.net/npm/three@0.165.0/build/three.module.js";
+let _bvhAvailable = !1,
+    _MeshBVH = null,
+    _acceleratedRaycast = null;
+(async () => {
+    try {
+        const e = await import("https://cdn.jsdelivr.net/npm/three-mesh-bvh@0.7.3/build/index.module.js");
+        (_MeshBVH = e.MeshBVH),
+            (_acceleratedRaycast = e.acceleratedRaycast),
+            (_bvhAvailable = !0),
+            console.log("[BSP] three-mesh-bvh loaded — BVH raycasting enabled");
+    } catch {
+        console.warn("[BSP] three-mesh-bvh not available — using standard raycasting");
+    }
+})();
+const _bvhQueue = [];
+let _bvhScheduled = !1;
+function scheduleBVHBuild(e) {
+    if ((_bvhQueue.push(e), _bvhScheduled)) return;
+    _bvhScheduled = !0;
+    const t =
+        "function" == typeof requestIdleCallback
+            ? (e) => requestIdleCallback(e, { timeout: 2e3 })
+            : (e) => setTimeout(e, 0);
+    t(function e(a) {
+        const n = () => !a || a.timeRemaining() > 2;
+        for (; _bvhQueue.length && n(); ) {
+            const e = _bvhQueue.shift();
+            try {
+                (e.boundsTree = new _MeshBVH(e)), (e.rawcastFunc = _acceleratedRaycast);
+            } catch {}
+        }
+        _bvhQueue.length ? t(e) : (_bvhScheduled = !1);
+    });
+}
+function buildBVH(e) {
+    _bvhAvailable && _MeshBVH && _acceleratedRaycast && scheduleBVHBuild(e);
+}
+const VIDEO_EXTS = new Set([".mp4", ".webm"]),
+    SHADER_EXTS = new Set([".frag"]),
+    TEX_EXTENSIONS = [".mp4", ".webm", ".frag", ".gif", ".avif", ".webp", ".png", ".jpg"],
+    ANIM_EXTS = new Set([".gif", ".avif", ".webp"]),
+    TEXTURE_BATCH_SIZE = 4,
+    MESH_YIELD_EVERY = 10,
+    MAX_ATLAS_MIPMAP = 4096,
+    TEX_PROBE_TIMEOUT_MS = 1e4;
+let _shaderTexSize = 512,
+    _maxAniso = 1,
+    _shaderFps = 0,
+    _shaderFilter = 1,
+    _lastShaderTick = 0,
+    _currentFrame = 0;
+export function setShaderConfig(e, t) {
+    (_shaderFps = 0 | e),
+        (_shaderFilter = 0 | t),
+        console.log(`[BSP] Shader FPS: ${_shaderFps || "unlimited"}, Filter: ${_shaderFilter}`);
+}
+export function setShaderTexSize(e) {
+    (_shaderTexSize = Math.max(64, Math.min(4096, 0 | e))),
+        console.log(`[BSP] Shader texture size: ${_shaderTexSize}px`);
+}
+export function initTexLoader(e) {
+    (_maxAniso = Math.min(8, e.capabilities.getMaxAnisotropy())),
+        console.log(`[BSP] Anisotropic filtering: ${_maxAniso}×`);
+}
+const _texCache = new Map(),
+    _loader = new THREE.TextureLoader(),
+    _animList = [],
+    _videoList = [],
+    _shaderList = [];
+export function tickAnimatedTextures() {
+    if ((_currentFrame++, _animList.length)) {
+        const e = performance.now();
+        for (const t of _animList) {
+            if (t.tex._lastVisibleFrame < _currentFrame - 2) continue;
+            if (e < t.nextFrameTime) continue;
+            const a = t.frames[t.frameIdx];
+            t.ctx.clearRect(0, 0, t.canvas.width, t.canvas.height),
+                t.ctx.drawImage(a.bitmap, 0, 0, t.canvas.width, t.canvas.height),
+                (t.tex.needsUpdate = !0),
+                (t.frameIdx = (t.frameIdx + 1) % t.frames.length),
+                (t.nextFrameTime = e + a.duration);
+        }
+    }
+    if (_videoList.length) for (const e of _videoList) e.paused && !e.ended && e.play().catch(() => {});
+    if (_shaderList.length) {
+        const e = performance.now();
+        let t = !0;
+        if (_shaderFps > 0) {
+            const a = 1e3 / _shaderFps;
+            e - _lastShaderTick < a
+                ? (t = !1)
+                : ((_lastShaderTick = e - ((e - _lastShaderTick) % a)),
+                  isNaN(_lastShaderTick) && (_lastShaderTick = e));
+        }
+        if (t)
+            for (const e of _shaderList)
+                e.tex._lastVisibleFrame < _currentFrame - 2 ||
+                    ((e.sandbox.forceRender = !0), e.sandbox.render(), (e.tex.needsUpdate = !0));
+    }
+}
+export function unmuteVideos() {
+    for (const e of _videoList) e.muted && ((e.muted = !1), e.play().catch(() => {}));
+}
+export function touchTexture(e) {
+    e && (e._lastVisibleFrame = _currentFrame);
+}
+function applyTexFilters(e, { linearMag: t = !1 } = {}) {
+    (e.wrapS = e.wrapT = THREE.RepeatWrapping),
+        (e.colorSpace = THREE.SRGBColorSpace),
+        (e.minFilter = THREE.LinearMipmapLinearFilter),
+        (e.magFilter = t ? THREE.LinearFilter : THREE.NearestFilter),
+        (e.anisotropy = _maxAniso),
+        (e.generateMipmaps = !0);
+}
+function fetchWithTimeout(e, t = 1e4, a = {}) {
+    const n = new AbortController(),
+        r = setTimeout(() => n.abort(), t);
+    return fetch(e, { ...a, signal: n.signal }).finally(() => clearTimeout(r));
+}
+async function fetchBSP(e) {
+    const t = await fetch(e);
+    if (!t.ok) throw new Error(`BSP fetch failed: ${e} (${t.status})`);
+    if (!e.endsWith(".expore")) return t.arrayBuffer();
+    if ("undefined" == typeof DecompressionStream)
+        throw new Error(
+            "[BSP] DecompressionStream is not available in this browser. Use a plain .bsp file or upgrade to a recent browser."
+        );
+    console.log("[BSP] Decompressing gzip stream...");
+    const a = performance.now(),
+        n = new DecompressionStream("gzip"),
+        r = t.body.pipeThrough(n).getReader(),
+        o = [];
+    let i = 0;
+    for (;;) {
+        const { done: e, value: t } = await r.read();
+        if (e) break;
+        o.push(t), (i += t.byteLength);
+    }
+    const s = new Uint8Array(i);
+    let l = 0;
+    for (const e of o) s.set(e, l), (l += e.byteLength);
+    return (
+        console.log(
+            `[BSP] Decompressed ${(i / 1024 / 1024).toFixed(2)} MB in ${(performance.now() - a).toFixed(0)} ms`
+        ),
+        s.buffer
+    );
+}
+function loadVideoTex(e, t = !1) {
+    return new Promise((a) => {
+        const n = document.createElement("video");
+        (n.src = e),
+            (n.loop = !0),
+            (n.muted = !0),
+            (n.playsInline = !0),
+            (n.autoplay = !0),
+            (n.preload = "auto"),
+            (n.crossOrigin = "anonymous"),
+            (n.dataset.spelecBspVideo = ""),
+            (n.style.position = "absolute"),
+            (n.style.top = "0"),
+            (n.style.left = "0"),
+            (n.style.width = "1px"),
+            (n.style.height = "1px"),
+            (n.style.opacity = "0"),
+            (n.style.pointerEvents = "none"),
+            document.body.appendChild(n);
+        const r = new THREE.VideoTexture(n);
+        (r._lastVisibleFrame = 0),
+            (r.colorSpace = THREE.SRGBColorSpace),
+            (r.minFilter = THREE.LinearFilter),
+            (r.magFilter = THREE.LinearFilter),
+            (r.generateMipmaps = !1),
+            (r.wrapS = r.wrapT = THREE.RepeatWrapping);
+        let o = !1;
+        const i = (e) => {
+                o || ((o = !0), clearTimeout(s), a(e));
+            },
+            s = setTimeout(() => {
+                t || console.warn("[BSP] Video texture timed out:", e), n.remove(), i(null);
+            }, 1e4);
+        n.addEventListener(
+            "loadeddata",
+            () => {
+                (n._tex = r),
+                    _videoList.push(n),
+                    n.play().catch(() => {}),
+                    console.log(`[BSP] Video texture ready: ${e}`),
+                    i(r);
+            },
+            { once: !0 }
+        ),
+            n.addEventListener(
+                "error",
+                () => {
+                    t || console.warn("[BSP] Video texture failed to load:", e), n.remove(), i(null);
+                },
+                { once: !0 }
+            ),
+            n.load();
+    });
+}
+let _glslCanvasLoadPromise = null;
+function ensureGlslCanvasLoaded() {
+    if (window.GlslCanvas) return Promise.resolve();
+    if (_glslCanvasLoadPromise) return _glslCanvasLoadPromise;
+    const e = import.meta.url,
+        t = e.substring(0, e.lastIndexOf("/") + 1);
+    function a(e) {
+        return new Promise((t, a) => {
+            const n = document.createElement("script");
+            (n.src = e),
+                (n.onload = () => t()),
+                (n.onerror = () => a(new Error(`Failed to load ${e}`))),
+                document.head.appendChild(n);
+        });
+    }
+    return (
+        (_glslCanvasLoadPromise = a(t + "GlslCanvas.js")
+            .catch(() => a("https://spelecanton.github.io/Expore/javascript/GlslCanvas.js"))
+            .then(() => {
+                if (!window.GlslCanvas) throw new Error("GlslCanvas.js loaded but window.GlslCanvas is missing");
+                console.log("[BSP] GlslCanvas.js loaded");
+            })),
+        _glslCanvasLoadPromise
+    );
+}
+function loadShaderTex(e, t = !1) {
+    return fetchWithTimeout(e)
+        .then((a) => (a.ok ? a.text() : (t || console.warn("[BSP] Shader texture fetch failed:", e, a.status), null)))
+        .then(async (t) => {
+            if (!t) return null;
+            await ensureGlslCanvasLoaded();
+            const a = document.createElement("canvas");
+            let n;
+            (a.width = a.height = _shaderTexSize),
+                (a.style.position = "absolute"),
+                (a.style.top = "0"),
+                (a.style.left = "0"),
+                (a.style.width = _shaderTexSize + "px"),
+                (a.style.height = _shaderTexSize + "px"),
+                (a.style.opacity = "0"),
+                (a.style.pointerEvents = "none"),
+                (a.dataset.spelecBspShader = ""),
+                a.setAttribute("data-fragment", t),
+                document.body.appendChild(a);
+            try {
+                n = new window.GlslCanvas(a);
+            } catch (t) {
+                return console.warn("[BSP] GlslCanvas init failed:", e, t.message), a.remove(), null;
+            }
+            if (!n.isValid)
+                return (
+                    console.warn("[BSP] Shader failed to compile, skipping texture:", e),
+                    n.destroy?.(),
+                    a.remove(),
+                    null
+                );
+            n.animationFrameRequest &&
+                (cancelAnimationFrame(n.animationFrameRequest), (n.animationFrameRequest = void 0)),
+                (a.width = _shaderTexSize),
+                (a.height = _shaderTexSize),
+                (n.width = _shaderTexSize),
+                (n.height = _shaderTexSize),
+                n.gl && n.gl.viewport(0, 0, _shaderTexSize, _shaderTexSize),
+                (n.resize = () => !1),
+                (n.paused = !0),
+                (n.forceRender = !0),
+                n.render();
+            const r = new THREE.CanvasTexture(a);
+            r._lastVisibleFrame = 0;
+            const o = 0 === _shaderFilter ? THREE.NearestFilter : THREE.LinearFilter;
+            return (
+                (r.colorSpace = THREE.SRGBColorSpace),
+                (r.minFilter = o),
+                (r.magFilter = o),
+                (r.generateMipmaps = !1),
+                (r.wrapS = r.wrapT = THREE.RepeatWrapping),
+                _shaderList.push({ canvas: a, sandbox: n, tex: r }),
+                console.log(`[BSP] Shader texture ready: ${e} @ ${_shaderTexSize}px`),
+                r
+            );
+        })
+        .catch((a) => (t || console.warn("[BSP] Shader texture load failed:", e, a.message), null));
+}
+async function loadAnimatedTex(e, t = !1) {
+    if ("undefined" == typeof ImageDecoder)
+        return t || console.warn("[BSP] ImageDecoder not available, static fallback:", e), loadStaticTex(e);
+    try {
+        const t = await fetchWithTimeout(e);
+        if (!t.ok) return null;
+        const a = await t.arrayBuffer(),
+            n =
+                { ".gif": "image/gif", ".avif": "image/avif", ".webp": "image/webp" }[
+                    e.substring(e.lastIndexOf(".")).toLowerCase()
+                ] ?? "image/gif",
+            r = new ImageDecoder({ data: new Blob([a], { type: n }).stream(), type: n, preferAnimation: !0 });
+        await r.tracks.ready;
+        const o = r.tracks.selectedTrack?.frameCount ?? 1;
+        if ((r.close(), o <= 1)) return loadStaticTex(e);
+        console.log(`[BSP] Animated texture ${e}: ${o} frames`);
+        const i = new ImageDecoder({ data: new Blob([a], { type: n }).stream(), type: n, preferAnimation: !0 });
+        await i.tracks.ready;
+        const s = [];
+        let l = 0,
+            c = 0;
+        for (let e = 0; e < o; e++) {
+            const t = (await i.decode({ frameIndex: e })).image,
+                a = null != t.duration ? t.duration / 1e3 : 100;
+            0 === e && ((l = t.displayWidth || t.codedWidth || 128), (c = t.displayHeight || t.codedHeight || 128));
+            const n = await createImageBitmap(t, { resizeWidth: l, resizeHeight: c });
+            t.close(), s.push({ bitmap: n, duration: a });
+        }
+        if ((i.close(), !s.length)) return loadStaticTex(e);
+        const d = document.createElement("canvas");
+        (d.width = l), (d.height = c);
+        const u = d.getContext("2d");
+        u.drawImage(s[0].bitmap, 0, 0, l, c);
+        const h = new THREE.CanvasTexture(d);
+        return (
+            (h._lastVisibleFrame = 0),
+            applyTexFilters(h),
+            (h.needsUpdate = !0),
+            _animList.push({
+                frames: s,
+                canvas: d,
+                ctx: u,
+                tex: h,
+                frameIdx: 0,
+                nextFrameTime: performance.now() + s[0].duration,
+            }),
+            h
+        );
+    } catch (a) {
+        return t || console.warn("[BSP] Animation load failed, fallback static:", e, a.message), loadStaticTex(e);
+    }
+}
+function loadStaticTex(e) {
+    return new Promise((t) => {
+        let a = !1;
+        const n = setTimeout(() => {
+            a || ((a = !0), t(null));
+        }, 1e4);
+        _loader.load(
+            e,
+            (e) => {
+                a || ((a = !0), clearTimeout(n), applyTexFilters(e), t(e));
+            },
+            void 0,
+            () => {
+                a || ((a = !0), clearTimeout(n), t(null));
+            }
+        );
+    });
+}
+function loadTexByExt(e, t, a = !1) {
+    return VIDEO_EXTS.has(t)
+        ? loadVideoTex(e, a)
+        : SHADER_EXTS.has(t)
+          ? loadShaderTex(e, a)
+          : ANIM_EXTS.has(t)
+            ? loadAnimatedTex(e, a)
+            : loadStaticTex(e);
+}
+async function tryLoadTex(e) {
+    if (_texCache.has(e)) return _texCache.get(e);
+    const t = e.substring(e.lastIndexOf(".")).toLowerCase(),
+        a = await loadTexByExt(e, t);
+    return _texCache.set(e, a), a;
+}
+export async function loadTextureFromUrl(e) {
+    if (_texCache.has(e)) return _texCache.get(e);
+    const t = e.substring(e.lastIndexOf(".")).toLowerCase(),
+        a = await loadTexByExt(e, t);
+    return _texCache.set(e, a), a;
+}
+async function findTex(e, t) {
+    for (const a of e) {
+        if (!a) continue;
+        const e = (
+            await Promise.all(
+                TEX_EXTENSIONS.map(async (e) => {
+                    const n = a + t + e;
+                    if (_texCache.has(n)) {
+                        const e = _texCache.get(n);
+                        return e ? { url: n, tex: e } : null;
+                    }
+                    const r = await loadTexByExt(n, e, !0);
+                    return _texCache.set(n, r), r ? { url: n, tex: r } : null;
+                })
+            )
+        ).find((e) => null !== e);
+        if (e) return e.tex;
+    }
+    return null;
+}
+const _whiteTex = (() => {
+        const e = document.createElement("canvas");
+        (e.width = e.height = 1), (e.getContext("2d").fillStyle = "#fff"), e.getContext("2d").fillRect(0, 0, 1, 1);
+        const t = new THREE.CanvasTexture(e);
+        return (t.colorSpace = THREE.SRGBColorSpace), (t.minFilter = t.magFilter = THREE.LinearFilter), t;
+    })(),
+    _invisibleMat = new THREE.MeshBasicMaterial({
+        colorWrite: !1,
+        depthWrite: !1,
+        transparent: !0,
+        opacity: 0,
+        side: THREE.DoubleSide,
+    });
+async function fetchWorkerCode() {
+    const e = import.meta.url,
+        t = e.substring(0, e.lastIndexOf("/") + 1) + "bsp_worker.js";
+    for (const e of [t, "https://spelecanton.github.io/Expore/javascript/bsp_worker.js"])
+        try {
+            const t = await fetch(e);
+            if (t.ok) return console.log("[BSP] Worker loaded from:", e), await t.text();
+        } catch {}
+    throw new Error("bsp_worker.js not found");
+}
+function runBSPWorker(e, t, a, n) {
+    return new Promise(async (r, o) => {
+        try {
+            const i = await fetchWorkerCode(),
+                s = new Blob([i], { type: "application/javascript" }),
+                l = URL.createObjectURL(s),
+                c = new Worker(l);
+            (c.onmessage = ({ data: e }) => {
+                "progress" === e.type
+                    ? n?.(e.pct)
+                    : "done" === e.type
+                      ? (c.terminate(), URL.revokeObjectURL(l), r(e))
+                      : "error" === e.type &&
+                        (c.terminate(), URL.revokeObjectURL(l), o(new Error(`[BSP Worker] ${e.message}`)));
+            }),
+                (c.onerror = (e) => {
+                    c.terminate(), URL.revokeObjectURL(l), o(e);
+                }),
+                c.postMessage({ buffer: e, textureBase: t, fallbackTexBase: a }, [e]);
+        } catch (e) {
+            o(e);
+        }
+    });
+}
+const MAX_VERTS_PER_DRAW = 6e4;
+function buildGeometry(e) {
+    const t = [];
+    let a = [],
+        n = 0;
+    function r() {
+        if (!a.length) return;
+        let e = 0,
+            r = 0;
+        for (const t of a) (e += new Float32Array(t.pos).length / 3), (r += new Uint32Array(t.idx).length);
+        const o = new Float32Array(3 * e),
+            i = new Float32Array(3 * e),
+            s = new Float32Array(2 * e),
+            l = new Float32Array(2 * e),
+            c = new Uint32Array(r);
+        let d = 0,
+            u = 0;
+        for (const e of a) {
+            const t = new Float32Array(e.pos),
+                a = new Float32Array(e.nrm),
+                n = new Float32Array(e.uv1),
+                r = new Float32Array(e.uv2),
+                h = new Uint32Array(e.idx),
+                p = t.length / 3;
+            o.set(t, 3 * d), i.set(a, 3 * d), s.set(n, 2 * d), l.set(r, 2 * d);
+            for (let e = 0; e < h.length; e++) c[u + e] = h[e] + d;
+            (d += p), (u += h.length);
+        }
+        const h = new THREE.BufferGeometry();
+        h.setAttribute("position", new THREE.BufferAttribute(o, 3)),
+            h.setAttribute("normal", new THREE.BufferAttribute(i, 3)),
+            h.setAttribute("uv", new THREE.BufferAttribute(s, 2)),
+            h.setAttribute("uv1", new THREE.BufferAttribute(l, 2)),
+            h.setIndex(new THREE.BufferAttribute(c, 1)),
+            h.computeBoundingSphere(),
+            h.computeBoundingBox(),
+            buildBVH(h),
+            t.push(h),
+            (a = []),
+            (n = 0);
+    }
+    for (const t of e) {
+        const e = new Float32Array(t.pos).length / 3;
+        n + e > 6e4 && n > 0 && r(), a.push(t), (n += e);
+    }
+    return r(), t;
+}
+function mergeBatchGeometries(e) {
+    const t = new Map();
+    for (const a of e) {
+        const e = `${a.texIdx}|${a.lmIdx}|${a.noclip ? 1 : 0}|${a.invisible ? 1 : 0}`;
+        t.has(e) ||
+            t.set(e, {
+                texIdx: a.texIdx,
+                lmIdx: a.lmIdx,
+                noclip: a.noclip,
+                invisible: a.invisible,
+                hasLM: a.hasLM,
+                parts: [],
+            }),
+            t.get(e).parts.push(a);
+    }
+    const a = [];
+    for (const [, e] of t) {
+        const t = buildGeometry(e.parts);
+        for (const n of t)
+            a.push({
+                geo: n,
+                texIdx: e.texIdx,
+                lmIdx: e.lmIdx,
+                noclip: e.noclip,
+                invisible: e.invisible,
+                hasLM: e.hasLM,
+            });
+    }
+    return a;
+}
+function yieldToEventLoop() {
+    return new Promise((e) => setTimeout(e, 0));
+}
+async function buildMeshesProgressively(e, t, a, n, r, o) {
+    let i = 0,
+        s = 0,
+        l = 0,
+        c = 0;
+    const d = new Map();
+    for (let u = 0; u < e.length; u++) {
+        u > 0 && u % 10 == 0 && (o?.(90 + (u / e.length) * 10), await yieldToEventLoop());
+        const h = e[u],
+            p = t[h.texIdx] || "default";
+        let m;
+        if (h.invisible) m = _invisibleMat;
+        else {
+            const e = n.get(p) ?? null;
+            (m = new THREE.MeshLambertMaterial({ map: e ?? _whiteTex, side: THREE.DoubleSide, alphaTest: 0.5 })),
+                e || (d.has(p) || d.set(p, []), d.get(p).push(m));
+        }
+        const f = new THREE.Mesh(h.geo, m);
+        (f.onBeforeRender = function () {
+            m.map && (m.map._lastVisibleFrame = _currentFrame);
+        }),
+            (f.matrixAutoUpdate = !1),
+            f.updateMatrix(),
+            (f.frustumCulled = !0),
+            h.invisible && ((f.userData.invisible = !0), c++),
+            h.noclip && ((f.userData.noclip = !0), l++),
+            h.hasLM && a && !h.invisible && ((m.lightMap = a), (m.lightMapIntensity = 1), s++),
+            r.add(f),
+            i++;
+    }
+    return (
+        console.log(`[BSP] Meshes: ${i} total, with lightmap: ${s}, noclip: ${l}, invisible clip: ${c}`),
+        { totalMeshes: i, pendingSwap: d }
+    );
+}
+const INITIAL_BATCHES = 1;
+async function loadTexturesInBatches(e, t, a, n) {
+    const r = new Map(),
+        o = e.length;
+    for (let i = 0; i < o; i += 4) {
+        const s = e.slice(i, i + 4);
+        await Promise.all(
+            s.map(async (e) => {
+                const a = await findTex(t, e);
+                if ((r.set(e, a || _whiteTex), n && a)) {
+                    const t = n.get(e);
+                    if (t) {
+                        for (const e of t) (e.map = a), (e.needsUpdate = !0);
+                        n.delete(e);
+                    }
+                }
+            })
+        ),
+            a?.(82 + ((i + s.length) / o) * 8);
+    }
+    return r;
+}
+export async function loadBSP({
+    url: e,
+    scene: t,
+    textureBase: a = "",
+    fallbackTexBase: n = "",
+    onProgress: r = null,
+}) {
+    r?.(0);
+    const o = await fetchBSP(e);
+    r?.(5);
+    const i = await runBSPWorker(o, a, n, (e) => r?.(5 + 0.75 * e)),
+        {
+            portals: s,
+            playerStart: l,
+            ambientIntensity: c,
+            ambientColorArr: d,
+            texNames: u,
+            lmAtlas: h,
+            batches: p,
+        } = i;
+    let m = null;
+    if (h) {
+        0 === h.nonZero
+            ? console.warn("[BSP] No lightmap — baked light missing.")
+            : console.log(`[BSP] Lightmap atlas ${h.W}×${h.H}, non-zero: ${h.nonZero}`);
+        const e = new Uint8Array(h.data);
+        (m = new THREE.DataTexture(e, h.W, h.H, THREE.RGBAFormat)),
+            (m.colorSpace = THREE.SRGBColorSpace),
+            (m.channel = 1),
+            h.W > 4096 || h.H > 4096
+                ? (console.warn(
+                      `[BSP] Atlas ${h.W}×${h.H} exceeds 4096px — mipmaps disabled. Consider -lightmapsize 128 in q3map2.`
+                  ),
+                  (m.generateMipmaps = !1),
+                  (m.minFilter = THREE.LinearFilter))
+                : ((m.generateMipmaps = !0), (m.minFilter = THREE.LinearMipmapLinearFilter)),
+            (m.magFilter = THREE.LinearFilter),
+            (m.anisotropy = _maxAniso),
+            (m.wrapS = m.wrapT = THREE.ClampToEdgeWrapping),
+            setTimeout(() => {
+                m.needsUpdate = !0;
+            }, 0);
+    }
+    console.log(`[BSP] Merging ${p.length} batches (vertex budget: 60000)...`);
+    const f = mergeBatchGeometries(p);
+    console.log(`[BSP] After merge: ${f.length} draw calls`);
+    const x = [a, n],
+        g = [...new Set(p.filter((e) => !e.invisible).map((e) => u[e.texIdx] || "default"))];
+    console.log(`[BSP] Loading ${g.length} unique textures (4/batch)...`);
+    const w = g.slice(0, 4),
+        T = new Map();
+    await Promise.all(
+        w.map(async (e) => {
+            const t = await findTex(x, e);
+            T.set(e, t || _whiteTex);
+        })
+    ),
+        r?.(82);
+    const { pendingSwap: E } = await buildMeshesProgressively(f, u, m, T, t, r);
+    r?.(100);
+    const S = g.slice(w.length);
+    S.length > 0 &&
+        (console.log(`[BSP] Background-loading ${S.length} remaining textures...`),
+        loadTexturesInBatches(S, x, null, E).catch((e) => {
+            console.warn("[BSP] Background texture load error:", e);
+        }));
+    const _ = { portals: s, playerStart: l };
+    return (
+        void 0 !== c && (_.ambientIntensity = c),
+        d && (_.ambientColor = new THREE.Color(...d)),
+        (_.lights = i.lights ?? []),
+        _
+    );
+}

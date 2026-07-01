@@ -1,39 +1,347 @@
-// bsp_worker.js v1.3 — UNIFIED COLOR/INTENSITY KEYS FOR LIGHT ENTITIES
-// Fix: light entities previously required color via "_light" (combined
-// "r g b intensity" string) or "_color" (rgb only, underscore-prefixed),
-// which didn't match the plain, no-underscore key names used everywhere
-// else in the engine (portal "color", worldspawn intensity conventions).
-// Now light entities read color from "color" (R G B, each 0-255 — same
-// convention as portal's "color" and worldspawn's "_ambient_color") and
-// intensity from "light" (a single number), matching standard Quake 3
-// entity key names. The old "_color" and combined "_light" (r g b
-// intensity) keys are still read as fallbacks so existing maps keep
-// working unchanged — "color"/"light" simply take priority when present.
-// v1.2 — UNIFIED COLOR FORMAT
-// Fix: light entities accepted TWO different color scales depending on
-// which key was used — "_light" (r g b intensity) already scaled its rgb
-// by /255, but "_color" / "color" (r g b only, no intensity) expected
-// values already in the 0-1 range. This meant a mapper writing
-// _color "135 255 0" (matching the 0-255 convention used everywhere else,
-// e.g. worldspawn's _ambient_color) got a wildly wrong, mostly-white color.
-// Fix: _color / color now scale by /255 exactly like _light's rgb channels
-// and worldspawn's _ambient_color, so every color-bearing key in the map
-// (light _light, light _color/color, worldspawn _ambient_color) uses the
-// same single "R G B, each 0-255" convention. Portal colors are unified to
-// match too — see engine.js v7.22 changelog for the portal side of this fix.
-// v1.1 — CASE-PRESERVING TEXTURE NAMES
-// Fix: texture names parsed from the BSP texture lump were forced to
-// lowercase (s.toLowerCase()), which breaks texture lookup on case-sensitive
-// servers (Linux/nginx) whenever a face references a mixed-case filename —
-// e.g. ported Counter-Strike/Half-Life textures like "SandCrtLrgSd.mp4".
-// The BSP lump preserves whatever case the mapper/shader actually used, so
-// the loader must do the same instead of normalizing it away. The
-// "textures/" prefix strip is now case-insensitive (/i) so it still strips
-// correctly regardless of the case of that one fixed prefix.
-"use strict";const MAGIC=1347633737,VERSION=46,LUMP_ENTITIES=0,LUMP_TEXTURES=1,LUMP_MODELS=7,LUMP_LIGHTMAPS=14,LUMP_VERTS=10,LUMP_MESH_VERTS=11,LUMP_FACES=13,TEX_RECORD_SIZE=72,VERT_RECORD_SIZE=44,FACE_RECORD_SIZE=104,MODEL_RECORD_SIZE=40,LM_SIZE=49152,UNIT=.02,NOCLIP_CLASSNAMES=new Set(["func_wall","func_illusionary","func_detail","func_fog"]),INVISIBLE_TEXTURES=new Set(["common/clip","common/nodraw","common/hint","common/skip","common/caulk","common/trigger","clip","nodraw","hint"]),LIGHT_CLASSNAMES=new Set(["light","light_spot","light_point"]);function parseEntityLump(t){const e=[];let s=0;const n=t.length;for(;s<n;){for(;s<n&&"{"!==t[s];)s++;if(s>=n)break;s++;const o={};for(;s<n&&"}"!==t[s];){for(;s<n&&'"'!==t[s]&&"}"!==t[s];)s++;if(s>=n||"}"===t[s])break;s++;let e="";for(;s<n&&'"'!==t[s];)e+=t[s++];for(s++;s<n&&'"'!==t[s];)s++;s++;let r="";for(;s<n&&'"'!==t[s];)r+=t[s++];s++,e&&(o[e]=r)}s++,Object.keys(o).length&&e.push(o)}return e}function buildNoclipFaceSet(t,e,s){const n=new Set,o=s.length/40|0,r=new DataView(e);for(const e of t){if(!NOCLIP_CLASSNAMES.has(e.classname))continue;const t=e.model??"";if(!t.startsWith("*"))continue;const a=parseInt(t.slice(1),10);if(isNaN(a)||a<1||a>=o)continue;const l=s.offset+40*a,i=r.getInt32(l+24,!0),c=r.getInt32(l+28,!0);if(console.log(`[BSP Worker] ${e.classname} model=*${a}: firstFace=${i}, numFaces=${c}`),i<0||c<0||c>1e5)console.warn(`[BSP Worker] Skipping ${e.classname} — invalid face values`);else for(let t=i;t<i+c;t++)n.add(t)}return n}
-// Color: "color" (R G B, 0-255) takes priority, then legacy "_color"
-// (same 0-255 scale), then legacy combined "_light" (r g b intensity,
-// rgb also 0-255) as a last resort. Default is white (1,1,1) if none set.
-// Intensity: "light" (plain number) takes priority, then legacy "_light"
-// (either "r g b intensity" or a single bare number). Default is 200.
-function parseLights(t){const e=[];for(const s of t){if(!LIGHT_CLASSNAMES.has(s.classname))continue;const[t,n,o]=(s.origin||"0 0 0").split(" ").map(Number);let r=1,a=1,l=1,i=200,colorSet=!1,intensitySet=!1;if(s.color){const t=s.color.trim().split(/\s+/).map(Number);t.length>=3&&(r=t[0]/255,a=t[1]/255,l=t[2]/255,colorSet=!0)}else if(s._color){const t=s._color.trim().split(/\s+/).map(Number);t.length>=3&&(r=t[0]/255,a=t[1]/255,l=t[2]/255,colorSet=!0)}const litVal=parseFloat(s.light);if(!isNaN(litVal)){i=litVal,intensitySet=!0}if(s._light){const t=s._light.trim().split(/\s+/).map(Number);t.length>=4?(colorSet||(r=t[0]/255,a=t[1]/255,l=t[2]/255,colorSet=!0),intensitySet||(i=t[3],intensitySet=!0)):1===t.length&&!intensitySet&&(i=t[0],intensitySet=!0)}r=Math.max(0,Math.min(1,r)),a=Math.max(0,Math.min(1,a)),l=Math.max(0,Math.min(1,l));const c="1"===s._sprite;e.push({x:.02*t,y:.02*o,z:.02*-n,r:r,g:a,b:l,intensity:i,sprite:c})}if(e.length>0){const t=e.filter(t=>t.sprite).length;console.log(`[BSP Worker] Lights: ${e.length} total, ${t} with sprite`)}return e}function buildLightmapAtlas(t,e,s){if(0===s)return null;const n=Math.ceil(Math.sqrt(s)),o=Math.ceil(s/n),r=128*n,a=128*o,l=new Uint8Array(r*a*4),i=new Uint8Array(384);let c=0;for(let o=0;o<s;o++){const s=e.offset+49152*o,a=128*(o%n),f=128*(o/n|0),p=new Uint8Array(t,s,49152);for(let t=0;t<128;t++){i.set(p.subarray(384*t,384*t+384));const e=4*((f+t)*r+a);for(let t=0;t<128;t++){const s=3*t,n=e+4*t;l[n]=i[s],l[n+1]=i[s+1],l[n+2]=i[s+2],l[n+3]=255,i[s]|i[s+1]|i[s+2]&&c++}}}return{atlasData:l.buffer,W:r,H:a,cols:n,rows:o,nonZero:c}}function parseVertices(t,e){const s=e.length/44|0,n=new DataView(t),o=new Float32Array(3*s),r=new Float32Array(2*s),a=new Float32Array(2*s),l=new Float32Array(3*s);for(let t=0;t<s;t++){const s=e.offset+44*t,i=n.getFloat32(s,!0),c=n.getFloat32(s+4,!0),f=n.getFloat32(s+8,!0);o[3*t]=.02*i,o[3*t+1]=.02*f,o[3*t+2]=.02*-c,r[2*t]=n.getFloat32(s+12,!0),r[2*t+1]=n.getFloat32(s+16,!0),a[2*t]=n.getFloat32(s+20,!0),a[2*t+1]=n.getFloat32(s+24,!0);const p=n.getFloat32(s+28,!0),g=n.getFloat32(s+32,!0),u=n.getFloat32(s+36,!0);l[3*t]=p,l[3*t+1]=u,l[3*t+2]=-g}return{rawPos:o,rawUV1:r,rawUV2:a,rawNorm:l}}function buildBatches(t,e,s,n,o,r,a,l,i,c,f){const p=new DataView(t),g=e.length/104|0,u=s.length/4|0,m=new Int32Array(t,s.offset,u),h=new Map,w=n.length/3;for(let t=0;t<g;t++){const s=e.offset+104*t,n=p.getInt32(s,!0),o=p.getInt32(s+8,!0);if(1!==o&&3!==o)continue;const r=p.getInt32(s+12,!0),a=p.getInt32(s+16,!0);if(a<3)continue;if(r<0||r>=w)continue;const l=p.getInt32(s+20,!0),i=p.getInt32(s+24,!0),g=p.getInt32(s+28,!0),I=c.has(t),S=(f[n]||"").toLowerCase(),d=INVISIBLE_TEXTURES.has(S),_=`${n}:${g}:${I?"n":"s"}:${d?"i":"v"}`;let b=h.get(_);b||(b={texIdx:n,lmIdx:g,noclip:I,invisible:d,absIndices:[]},h.set(_,b));const y=b.absIndices;if(i>0)for(let t=0;t<i;t++){const e=l+t;if(e<0||e>=u)continue;const s=r+m[e];s>=0&&s<w&&y.push(s)}else for(let t=1;t<a-1;t++){const e=r,s=r+t,n=r+t+1;e<w&&s<w&&n<w&&y.push(e,s,n)}}const I=l?l.cols:1,S=l?l.W:1,d=l?l.H:1,_=[];for(const[,t]of h){const e=t.absIndices;if(!e.length)continue;const s=new Map,c=e.length,f=new Float32Array(3*c),p=new Float32Array(3*c),g=new Float32Array(2*c),u=new Float32Array(2*c),m=new Uint32Array(e.length);let h=0,w=0,b=1,y=1;if(l&&t.lmIdx>=0&&t.lmIdx<i){h=128*(t.lmIdx%I)/S,w=128*(t.lmIdx/I|0)/d,b=128/S,y=128/d}let M=0;for(let t=0;t<e.length;t++){const l=e[t];let i=s.get(l);void 0===i&&(i=M++,s.set(l,i),f[3*i]=n[3*l],f[3*i+1]=n[3*l+1],f[3*i+2]=n[3*l+2],p[3*i]=a[3*l],p[3*i+1]=a[3*l+1],p[3*i+2]=a[3*l+2],g[2*i]=o[2*l],g[2*i+1]=1-o[2*l+1],u[2*i]=r[2*l]*b+h,u[2*i+1]=r[2*l+1]*y+w),m[t]=i}_.push({texIdx:t.texIdx,lmIdx:t.lmIdx,noclip:t.noclip,invisible:t.invisible,hasLM:null!==l&&t.lmIdx>=0&&t.lmIdx<i,pos:f.subarray(0,3*M),nrm:p.subarray(0,3*M),uv1:g.subarray(0,2*M),uv2:u.subarray(0,2*M),idx:m})}return _}self.onmessage=function({data:t}){try{const{buffer:e,textureBase:s,fallbackTexBase:n}=t,o=new DataView(e);if(o.getUint32(0,!0)!==MAGIC)throw new Error("File is not IBSP");if(46!==o.getInt32(4,!0))throw new Error(`BSP version ${o.getInt32(4,!0)} is not supported`);const r=t=>({offset:o.getInt32(8+8*t,!0),length:o.getInt32(8+8*t+4,!0)});self.postMessage({type:"progress",pct:5});const a=r(0),l=parseEntityLump((new TextDecoder).decode(new Uint8Array(e,a.offset,a.length))),i=[],c=[];let f,p,g=null;for(const t of l)if("trigger_portal"===t.classname)i.push(t);else if("info_player_start"===t.classname){const[e,s,n]=(t.origin||"0 0 0").split(" ").map(Number);g={x:.02*e,y:.02*n,z:.02*-s,angle:parseFloat(t.angle||"0")}}else if("worldspawn"===t.classname){const e=parseFloat(t._ambient);if(isNaN(e)||(f=e),t._ambient_color){const[e,s,n]=t._ambient_color.trim().split(/\s+/).map(Number);isNaN(e)||(p=[e/255,s/255,n/255])}}const u=parseLights(l);c.push(...u),self.postMessage({type:"progress",pct:10});const m=buildNoclipFaceSet(l,e,r(7));m.size>0&&console.log(`[BSP Worker] Noclip faces: ${m.size} (func_wall etc.)`);const h=r(1),w=h.length/72|0,I=[];for(let t=0;t<w;t++){const e=h.offset+72*t;let s="";for(let t=0;t<64;t++){const n=o.getUint8(e+t);if(!n)break;s+=String.fromCharCode(n)}I.push(s.replace(/\\/g,"/").replace(/^textures\//i,""))}self.postMessage({type:"progress",pct:20});const S=r(14),d=S.length/49152|0,_=buildLightmapAtlas(e,S,d);self.postMessage({type:"progress",pct:40});const{rawPos:b,rawUV1:y,rawUV2:M,rawNorm:E}=parseVertices(e,r(10));self.postMessage({type:"progress",pct:55});const A=buildBatches(e,r(13),r(11),b,y,M,E,_,d,m,I);self.postMessage({type:"progress",pct:85});const L=[];_&&L.push(_.atlasData);for(const t of A)t.pos=t.pos.slice().buffer,t.nrm=t.nrm.slice().buffer,t.uv1=t.uv1.slice().buffer,t.uv2=t.uv2.slice().buffer,t.idx=t.idx.buffer,L.push(t.pos,t.nrm,t.uv1,t.uv2,t.idx);self.postMessage({type:"progress",pct:95}),self.postMessage({type:"done",portals:i,lights:c,playerStart:g,ambientIntensity:f,ambientColorArr:p,texNames:I,lmAtlas:_?{data:_.atlasData,W:_.W,H:_.H,cols:_.cols,rows:_.rows,nonZero:_.nonZero}:null,batches:A},L)}catch(t){self.postMessage({type:"error",message:t.message})}};
+"use strict";
+const MAGIC = 1347633737,
+    VERSION = 46,
+    LUMP_ENTITIES = 0,
+    LUMP_TEXTURES = 1,
+    LUMP_MODELS = 7,
+    LUMP_LIGHTMAPS = 14,
+    LUMP_VERTS = 10,
+    LUMP_MESH_VERTS = 11,
+    LUMP_FACES = 13,
+    TEX_RECORD_SIZE = 72,
+    VERT_RECORD_SIZE = 44,
+    FACE_RECORD_SIZE = 104,
+    MODEL_RECORD_SIZE = 40,
+    LM_SIZE = 49152,
+    UNIT = 0.02,
+    NOCLIP_CLASSNAMES = new Set(["func_wall", "func_illusionary", "func_detail", "func_fog"]),
+    INVISIBLE_TEXTURES = new Set([
+        "common/clip",
+        "common/nodraw",
+        "common/hint",
+        "common/skip",
+        "common/caulk",
+        "common/trigger",
+        "clip",
+        "nodraw",
+        "hint",
+    ]),
+    LIGHT_CLASSNAMES = new Set(["light", "light_spot", "light_point"]);
+function parseEntityLump(t) {
+    const e = [];
+    let s = 0;
+    const n = t.length;
+    for (; s < n; ) {
+        for (; s < n && "{" !== t[s]; ) s++;
+        if (s >= n) break;
+        s++;
+        const o = {};
+        for (; s < n && "}" !== t[s]; ) {
+            for (; s < n && '"' !== t[s] && "}" !== t[s]; ) s++;
+            if (s >= n || "}" === t[s]) break;
+            s++;
+            let e = "";
+            for (; s < n && '"' !== t[s]; ) e += t[s++];
+            for (s++; s < n && '"' !== t[s]; ) s++;
+            s++;
+            let r = "";
+            for (; s < n && '"' !== t[s]; ) r += t[s++];
+            s++, e && (o[e] = r);
+        }
+        s++, Object.keys(o).length && e.push(o);
+    }
+    return e;
+}
+function buildNoclipFaceSet(t, e, s) {
+    const n = new Set(),
+        o = (s.length / 40) | 0,
+        r = new DataView(e);
+    for (const e of t) {
+        if (!NOCLIP_CLASSNAMES.has(e.classname)) continue;
+        const t = e.model ?? "";
+        if (!t.startsWith("*")) continue;
+        const a = parseInt(t.slice(1), 10);
+        if (isNaN(a) || a < 1 || a >= o) continue;
+        const l = s.offset + 40 * a,
+            i = r.getInt32(l + 24, !0),
+            c = r.getInt32(l + 28, !0);
+        if (
+            (console.log(`[BSP Worker] ${e.classname} model=*${a}: firstFace=${i}, numFaces=${c}`),
+            i < 0 || c < 0 || c > 1e5)
+        )
+            console.warn(`[BSP Worker] Skipping ${e.classname} — invalid face values`);
+        else for (let t = i; t < i + c; t++) n.add(t);
+    }
+    return n;
+}
+function parseLights(t) {
+    const e = [];
+    for (const s of t) {
+        if (!LIGHT_CLASSNAMES.has(s.classname)) continue;
+        const [t, n, o] = (s.origin || "0 0 0").split(" ").map(Number);
+        let r = 1,
+            a = 1,
+            l = 1,
+            i = 200,
+            c = !1,
+            f = !1;
+        if (s.color) {
+            const t = s.color.trim().split(/\s+/).map(Number);
+            t.length >= 3 && ((r = t[0] / 255), (a = t[1] / 255), (l = t[2] / 255), (c = !0));
+        } else if (s._color) {
+            const t = s._color.trim().split(/\s+/).map(Number);
+            t.length >= 3 && ((r = t[0] / 255), (a = t[1] / 255), (l = t[2] / 255), (c = !0));
+        }
+        const p = parseFloat(s.light);
+        if ((isNaN(p) || ((i = p), (f = !0)), s._light)) {
+            const t = s._light.trim().split(/\s+/).map(Number);
+            t.length >= 4
+                ? (c || ((r = t[0] / 255), (a = t[1] / 255), (l = t[2] / 255), (c = !0)), f || ((i = t[3]), (f = !0)))
+                : 1 === t.length && !f && ((i = t[0]), (f = !0));
+        }
+        (r = Math.max(0, Math.min(1, r))), (a = Math.max(0, Math.min(1, a))), (l = Math.max(0, Math.min(1, l)));
+        const g = "1" === s._sprite;
+        e.push({ x: 0.02 * t, y: 0.02 * o, z: 0.02 * -n, r: r, g: a, b: l, intensity: i, sprite: g });
+    }
+    if (e.length > 0) {
+        const t = e.filter((t) => t.sprite).length;
+        console.log(`[BSP Worker] Lights: ${e.length} total, ${t} with sprite`);
+    }
+    return e;
+}
+function buildLightmapAtlas(t, e, s) {
+    if (0 === s) return null;
+    const n = Math.ceil(Math.sqrt(s)),
+        o = Math.ceil(s / n),
+        r = 128 * n,
+        a = 128 * o,
+        l = new Uint8Array(r * a * 4),
+        i = new Uint8Array(384);
+    let c = 0;
+    for (let o = 0; o < s; o++) {
+        const s = e.offset + 49152 * o,
+            a = (o % n) * 128,
+            f = 128 * ((o / n) | 0),
+            p = new Uint8Array(t, s, 49152);
+        for (let t = 0; t < 128; t++) {
+            i.set(p.subarray(384 * t, 384 * t + 384));
+            const e = 4 * ((f + t) * r + a);
+            for (let t = 0; t < 128; t++) {
+                const s = 3 * t,
+                    n = e + 4 * t;
+                (l[n] = i[s]),
+                    (l[n + 1] = i[s + 1]),
+                    (l[n + 2] = i[s + 2]),
+                    (l[n + 3] = 255),
+                    i[s] | i[s + 1] | i[s + 2] && c++;
+            }
+        }
+    }
+    return { atlasData: l.buffer, W: r, H: a, cols: n, rows: o, nonZero: c };
+}
+function parseVertices(t, e) {
+    const s = (e.length / 44) | 0,
+        n = new DataView(t),
+        o = new Float32Array(3 * s),
+        r = new Float32Array(2 * s),
+        a = new Float32Array(2 * s),
+        l = new Float32Array(3 * s);
+    for (let t = 0; t < s; t++) {
+        const s = e.offset + 44 * t,
+            i = n.getFloat32(s, !0),
+            c = n.getFloat32(s + 4, !0),
+            f = n.getFloat32(s + 8, !0);
+        (o[3 * t] = 0.02 * i),
+            (o[3 * t + 1] = 0.02 * f),
+            (o[3 * t + 2] = 0.02 * -c),
+            (r[2 * t] = n.getFloat32(s + 12, !0)),
+            (r[2 * t + 1] = n.getFloat32(s + 16, !0)),
+            (a[2 * t] = n.getFloat32(s + 20, !0)),
+            (a[2 * t + 1] = n.getFloat32(s + 24, !0));
+        const p = n.getFloat32(s + 28, !0),
+            g = n.getFloat32(s + 32, !0),
+            u = n.getFloat32(s + 36, !0);
+        (l[3 * t] = p), (l[3 * t + 1] = u), (l[3 * t + 2] = -g);
+    }
+    return { rawPos: o, rawUV1: r, rawUV2: a, rawNorm: l };
+}
+function buildBatches(t, e, s, n, o, r, a, l, i, c, f) {
+    const p = new DataView(t),
+        g = (e.length / 104) | 0,
+        u = (s.length / 4) | 0,
+        m = new Int32Array(t, s.offset, u),
+        h = new Map(),
+        I = n.length / 3;
+    for (let t = 0; t < g; t++) {
+        const s = e.offset + 104 * t,
+            n = p.getInt32(s, !0),
+            o = p.getInt32(s + 8, !0);
+        if (1 !== o && 3 !== o) continue;
+        const r = p.getInt32(s + 12, !0),
+            a = p.getInt32(s + 16, !0);
+        if (a < 3) continue;
+        if (r < 0 || r >= I) continue;
+        const l = p.getInt32(s + 20, !0),
+            i = p.getInt32(s + 24, !0),
+            g = p.getInt32(s + 28, !0),
+            w = c.has(t),
+            S = (f[n] || "").toLowerCase(),
+            d = INVISIBLE_TEXTURES.has(S),
+            _ = `${n}:${g}:${w ? "n" : "s"}:${d ? "i" : "v"}`;
+        let b = h.get(_);
+        b || ((b = { texIdx: n, lmIdx: g, noclip: w, invisible: d, absIndices: [] }), h.set(_, b));
+        const y = b.absIndices;
+        if (i > 0)
+            for (let t = 0; t < i; t++) {
+                const e = l + t;
+                if (e < 0 || e >= u) continue;
+                const s = r + m[e];
+                s >= 0 && s < I && y.push(s);
+            }
+        else
+            for (let t = 1; t < a - 1; t++) {
+                const e = r,
+                    s = r + t,
+                    n = r + t + 1;
+                e < I && s < I && n < I && y.push(e, s, n);
+            }
+    }
+    const w = l ? l.cols : 1,
+        S = l ? l.W : 1,
+        d = l ? l.H : 1,
+        _ = [];
+    for (const [, t] of h) {
+        const e = t.absIndices;
+        if (!e.length) continue;
+        const s = new Map(),
+            c = e.length,
+            f = new Float32Array(3 * c),
+            p = new Float32Array(3 * c),
+            g = new Float32Array(2 * c),
+            u = new Float32Array(2 * c),
+            m = new Uint32Array(e.length);
+        let h = 0,
+            I = 0,
+            b = 1,
+            y = 1;
+        l &&
+            t.lmIdx >= 0 &&
+            t.lmIdx < i &&
+            ((h = ((t.lmIdx % w) * 128) / S), (I = (128 * ((t.lmIdx / w) | 0)) / d), (b = 128 / S), (y = 128 / d));
+        let M = 0;
+        for (let t = 0; t < e.length; t++) {
+            const l = e[t];
+            let i = s.get(l);
+            void 0 === i &&
+                ((i = M++),
+                s.set(l, i),
+                (f[3 * i] = n[3 * l]),
+                (f[3 * i + 1] = n[3 * l + 1]),
+                (f[3 * i + 2] = n[3 * l + 2]),
+                (p[3 * i] = a[3 * l]),
+                (p[3 * i + 1] = a[3 * l + 1]),
+                (p[3 * i + 2] = a[3 * l + 2]),
+                (g[2 * i] = o[2 * l]),
+                (g[2 * i + 1] = 1 - o[2 * l + 1]),
+                (u[2 * i] = r[2 * l] * b + h),
+                (u[2 * i + 1] = r[2 * l + 1] * y + I)),
+                (m[t] = i);
+        }
+        _.push({
+            texIdx: t.texIdx,
+            lmIdx: t.lmIdx,
+            noclip: t.noclip,
+            invisible: t.invisible,
+            hasLM: null !== l && t.lmIdx >= 0 && t.lmIdx < i,
+            pos: f.subarray(0, 3 * M),
+            nrm: p.subarray(0, 3 * M),
+            uv1: g.subarray(0, 2 * M),
+            uv2: u.subarray(0, 2 * M),
+            idx: m,
+        });
+    }
+    return _;
+}
+self.onmessage = function ({ data: t }) {
+    try {
+        const { buffer: e, textureBase: s, fallbackTexBase: n } = t,
+            o = new DataView(e);
+        if (o.getUint32(0, !0) !== MAGIC) throw new Error("File is not IBSP");
+        if (46 !== o.getInt32(4, !0)) throw new Error(`BSP version ${o.getInt32(4, !0)} is not supported`);
+        const r = (t) => ({ offset: o.getInt32(8 + 8 * t, !0), length: o.getInt32(8 + 8 * t + 4, !0) });
+        self.postMessage({ type: "progress", pct: 5 });
+        const a = r(0),
+            l = parseEntityLump(new TextDecoder().decode(new Uint8Array(e, a.offset, a.length))),
+            i = [],
+            c = [];
+        let f,
+            p,
+            g = null;
+        for (const t of l)
+            if ("trigger_portal" === t.classname) i.push(t);
+            else if ("info_player_start" === t.classname) {
+                const [e, s, n] = (t.origin || "0 0 0").split(" ").map(Number);
+                g = { x: 0.02 * e, y: 0.02 * n, z: 0.02 * -s, angle: parseFloat(t.angle || "0") };
+            } else if ("worldspawn" === t.classname) {
+                const e = parseFloat(t._ambient);
+                if ((isNaN(e) || (f = e), t._ambient_color)) {
+                    const [e, s, n] = t._ambient_color.trim().split(/\s+/).map(Number);
+                    isNaN(e) || (p = [e / 255, s / 255, n / 255]);
+                }
+            }
+        const u = parseLights(l);
+        c.push(...u), self.postMessage({ type: "progress", pct: 10 });
+        const m = buildNoclipFaceSet(l, e, r(7));
+        m.size > 0 && console.log(`[BSP Worker] Noclip faces: ${m.size} (func_wall etc.)`);
+        const h = r(1),
+            I = (h.length / 72) | 0,
+            w = [];
+        for (let t = 0; t < I; t++) {
+            const e = h.offset + 72 * t;
+            let s = "";
+            for (let t = 0; t < 64; t++) {
+                const n = o.getUint8(e + t);
+                if (!n) break;
+                s += String.fromCharCode(n);
+            }
+            w.push(s.replace(/\\/g, "/").replace(/^textures\//i, ""));
+        }
+        self.postMessage({ type: "progress", pct: 20 });
+        const S = r(14),
+            d = (S.length / 49152) | 0,
+            _ = buildLightmapAtlas(e, S, d);
+        self.postMessage({ type: "progress", pct: 40 });
+        const { rawPos: b, rawUV1: y, rawUV2: M, rawNorm: E } = parseVertices(e, r(10));
+        self.postMessage({ type: "progress", pct: 55 });
+        const A = buildBatches(e, r(13), r(11), b, y, M, E, _, d, m, w);
+        self.postMessage({ type: "progress", pct: 85 });
+        const N = [];
+        _ && N.push(_.atlasData);
+        for (const t of A)
+            (t.pos = t.pos.slice().buffer),
+                (t.nrm = t.nrm.slice().buffer),
+                (t.uv1 = t.uv1.slice().buffer),
+                (t.uv2 = t.uv2.slice().buffer),
+                (t.idx = t.idx.buffer),
+                N.push(t.pos, t.nrm, t.uv1, t.uv2, t.idx);
+        self.postMessage({ type: "progress", pct: 95 }),
+            self.postMessage(
+                {
+                    type: "done",
+                    portals: i,
+                    lights: c,
+                    playerStart: g,
+                    ambientIntensity: f,
+                    ambientColorArr: p,
+                    texNames: w,
+                    lmAtlas: _
+                        ? { data: _.atlasData, W: _.W, H: _.H, cols: _.cols, rows: _.rows, nonZero: _.nonZero }
+                        : null,
+                    batches: A,
+                },
+                N
+            );
+    } catch (t) {
+        self.postMessage({ type: "error", message: t.message });
+    }
+};
