@@ -1,5 +1,17 @@
-// engine.js v7.21
+// engine.js v7.22
 // Changelog:
+// v7.22 — UNIFIED COLOR FORMAT for trigger_portal.
+//         Every color-bearing key in the map now uses the same convention:
+//         "R G B" with each channel 0-255 (the format already used by
+//         worldspawn's _ambient_color, and now by light's _light/_color
+//         too — see bsp_worker.js v1.2 changelog for that half of the fix).
+//         Portal "color" previously only accepted a hex string like
+//         "0xff2200"/"#ff2200", which used a completely different scale
+//         and syntax from every other color field in the map. Added
+//         parseEntityColor(): tries "R G B" (0-255) first, falls back to
+//         hex parsing so existing maps with hex portal colors keep working
+//         unchanged. New maps can just write color "255 34 0" like any
+//         other entity.
 // v7.21 — FIX: shader (.frag) textures on portal media planes never animate.
 //         Portal meshes (buildPortal/applyPortalMediaTexture) had no
 //         onBeforeRender hook, so a shader texture's _lastVisibleFrame
@@ -135,6 +147,38 @@ function mapBaseFromUrl(url) {
     } catch { return "./"; }
 }
 
+// ── Color helpers ─────────────────────────────────────────────────────────────
+
+// Unified color format across the whole engine: "R G B", each channel
+// 0-255 — the same convention already used by worldspawn's _ambient_color
+// and (as of bsp_worker.js v1.2) by light entities' _light/_color/color.
+// Portals used to be the odd one out, requiring a hex string like
+// "0xff2200". This still works as a fallback for old maps, but new maps
+// should just write color "255 34 0" like any other colored entity.
+function parseEntityColor(str, fallbackHex = 0xff2200) {
+    const s = (str || "").trim();
+    if (!s) return new THREE.Color(fallbackHex);
+
+    // Hex fallback: "0xff2200", "#ff2200", or bare "ff2200"
+    if (s.startsWith("0x") || s.startsWith("#") || /^[0-9a-f]{6}$/i.test(s)) {
+        const hex = parseInt(s.replace(/^0x|^#/i, ""), 16);
+        return isNaN(hex) ? new THREE.Color(fallbackHex) : new THREE.Color(hex);
+    }
+
+    // Standard "R G B" (0-255) format
+    const parts = s.split(/\s+/).map(Number);
+    if (parts.length >= 3 && parts.every(n => !isNaN(n))) {
+        const [r, g, b] = parts;
+        return new THREE.Color(
+            Math.max(0, Math.min(1, r / 255)),
+            Math.max(0, Math.min(1, g / 255)),
+            Math.max(0, Math.min(1, b / 255)),
+        );
+    }
+
+    return new THREE.Color(fallbackHex);
+}
+
 // ── Portal helpers ────────────────────────────────────────────────────────────
 
 // Label canvas 2048×320 (4× the old 512×80): ~731 px/world-unit vs old 183.
@@ -197,7 +241,7 @@ function buildPortal(entity, scene, portals) {
     const [ox, oy, oz] = (entity.origin || "0 0 0").split(" ").map(Number);
     const url          = entity.target_url || "#";
     const label        = (entity.label || "").trim();
-    const color        = new THREE.Color().setHex(parseInt((entity.color || "0xff2200").replace("#", ""), 16));
+    const color        = parseEntityColor(entity.color, 0xff2200);
     const angle        = parseFloat(entity.angle  || "0") * Math.PI / 180;
     const szDefault    = entity.size || "110";
     const w            = 0.02 * parseFloat(entity.width  || szDefault);
