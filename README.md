@@ -21,6 +21,7 @@ For easy editing html files and testing the maps on local PC.
 ### 4. Follow the Tutorial
 Ready to build? Follow the official step-by-step guide to configure TrenchBroom and start creating your first map:
 * 📖 [Expore Documentation & Tutorial](https://spelecanton.github.io/Expore/tutorial/) (outdated)
+* [YT Tutorial](https://www.youtube.com/watch?v=odt3qntKuvs) (czech)
 
 ---
 
