@@ -1,42 +1,4 @@
-// engine.js v7.22
-// Changelog:
-// v7.22 — UNIFIED COLOR FORMAT for trigger_portal.
-//         Every color-bearing key in the map now uses the same convention:
-//         "R G B" with each channel 0-255 (the format already used by
-//         worldspawn's _ambient_color, and now by light's _light/_color
-//         too — see bsp_worker.js v1.2 changelog for that half of the fix).
-//         Portal "color" previously only accepted a hex string like
-//         "0xff2200"/"#ff2200", which used a completely different scale
-//         and syntax from every other color field in the map. Added
-//         parseEntityColor(): tries "R G B" (0-255) first, falls back to
-//         hex parsing so existing maps with hex portal colors keep working
-//         unchanged. New maps can just write color "255 34 0" like any
-//         other entity.
-// v7.21 — FIX: shader (.frag) textures on portal media planes never animate.
-//         Portal meshes (buildPortal/applyPortalMediaTexture) had no
-//         onBeforeRender hook, so a shader texture's _lastVisibleFrame
-//         (used by tickAnimatedTextures() in bsp_loader.js to decide
-//         whether to keep ticking a GlslCanvas sandbox) stayed stuck at 0
-//         forever, getting the shader auto-paused after a couple of
-//         frames even though the portal was clearly on screen. BSP face
-//         meshes never had this issue because they already refresh
-//         _lastVisibleFrame every frame in their own onBeforeRender.
-//         Fix: import touchTexture() from bsp_loader.js and call it from
-//         the portal mesh's onBeforeRender, exactly like BSP faces do.
-// v7.20 — Add targetFps parameter to initEngine().
-//         0 = unlimited (native requestAnimationFrame rate).
-//         e.g. 30 = cap at 30 fps, 60 = cap at 60 fps.
-//         Uses elapsed-time gating inside rAF — browser throttling
-//         and tab visibility handling still work correctly.
-// v7.19 — Add shaderTexSize parameter to initEngine().
-//         Calls setShaderTexSize() from bsp_loader.js before BSP load,
-//         so .frag shader canvas textures render at the chosen resolution
-//         (default 512, recommended range 256–2048; power-of-2 only).
-//         Configurable in index.html alongside other engine params.
-// v7.18 — Portal label texture resolution 512×80 → 2048×320 (4× upscale).
-// v7.17 — Fix three camera bob bugs (Y-offset, fadeRate, phase snap).
-// v7.16 — MSAA 2x support via WebGLRenderTarget with samples.
-// v7.15 — Fix inconsistent bob frequency on slopes and walls.
+
 
 import * as THREE from "https://cdn.jsdelivr.net/npm/three@0.165.0/build/three.module.js";
 import { EffectComposer } from "https://cdn.jsdelivr.net/npm/three@0.165.0/examples/jsm/postprocessing/EffectComposer.js";
@@ -237,12 +199,22 @@ function applyPortalMediaTexture(url, mesh) {
     });
 }
 
+// Parses the "billboard" entity key. Accepts "1"/"true" (case-insensitive)
+// as truthy, everything else (including missing key) is false — matching
+// the "0 = off by default" convention used across the rest of the engine's
+// boolean-ish entity keys.
+function parseEntityBool(str) {
+    const s = (str ?? "").trim().toLowerCase();
+    return s === "1" || s === "true";
+}
+
 function buildPortal(entity, scene, portals) {
     const [ox, oy, oz] = (entity.origin || "0 0 0").split(" ").map(Number);
     const url          = entity.target_url || "#";
     const label        = (entity.label || "").trim();
     const color        = parseEntityColor(entity.color, 0xff2200);
     const angle        = parseFloat(entity.angle  || "0") * Math.PI / 180;
+    const billboard     = parseEntityBool(entity.billboard);
     const szDefault    = entity.size || "110";
     const w            = 0.02 * parseFloat(entity.width  || szDefault);
     const h            = 0.02 * parseFloat(entity.height || szDefault);
@@ -254,6 +226,9 @@ function buildPortal(entity, scene, portals) {
         color, transparent: true, opacity, side: THREE.DoubleSide, depthWrite: false,
     }));
     mesh.position.set(px, py, pz);
+    // Initial rotation from "angle" — used as-is for static portals, and as
+    // the pre-first-frame orientation for billboard portals (avoids a pop
+    // before the render loop gets a chance to face it toward the camera).
     mesh.rotation.y = angle;
 
     // FIX v7.21: without this, a shader (.frag) texture applied to this
@@ -274,7 +249,7 @@ function buildPortal(entity, scene, portals) {
 
     const isMedia = isPortalMediaLabel(label);
     isMedia ? applyPortalMediaTexture(label, mesh) : buildPortalLabel(label, color, mesh);
-    portals.push({ x: px, y: py, z: pz, url, label, col: color, mesh, opacity, isMedia });
+    portals.push({ x: px, y: py, z: pz, url, label, col: color, mesh, opacity, isMedia, billboard });
 }
 
 // ── Light sprites ─────────────────────────────────────────────────────────────
@@ -691,7 +666,18 @@ export async function initEngine({
 
         if (frameN % 3 === 0) tickAnimatedTextures();
 
-        for (const p of portals) p.mesh.material.opacity = p.opacity;
+        for (const p of portals) {
+            p.mesh.material.opacity = p.opacity;
+            // v7.23 — billboard portals: face the camera every frame,
+            // Y-axis only (no pitch), so the plane stays upright like a
+            // classic sprite billboard. Non-billboard portals keep their
+            // fixed "angle"-derived rotation, set once in buildPortal().
+            if (p.billboard) {
+                const bdx = cam.position.x - p.mesh.position.x;
+                const bdz = cam.position.z - p.mesh.position.z;
+                p.mesh.rotation.y = Math.atan2(bdx, bdz);
+            }
+        }
 
         const now = performance.now();
         if (now - lastHash >= 3000) {
