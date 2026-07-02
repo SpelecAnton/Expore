@@ -94,6 +94,28 @@ async function findBackgroundMusic(base) {
     return a;
 }
 
+// Footstep sound: same discovery pattern as background music, but this one is
+// play()/pause()-driven by the walking state instead of autoplaying once.
+// Audio elements keep their currentTime across pause(), so resuming walking
+// naturally continues playback right where it left off — no manual bookkeeping needed.
+const STEPS_CANDIDATES = ["steps.mp3", "steps.ogg", "steps.wav"];
+
+async function findStepsSound(base, volume = 0.6) {
+    const found = (await Promise.all(STEPS_CANDIDATES.map(async name => {
+        const url = base + name;
+        try { return (await fetch(url, { method: "HEAD" })).ok ? url : null; }
+        catch { return null; }
+    }))).find(Boolean);
+    if (!found) { console.log("[Engine] No footstep sound found."); return null; }
+    console.log(`[Engine] Footstep sound: ${found}`);
+    const a = new Audio(found);
+    a.loop = true;
+    a.volume = volume;
+    return a;
+}
+
+const BG_CANDIDATES_UNUSED_PLACEHOLDER = null; // (kept for diff-friendliness, no-op)
+
 function mapBaseFromUrl(url) {
     try {
         const href = new URL(url, location.href).href;
@@ -322,6 +344,7 @@ export async function initEngine({
     shaderFps = 0,
     shaderFilter = 1,
     targetFps = 0,
+    stepsVolume = 0.6,
 }) {
     setShaderConfig(shaderFps, shaderFilter);
     setShaderTexSize(shaderTexSize);
@@ -383,6 +406,7 @@ export async function initEngine({
     const invisMeshes = [];
 
     const bgMusicPromise = findBackgroundMusic(mapBaseFromUrl(mapUrl));
+    const stepsPromise   = findStepsSound(mapBaseFromUrl(mapUrl), stepsVolume);
 
     let yaw = 0;
 
@@ -439,7 +463,8 @@ export async function initEngine({
     window._physics = physics;
     window._scene   = scene;
 
-    const bgMusic = await bgMusicPromise;
+    const bgMusic   = await bgMusicPromise;
+    const stepsAudio = await stepsPromise;
     let bgStarted = false;
     function startBgMusic() {
         if (!bgStarted && bgMusic) {
@@ -552,9 +577,10 @@ export async function initEngine({
     });
 
     onReady?.();
-    console.log(`[Engine] bobStrength=${bobStrength}, bobSpeed=${bobSpeed}, shaderTexSize=${shaderTexSize}, shaderFps=${shaderFps||"unlimited"}, shaderFilter=${shaderFilter}, targetFps=${targetFps||"unlimited"}`);
+    console.log(`[Engine] bobStrength=${bobStrength}, bobSpeed=${bobSpeed}, shaderTexSize=${shaderTexSize}, shaderFps=${shaderFps||"unlimited"}, shaderFilter=${shaderFilter}, targetFps=${targetFps||"unlimited"}, stepsVolume=${stepsVolume}`);
 
     let _bobPhase = 0, _bobFactor = 0;
+    let _wasWalking = false; // tracks footstep-audio play/pause transitions
 
     const _frameInterval = targetFps > 0 ? 1000 / targetFps : 0;
     let _lastFrameTime   = 0;
@@ -604,8 +630,18 @@ export async function initEngine({
         const isWalkKey = keys.w||keys.s||keys.a||keys.d||keys.arrowup||keys.arrowdown||keys.arrowleft||keys.arrowright;
         const onGround  = physics.isOnGround;
         const bobActive = bobStrength > 0 && onGround && isWalkKey && horizDist > 0.001;
-        const fadeRate  = bobActive ? 8 : 20;
-        _bobFactor += ((bobActive ? 1 : 0) - _bobFactor) * (1 - Math.exp(-dt * fadeRate));
+
+        if (stepsAudio) {
+            const isWalking = onGround && isWalkKey && horizDist > 0.001;
+            if (isWalking && !_wasWalking) {
+                stepsAudio.play().catch(e => console.warn("[Engine] Steps audio play failed:", e));
+            } else if (!isWalking && _wasWalking) {
+                stepsAudio.pause();
+            }
+            _wasWalking = isWalking;
+        }
+
+        _bobFactor += ((bobActive ? 1 : 0) - _bobFactor) * (1 - Math.exp(-dt * (bobActive ? 8 : 20)));
         if (bobActive) {
             _bobPhase += dt * bobSpeed;
         } else {
