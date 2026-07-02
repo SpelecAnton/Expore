@@ -1,5 +1,3 @@
-
-
 import * as THREE from "https://cdn.jsdelivr.net/npm/three@0.165.0/build/three.module.js";
 import { EffectComposer } from "https://cdn.jsdelivr.net/npm/three@0.165.0/examples/jsm/postprocessing/EffectComposer.js";
 import { RenderPass }     from "https://cdn.jsdelivr.net/npm/three@0.165.0/examples/jsm/postprocessing/RenderPass.js";
@@ -44,8 +42,6 @@ const ColorAdjustShader = {
     `
 };
 
-// ── URL hash helpers ──────────────────────────────────────────────────────────
-
 function readHashState() {
     const s = window.location.hash.slice(1);
     if (!s) return null;
@@ -58,8 +54,6 @@ function writeHashState(x, y, z, yaw) {
     const f = v => Math.round(v * 1000) / 1000;
     history.replaceState(null, "", `#${f(x)},${f(y)},${f(z)},${f(yaw)}`);
 }
-
-// ── Audio helpers ─────────────────────────────────────────────────────────────
 
 const AUDIO_EXTS = new Set([".mp3", ".ogg", ".wav", ".flac", ".aac"]);
 
@@ -84,8 +78,6 @@ function playPortalAudio(url) {
     _activePortalAudio = a;
 }
 
-// ── Background music ──────────────────────────────────────────────────────────
-
 const BG_CANDIDATES = ["background.mp3", "background.ogg", "background.wav"];
 
 async function findBackgroundMusic(base) {
@@ -109,25 +101,15 @@ function mapBaseFromUrl(url) {
     } catch { return "./"; }
 }
 
-// ── Color helpers ─────────────────────────────────────────────────────────────
-
-// Unified color format across the whole engine: "R G B", each channel
-// 0-255 — the same convention already used by worldspawn's _ambient_color
-// and (as of bsp_worker.js v1.2) by light entities' _light/_color/color.
-// Portals used to be the odd one out, requiring a hex string like
-// "0xff2200". This still works as a fallback for old maps, but new maps
-// should just write color "255 34 0" like any other colored entity.
 function parseEntityColor(str, fallbackHex = 0xff2200) {
     const s = (str || "").trim();
     if (!s) return new THREE.Color(fallbackHex);
 
-    // Hex fallback: "0xff2200", "#ff2200", or bare "ff2200"
     if (s.startsWith("0x") || s.startsWith("#") || /^[0-9a-f]{6}$/i.test(s)) {
         const hex = parseInt(s.replace(/^0x|^#/i, ""), 16);
         return isNaN(hex) ? new THREE.Color(fallbackHex) : new THREE.Color(hex);
     }
 
-    // Standard "R G B" (0-255) format
     const parts = s.split(/\s+/).map(Number);
     if (parts.length >= 3 && parts.every(n => !isNaN(n))) {
         const [r, g, b] = parts;
@@ -141,10 +123,6 @@ function parseEntityColor(str, fallbackHex = 0xff2200) {
     return new THREE.Color(fallbackHex);
 }
 
-// ── Portal helpers ────────────────────────────────────────────────────────────
-
-// Label canvas 2048×320 (4× the old 512×80): ~731 px/world-unit vs old 183.
-// generateMipmaps + LinearMipmapLinearFilter keep it sharp at any distance.
 function buildPortalLabel(text, color, parent) {
     if (!text) return null;
     const W = 2048, H = 320;
@@ -153,7 +131,6 @@ function buildPortalLabel(text, color, parent) {
     const ctx = canvas.getContext("2d");
     ctx.clearRect(0, 0, W, H);
 
-    // Auto-shrink font for long strings (minimum 48 px stays legible)
     let fontSize = 120;
     ctx.font = `bold ${fontSize}px "Share Tech Mono", monospace`;
     while (ctx.measureText(text.toUpperCase()).width > W - 120 && fontSize > 48) {
@@ -199,10 +176,6 @@ function applyPortalMediaTexture(url, mesh) {
     });
 }
 
-// Parses the "billboard" entity key. Accepts "1"/"true" (case-insensitive)
-// as truthy, everything else (including missing key) is false — matching
-// the "0 = off by default" convention used across the rest of the engine's
-// boolean-ish entity keys.
 function parseEntityBool(str) {
     const s = (str ?? "").trim().toLowerCase();
     return s === "1" || s === "true";
@@ -210,8 +183,10 @@ function parseEntityBool(str) {
 
 function buildPortal(entity, scene, portals) {
     const [ox, oy, oz] = (entity.origin || "0 0 0").split(" ").map(Number);
-    const url          = entity.target_url || "#";
+    const url          = (entity.target_url || "").trim();
+    const hasUrl        = url.length > 0;
     const label        = (entity.label || "").trim();
+    const hasColor      = !!(entity.color && entity.color.trim());
     const color        = parseEntityColor(entity.color, 0xff2200);
     const angle        = parseFloat(entity.angle  || "0") * Math.PI / 180;
     const billboard     = parseEntityBool(entity.billboard);
@@ -226,33 +201,24 @@ function buildPortal(entity, scene, portals) {
         color, transparent: true, opacity, side: THREE.DoubleSide, depthWrite: false,
     }));
     mesh.position.set(px, py, pz);
-    // Initial rotation from "angle" — used as-is for static portals, and as
-    // the pre-first-frame orientation for billboard portals (avoids a pop
-    // before the render loop gets a chance to face it toward the camera).
     mesh.rotation.y = angle;
 
-    // FIX v7.21: without this, a shader (.frag) texture applied to this
-    // portal plane via applyPortalMediaTexture() never got its
-    // _lastVisibleFrame refreshed, so tickAnimatedTextures() in
-    // bsp_loader.js paused the GlslCanvas sandbox after a couple of frames
-    // and it never resumed — even though the portal was clearly visible.
-    // BSP face meshes already do this in buildMeshesProgressively().
     mesh.onBeforeRender = function () {
         if (mesh.material.map) touchTexture(mesh.material.map);
     };
 
     scene.add(mesh);
-    mesh.add(new THREE.LineSegments(
-        new THREE.EdgesGeometry(geo),
-        new THREE.LineBasicMaterial({ color, opacity, transparent: true })
-    ));
+    if (hasColor) {
+        mesh.add(new THREE.LineSegments(
+            new THREE.EdgesGeometry(geo),
+            new THREE.LineBasicMaterial({ color, opacity, transparent: true })
+        ));
+    }
 
     const isMedia = isPortalMediaLabel(label);
     isMedia ? applyPortalMediaTexture(label, mesh) : buildPortalLabel(label, color, mesh);
-    portals.push({ x: px, y: py, z: pz, url, label, col: color, mesh, opacity, isMedia, billboard });
+    portals.push({ x: px, y: py, z: pz, url, label, col: color, mesh, opacity, isMedia, billboard, clickable: hasUrl });
 }
-
-// ── Light sprites ─────────────────────────────────────────────────────────────
 
 function makeSpriteTexture(r, g, b) {
     const canvas = document.createElement("canvas");
@@ -309,8 +275,6 @@ function addLightSprites(scene, lights) {
     console.log(`[Engine] Lights: ${lights.length} total, ${spriteCount} with sprite`);
 }
 
-// ── Fallback room (BSP load error) ───────────────────────────────────────────
-
 function _fallbackRoom(scene) {
     const floorMat = new THREE.MeshLambertMaterial({ color: 1710638 });
     const ceilMat  = new THREE.MeshLambertMaterial({ color: 1447454 });
@@ -334,8 +298,6 @@ function _fallbackRoom(scene) {
     scene.add(new THREE.AmbientLight(0x334466, 3));
 }
 
-// ── Main entry point ──────────────────────────────────────────────────────────
-
 export async function initEngine({
     canvas,
     mapUrl        = "map.bsp",
@@ -350,46 +312,20 @@ export async function initEngine({
     renderDistance = 180,
     maxPixelRatio  = 1,
     fogColor       = 0,
-    // ── MSAA ───────────────────────────────────────────────────────────────
-    // msaa: WebGL multi-sample count for the main scene render target.
-    //   2 = MSAA 2x (good balance of quality vs. cost).
-    //   4 = MSAA 4x (higher quality, more GPU cost).
-    //   0 = disabled (falls back to antialias:true on the renderer).
     msaa = 2,
-    // ── Camera bob ─────────────────────────────────────────────────────────
-    // bobStrength: vertical sine amplitude in world units (0 = disabled).
-    //   0.02 = barely noticeable, 0.05 = natural, 0.10 = very pronounced.
-    // bobSpeed: phase advance rate in rad/s.
-    //   At MOVE_SPEED 5.6 u/s and bobSpeed 7.0: ~1.1 Hz walking rhythm.
     bobStrength = 0,
     bobSpeed    = 7.0,
-    // ── Color adjustments ──────────────────────────────────────────────────
     brightness  = 0.0,
     contrast    = 1.0,
-    tintRgba    = [1, 1, 1, 0], // [r, g, b, alpha]
-    // ── Shader texture resolution ──────────────────────────────────────────
-    // shaderTexSize: canvas pixel size for .frag shader textures on BSP faces.
-    //   Must be power-of-2. Larger = sharper but more GPU memory per texture.
-    //   256  = low  (fast, blurry up close)
-    //   512  = default
-    //   1024 = high quality
-    //   2048 = very high (use only if few shader textures in the map)
+    tintRgba    = [1, 1, 1, 0],
     shaderTexSize = 512,
     shaderFps = 0,
-    shaderFilter = 1, // 0 = nearest, 1 = bilinear, 2 = bicubic
-    // ── Frame rate cap ────────────────────────────────────────────────────
-    // targetFps: maximum frames per second to render.
-    //   0  = unlimited — renders every requestAnimationFrame tick (default).
-    //   30 = cap at 30 fps (saves GPU on simple maps or slow machines).
-    //   60 = cap at 60 fps (good default if monitor is 144 Hz+).
-    //   Values above the display refresh rate have no effect.
+    shaderFilter = 1,
     targetFps = 0,
 }) {
-    // Apply shader texture size before BSP load so every .frag face uses it
     setShaderConfig(shaderFps, shaderFilter);
     setShaderTexSize(shaderTexSize);
 
-    // ── Renderer ──────────────────────────────────────────────────────────────
     const renderer = new THREE.WebGLRenderer({
         canvas, antialias: true,
         powerPreference: "high-performance",
@@ -402,21 +338,17 @@ export async function initEngine({
     window._rendererInfo = renderer.info;
     initTexLoader(renderer);
 
-    // ── Scene / fog ───────────────────────────────────────────────────────────
     const scene  = new THREE.Scene;
     const fogCol = new THREE.Color(fogColor).convertSRGBToLinear();
     scene.fog        = new THREE.Fog(fogCol, 0.2 * renderDistance, renderDistance);
     scene.background = new THREE.Color(fogCol);
 
-    // ── Camera ────────────────────────────────────────────────────────────────
     const cam = new THREE.PerspectiveCamera(90, window.innerWidth / window.innerHeight, 0.01, renderDistance);
     cam.position.set(0, 1.6, 0);
 
-    // ── Ambient light ─────────────────────────────────────────────────────────
     const ambient = new THREE.AmbientLight(0xffffff, 1);
     scene.add(ambient);
 
-    // ── Post-processing ───────────────────────────────────────────────────────
     let msaaTarget = null;
     if (msaa > 0) {
         msaaTarget = new THREE.WebGLRenderTarget(
@@ -446,18 +378,14 @@ export async function initEngine({
         composer.addPass(bloomPass);
     }
 
-    // ── Portal / mesh lists for raycasting ───────────────────────────────────
     const portals     = [];
     const solidMeshes = [];
     const invisMeshes = [];
 
-    // ── Background music (start fetching early) ───────────────────────────────
     const bgMusicPromise = findBackgroundMusic(mapBaseFromUrl(mapUrl));
 
-    // ── Yaw ───────────────────────────────────────────────────────────────────
     let yaw = 0;
 
-    // ── Load BSP ──────────────────────────────────────────────────────────────
     try {
         const bsp = await loadBSP({
             url: mapUrl, scene,
@@ -505,14 +433,12 @@ export async function initEngine({
         });
     }
 
-    // ── Physics ───────────────────────────────────────────────────────────────
     const physics = createPhysics(scene, physicsConfig);
     physics.refreshCollidables();
     window._cam     = cam;
     window._physics = physics;
     window._scene   = scene;
 
-    // ── Background music ──────────────────────────────────────────────────────
     const bgMusic = await bgMusicPromise;
     let bgStarted = false;
     function startBgMusic() {
@@ -522,13 +448,12 @@ export async function initEngine({
         }
     }
 
-    // ── Portal hover raycasting ───────────────────────────────────────────────
     let _lastPortal     = null;
     let _rayFrame       = 0;
     const _centerUV     = new THREE.Vector2(0, 0);
     const _fwdRay       = new THREE.Raycaster;
     const _occRay       = new THREE.Raycaster;
-    const _portalMeshes = portals.map(p => p.mesh);
+    const _portalMeshes = portals.filter(p => p.clickable).map(p => p.mesh);
 
     function getHoveredPortal() {
         if (!_portalMeshes.length) return null;
@@ -546,7 +471,6 @@ export async function initEngine({
         return (_lastPortal = blocked ? null : (portals.find(p => p.mesh === hits[0].object) ?? null));
     }
 
-    // ── Input ─────────────────────────────────────────────────────────────────
     const keys = {};
 
     window.addEventListener("mousemove", e => {
@@ -611,7 +535,6 @@ export async function initEngine({
         }
     });
 
-    // ── Resize ────────────────────────────────────────────────────────────────
     let _resizeTimer = null;
     window.addEventListener("resize", () => {
         clearTimeout(_resizeTimer);
@@ -633,11 +556,9 @@ export async function initEngine({
 
     let _bobPhase = 0, _bobFactor = 0;
 
-    // Frame rate cap: minimum ms between rendered frames (0 = unlimited)
     const _frameInterval = targetFps > 0 ? 1000 / targetFps : 0;
     let _lastFrameTime   = 0;
 
-    // ── Render loop ───────────────────────────────────────────────────────────
     const clock  = new THREE.Clock;
     let frameN   = 0;
     let lastHash = 0;
@@ -646,9 +567,6 @@ export async function initEngine({
         requestAnimationFrame(loop);
         frameN++;
 
-        // Frame rate cap — skip render if not enough time has elapsed.
-        // Drift-corrected: _lastFrameTime tracks the ideal tick boundary
-        // so missed frames don't cause catch-up bursts.
         if (_frameInterval > 0) {
             const _now = performance.now();
             if (_now - _lastFrameTime < _frameInterval) return;
@@ -668,10 +586,6 @@ export async function initEngine({
 
         for (const p of portals) {
             p.mesh.material.opacity = p.opacity;
-            // v7.23 — billboard portals: face the camera every frame,
-            // Y-axis only (no pitch), so the plane stays upright like a
-            // classic sprite billboard. Non-billboard portals keep their
-            // fixed "angle"-derived rotation, set once in buildPortal().
             if (p.billboard) {
                 const bdx = cam.position.x - p.mesh.position.x;
                 const bdz = cam.position.z - p.mesh.position.z;
@@ -687,7 +601,6 @@ export async function initEngine({
 
         canvas.style.cursor = getHoveredPortal() ? "pointer" : "default";
 
-        // Camera bob — pure Y-position offset, independent of camera pitch.
         const isWalkKey = keys.w||keys.s||keys.a||keys.d||keys.arrowup||keys.arrowdown||keys.arrowleft||keys.arrowright;
         const onGround  = physics.isOnGround;
         const bobActive = bobStrength > 0 && onGround && isWalkKey && horizDist > 0.001;
