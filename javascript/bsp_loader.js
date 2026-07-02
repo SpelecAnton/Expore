@@ -111,7 +111,8 @@ function applyTexFilters(e, { linearMag: t = !1 } = {}) {
         (e.minFilter = THREE.LinearMipmapLinearFilter),
         (e.magFilter = t ? THREE.LinearFilter : THREE.NearestFilter),
         (e.anisotropy = _maxAniso),
-        (e.generateMipmaps = !0);
+        (e.generateMipmaps = !0),
+        (e.premultiplyAlpha = !0);
 }
 function fetchWithTimeout(e, t = 1e4, a = {}) {
     const n = new AbortController(),
