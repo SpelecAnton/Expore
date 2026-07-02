@@ -94,13 +94,24 @@ async function findBackgroundMusic(base) {
     return a;
 }
 
-// Footstep sound: same discovery pattern as background music, but this one is
-// play()/pause()-driven by the walking state instead of autoplaying once.
-// Audio elements keep their currentTime across pause(), so resuming walking
-// naturally continues playback right where it left off — no manual bookkeeping needed.
+// Footstep sound: same discovery pattern as background music. Unlike the
+// background track, this one is NOT set to native `loop = true` — instead we
+// loop it manually via the `ended` event so that every repeat can get a
+// freshly randomized `playbackRate` (poor-man's pitch variation, since plain
+// HTMLMediaElement has no dedicated pitch control). Play/pause is driven by
+// the walking state in the main render loop; pause() never resets
+// currentTime, so resuming walking continues exactly where audio left off.
 const STEPS_CANDIDATES = ["steps.mp3", "steps.ogg", "steps.wav"];
 
-async function findStepsSound(base, volume = 0.6) {
+function randomStepsPlaybackRate(variation) {
+    if (variation <= 0) return 1;
+    // Uniform range [1 - variation, 1 + variation], clamped to a sane minimum
+    // so we never hit 0 or negative playback rate.
+    const rate = 1 + (Math.random() * 2 - 1) * variation;
+    return Math.max(0.1, rate);
+}
+
+async function findStepsSound(base, volume, pitchVariation) {
     const found = (await Promise.all(STEPS_CANDIDATES.map(async name => {
         const url = base + name;
         try { return (await fetch(url, { method: "HEAD" })).ok ? url : null; }
@@ -109,12 +120,16 @@ async function findStepsSound(base, volume = 0.6) {
     if (!found) { console.log("[Engine] No footstep sound found."); return null; }
     console.log(`[Engine] Footstep sound: ${found}`);
     const a = new Audio(found);
-    a.loop = true;
+    a.loop = false; // looped manually below so pitch can vary per repeat
     a.volume = volume;
+    a.playbackRate = randomStepsPlaybackRate(pitchVariation);
+    a.addEventListener("ended", () => {
+        a.currentTime = 0;
+        a.playbackRate = randomStepsPlaybackRate(pitchVariation);
+        a.play().catch(() => {});
+    });
     return a;
 }
-
-const BG_CANDIDATES_UNUSED_PLACEHOLDER = null; // (kept for diff-friendliness, no-op)
 
 function mapBaseFromUrl(url) {
     try {
@@ -345,6 +360,7 @@ export async function initEngine({
     shaderFilter = 1,
     targetFps = 0,
     stepsVolume = 0.6,
+    stepsPitchVariation = 0.15,
 }) {
     setShaderConfig(shaderFps, shaderFilter);
     setShaderTexSize(shaderTexSize);
@@ -406,7 +422,7 @@ export async function initEngine({
     const invisMeshes = [];
 
     const bgMusicPromise = findBackgroundMusic(mapBaseFromUrl(mapUrl));
-    const stepsPromise   = findStepsSound(mapBaseFromUrl(mapUrl), stepsVolume);
+    const stepsPromise   = findStepsSound(mapBaseFromUrl(mapUrl), stepsVolume, stepsPitchVariation);
 
     let yaw = 0;
 
@@ -463,7 +479,7 @@ export async function initEngine({
     window._physics = physics;
     window._scene   = scene;
 
-    const bgMusic   = await bgMusicPromise;
+    const bgMusic    = await bgMusicPromise;
     const stepsAudio = await stepsPromise;
     let bgStarted = false;
     function startBgMusic() {
@@ -577,7 +593,7 @@ export async function initEngine({
     });
 
     onReady?.();
-    console.log(`[Engine] bobStrength=${bobStrength}, bobSpeed=${bobSpeed}, shaderTexSize=${shaderTexSize}, shaderFps=${shaderFps||"unlimited"}, shaderFilter=${shaderFilter}, targetFps=${targetFps||"unlimited"}, stepsVolume=${stepsVolume}`);
+    console.log(`[Engine] bobStrength=${bobStrength}, bobSpeed=${bobSpeed}, shaderTexSize=${shaderTexSize}, shaderFps=${shaderFps||"unlimited"}, shaderFilter=${shaderFilter}, targetFps=${targetFps||"unlimited"}, stepsVolume=${stepsVolume}, stepsPitchVariation=${stepsPitchVariation}`);
 
     let _bobPhase = 0, _bobFactor = 0;
     let _wasWalking = false; // tracks footstep-audio play/pause transitions
@@ -631,6 +647,11 @@ export async function initEngine({
         const onGround  = physics.isOnGround;
         const bobActive = bobStrength > 0 && onGround && isWalkKey && horizDist > 0.001;
 
+        // Footstep audio: play while actually moving on the ground, pause when
+        // stopped. Same walking condition as bobActive but independent of
+        // bobStrength, so footsteps work even with head-bob disabled. The
+        // pitch itself is randomized on each loop repeat inside the `ended`
+        // handler set up in findStepsSound(), not here.
         if (stepsAudio) {
             const isWalking = onGround && isWalkKey && horizDist > 0.001;
             if (isWalking && !_wasWalking) {
