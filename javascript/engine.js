@@ -1,3 +1,4 @@
+
 import * as THREE from "https://cdn.jsdelivr.net/npm/three@0.165.0/build/three.module.js";
 import { EffectComposer } from "https://cdn.jsdelivr.net/npm/three@0.165.0/examples/jsm/postprocessing/EffectComposer.js";
 import { RenderPass }     from "https://cdn.jsdelivr.net/npm/three@0.165.0/examples/jsm/postprocessing/RenderPass.js";
@@ -94,41 +95,157 @@ async function findBackgroundMusic(base) {
     return a;
 }
 
-// Footstep sound: same discovery pattern as background music. Unlike the
-// background track, this one is NOT set to native `loop = true` — instead we
-// loop it manually via the `ended` event so that every repeat can get a
-// freshly randomized `playbackRate` (poor-man's pitch variation, since plain
-// HTMLMediaElement has no dedicated pitch control). Play/pause is driven by
-// the walking state in the main render loop; pause() never resets
-// currentTime, so resuming walking continues exactly where audio left off.
+// ── Footstep audio ──────────────────────────────────────────────────────────
+// Uses the Web Audio API instead of a plain <audio> element so pitch can be
+// varied without changing playback speed/duration (plain playbackRate ties
+// pitch and tempo together, which is not what we want here).
+//
+// Technique: granular resynthesis. The buffer is chopped into small
+// overlapping "grains". Each grain plays a short slice of the source at the
+// target pitchRatio (which changes its pitch), but grains are scheduled back
+// onto the timeline at the *original* real-time spacing — so overall
+// duration stays put while the pitch inside each grain shifts. This is a
+// simplified version of the technique used by proper time-stretch/pitch-shift
+// libraries (e.g. WSOLA), good enough for short percussive sounds like
+// footsteps.
+
 const STEPS_CANDIDATES = ["steps.mp3", "steps.ogg", "steps.wav"];
 
-function randomStepsPlaybackRate(variation) {
-    if (variation <= 0) return 1;
-    // Uniform range [1 - variation, 1 + variation], clamped to a sane minimum
-    // so we never hit 0 or negative playback rate.
-    const rate = 1 + (Math.random() * 2 - 1) * variation;
-    return Math.max(0.1, rate);
-}
-
-async function findStepsSound(base, volume, pitchVariation) {
+async function findStepsUrl(base) {
     const found = (await Promise.all(STEPS_CANDIDATES.map(async name => {
         const url = base + name;
         try { return (await fetch(url, { method: "HEAD" })).ok ? url : null; }
         catch { return null; }
     }))).find(Boolean);
-    if (!found) { console.log("[Engine] No footstep sound found."); return null; }
-    console.log(`[Engine] Footstep sound: ${found}`);
-    const a = new Audio(found);
-    a.loop = false; // looped manually below so pitch can vary per repeat
-    a.volume = volume;
-    a.playbackRate = randomStepsPlaybackRate(pitchVariation);
-    a.addEventListener("ended", () => {
-        a.currentTime = 0;
-        a.playbackRate = randomStepsPlaybackRate(pitchVariation);
-        a.play().catch(() => {});
-    });
-    return a;
+    if (!found) console.log("[Engine] No footstep sound found.");
+    return found ?? null;
+}
+
+async function loadAudioBuffer(ctx, url) {
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`Steps fetch failed: ${url} (${res.status})`);
+    const arr = await res.arrayBuffer();
+    return await ctx.decodeAudioData(arr);
+}
+
+class GranularStepsPlayer {
+    constructor(ctx, buffer, gainNode, { pitchVariation = 0, stopMode = "pause", grainSize = 0.09, overlap = 0.5 } = {}) {
+        this.ctx            = ctx;
+        this.buffer          = buffer;
+        this.gainNode        = gainNode;
+        this.pitchVariation  = pitchVariation;
+        this.stopMode        = stopMode; // "pause" | "finish"
+        this.grainSize       = grainSize;
+        this.overlap         = overlap;
+        this.hop             = grainSize * (1 - overlap);
+
+        this._position        = 0;     // seconds into buffer, persists across pause/resume
+        this._pitchRatio       = 1;
+        this._playing          = false; // scheduler active
+        this._finishing         = false; // "finish" mode: let current cycle end, then stop
+        this._walking           = false;
+        this._scheduledUntil    = 0;    // ctx.currentTime up to which grains are scheduled
+        this._activeSources     = [];
+        this._schedulerTimer    = null;
+    }
+
+    _randomPitchRatio() {
+        if (this.pitchVariation <= 0) return 1;
+        const r = 1 + (Math.random() * 2 - 1) * this.pitchVariation;
+        return Math.max(0.5, Math.min(2, r));
+    }
+
+    _scheduleGrain(outputTime, sourceTime) {
+        const available = this.buffer.duration - sourceTime;
+        if (available <= 0) return;
+        const sourceDur = Math.min(this.grainSize * this._pitchRatio, available);
+        if (sourceDur <= 0) return;
+
+        const src  = this.ctx.createBufferSource();
+        src.buffer = this.buffer;
+        src.playbackRate.value = this._pitchRatio;
+
+        const g = this.ctx.createGain();
+        const half = this.grainSize * this.overlap * 0.5;
+        g.gain.setValueAtTime(0, outputTime);
+        g.gain.linearRampToValueAtTime(1, outputTime + half);
+        g.gain.setValueAtTime(1, Math.max(outputTime + half, outputTime + this.grainSize - half));
+        g.gain.linearRampToValueAtTime(0, outputTime + this.grainSize);
+
+        src.connect(g).connect(this.gainNode);
+        try {
+            src.start(outputTime, sourceTime, sourceDur);
+            src.stop(outputTime + this.grainSize + 0.02);
+        } catch { return; }
+
+        this._activeSources.push(src);
+        src.onended = () => {
+            const i = this._activeSources.indexOf(src);
+            if (i !== -1) this._activeSources.splice(i, 1);
+        };
+    }
+
+    _scheduleAhead() {
+        const lookahead = 0.25;
+        const now = this.ctx.currentTime;
+        while (this._scheduledUntil < now + lookahead) {
+            if (this._position >= this.buffer.duration) {
+                if (this._finishing) {
+                    this._playing   = false;
+                    this._finishing = false;
+                    this._position  = 0;
+                    clearTimeout(this._schedulerTimer);
+                    return;
+                }
+                this._position   = 0;
+                this._pitchRatio = this._randomPitchRatio();
+            }
+            this._scheduleGrain(this._scheduledUntil, this._position);
+            this._scheduledUntil += this.hop;
+            this._position        += this.hop;
+        }
+    }
+
+    _startScheduler() {
+        const tick = () => {
+            if (!this._playing) return;
+            this._scheduleAhead();
+            this._schedulerTimer = setTimeout(tick, 50);
+        };
+        tick();
+    }
+
+    _stopNow() {
+        this._playing = false;
+        clearTimeout(this._schedulerTimer);
+        const now = this.ctx.currentTime;
+        for (const src of this._activeSources) {
+            try { src.stop(now + 0.03); } catch {}
+        }
+        this._activeSources = [];
+        const unplayed = Math.max(0, this._scheduledUntil - now);
+        this._position = Math.max(0, Math.min(this.buffer.duration, this._position - unplayed));
+    }
+
+    // Called every frame with the current walking state.
+    update(isWalking) {
+        this._walking = isWalking;
+        if (isWalking) {
+            this._finishing = false;
+            if (!this._playing) {
+                this._playing = true;
+                if (this._position === 0) this._pitchRatio = this._randomPitchRatio();
+                this._scheduledUntil = this.ctx.currentTime;
+                this._startScheduler();
+            }
+        } else if (this._playing) {
+            if (this.stopMode === "pause") {
+                this._stopNow();
+            } else {
+                this._finishing = true; // let _scheduleAhead stop it once the current cycle ends
+            }
+        }
+    }
 }
 
 function mapBaseFromUrl(url) {
@@ -361,6 +478,7 @@ export async function initEngine({
     targetFps = 0,
     stepsVolume = 0.6,
     stepsPitchVariation = 0.15,
+    stepsStopMode = "pause",
 }) {
     setShaderConfig(shaderFps, shaderFilter);
     setShaderTexSize(shaderTexSize);
@@ -422,7 +540,35 @@ export async function initEngine({
     const invisMeshes = [];
 
     const bgMusicPromise = findBackgroundMusic(mapBaseFromUrl(mapUrl));
-    const stepsPromise   = findStepsSound(mapBaseFromUrl(mapUrl), stepsVolume, stepsPitchVariation);
+
+    // Steps: create the AudioContext eagerly (it starts suspended until a
+    // user gesture in most browsers, resumed on first keydown below), then
+    // fetch + decode the sound file in parallel with everything else.
+    let stepsCtx = null;
+    let stepsPlayer = null;
+    try {
+        stepsCtx = new (window.AudioContext || window.webkitAudioContext)();
+    } catch (e) {
+        console.warn("[Engine] Web Audio API unavailable — footsteps disabled:", e.message);
+    }
+    const stepsReadyPromise = (async () => {
+        if (!stepsCtx) return;
+        const url = await findStepsUrl(mapBaseFromUrl(mapUrl));
+        if (!url) return;
+        try {
+            const buffer = await loadAudioBuffer(stepsCtx, url);
+            const gainNode = stepsCtx.createGain();
+            gainNode.gain.value = stepsVolume;
+            gainNode.connect(stepsCtx.destination);
+            stepsPlayer = new GranularStepsPlayer(stepsCtx, buffer, gainNode, {
+                pitchVariation: stepsPitchVariation,
+                stopMode: stepsStopMode,
+            });
+            console.log(`[Engine] Footstep sound ready: ${url} (pitchVariation=${stepsPitchVariation}, stopMode=${stepsStopMode})`);
+        } catch (e) {
+            console.warn("[Engine] Footstep sound failed to load:", e.message);
+        }
+    })();
 
     let yaw = 0;
 
@@ -479,8 +625,8 @@ export async function initEngine({
     window._physics = physics;
     window._scene   = scene;
 
-    const bgMusic    = await bgMusicPromise;
-    const stepsAudio = await stepsPromise;
+    const bgMusic = await bgMusicPromise;
+    await stepsReadyPromise;
     let bgStarted = false;
     function startBgMusic() {
         if (!bgStarted && bgMusic) {
@@ -524,6 +670,7 @@ export async function initEngine({
         if (e.key === " ") e.preventDefault();
         startBgMusic();
         unmuteVideos();
+        if (stepsCtx && stepsCtx.state === "suspended") stepsCtx.resume().catch(() => {});
         document.querySelectorAll("video[data-spelec-bsp-video]").forEach(v => v.play().catch(() => {}));
 
         if (e.key.toLowerCase() === "f") {
@@ -593,10 +740,9 @@ export async function initEngine({
     });
 
     onReady?.();
-    console.log(`[Engine] bobStrength=${bobStrength}, bobSpeed=${bobSpeed}, shaderTexSize=${shaderTexSize}, shaderFps=${shaderFps||"unlimited"}, shaderFilter=${shaderFilter}, targetFps=${targetFps||"unlimited"}, stepsVolume=${stepsVolume}, stepsPitchVariation=${stepsPitchVariation}`);
+    console.log(`[Engine] bobStrength=${bobStrength}, bobSpeed=${bobSpeed}, shaderTexSize=${shaderTexSize}, shaderFps=${shaderFps||"unlimited"}, shaderFilter=${shaderFilter}, targetFps=${targetFps||"unlimited"}, stepsVolume=${stepsVolume}, stepsPitchVariation=${stepsPitchVariation}, stepsStopMode=${stepsStopMode}`);
 
     let _bobPhase = 0, _bobFactor = 0;
-    let _wasWalking = false; // tracks footstep-audio play/pause transitions
 
     const _frameInterval = targetFps > 0 ? 1000 / targetFps : 0;
     let _lastFrameTime   = 0;
@@ -647,19 +793,9 @@ export async function initEngine({
         const onGround  = physics.isOnGround;
         const bobActive = bobStrength > 0 && onGround && isWalkKey && horizDist > 0.001;
 
-        // Footstep audio: play while actually moving on the ground, pause when
-        // stopped. Same walking condition as bobActive but independent of
-        // bobStrength, so footsteps work even with head-bob disabled. The
-        // pitch itself is randomized on each loop repeat inside the `ended`
-        // handler set up in findStepsSound(), not here.
-        if (stepsAudio) {
+        if (stepsPlayer) {
             const isWalking = onGround && isWalkKey && horizDist > 0.001;
-            if (isWalking && !_wasWalking) {
-                stepsAudio.play().catch(e => console.warn("[Engine] Steps audio play failed:", e));
-            } else if (!isWalking && _wasWalking) {
-                stepsAudio.pause();
-            }
-            _wasWalking = isWalking;
+            stepsPlayer.update(isWalking);
         }
 
         _bobFactor += ((bobActive ? 1 : 0) - _bobFactor) * (1 - Math.exp(-dt * (bobActive ? 8 : 20)));
