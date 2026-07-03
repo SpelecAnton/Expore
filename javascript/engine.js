@@ -1,4 +1,3 @@
-
 import * as THREE from "https://cdn.jsdelivr.net/npm/three@0.165.0/build/three.module.js";
 import { EffectComposer } from "https://cdn.jsdelivr.net/npm/three@0.165.0/examples/jsm/postprocessing/EffectComposer.js";
 import { RenderPass }     from "https://cdn.jsdelivr.net/npm/three@0.165.0/examples/jsm/postprocessing/RenderPass.js";
@@ -95,19 +94,6 @@ async function findBackgroundMusic(base) {
     return a;
 }
 
-// ── Footstep audio ──────────────────────────────────────────────────────────
-// Uses the Web Audio API instead of a plain <audio> element so pitch can be
-// varied without changing playback speed/duration (plain playbackRate ties
-// pitch and tempo together, which is not what we want here).
-//
-// Technique: granular resynthesis. The buffer is chopped into small
-// overlapping "grains". Each grain plays a short slice of the source at the
-// target pitchRatio (which changes its pitch), but grains are scheduled back
-// onto the timeline at the *original* real-time spacing — so overall
-// duration stays put while the pitch inside each grain shifts. This is a
-// simplified version of the technique used by proper time-stretch/pitch-shift
-// libraries (e.g. WSOLA), good enough for short percussive sounds like
-// footsteps.
 
 const STEPS_CANDIDATES = ["steps.mp3", "steps.ogg", "steps.wav"];
 
@@ -128,6 +114,18 @@ async function loadAudioBuffer(ctx, url) {
     return await ctx.decodeAudioData(arr);
 }
 
+// Precomputed Hann window, sampled finely enough to sound smooth once
+// stretched (via setValueCurveAtTime) to any grain duration. Shared across
+// all grains/instances — it's read-only.
+const HANN_CURVE = (() => {
+    const N = 256;
+    const arr = new Float32Array(N);
+    for (let i = 0; i < N; i++) {
+        arr[i] = 0.5 - 0.5 * Math.cos((2 * Math.PI * i) / (N - 1));
+    }
+    return arr;
+})();
+
 class GranularStepsPlayer {
     constructor(ctx, buffer, gainNode, { pitchVariation = 0, stopMode = "pause", grainSize = 0.09, overlap = 0.5 } = {}) {
         this.ctx            = ctx;
@@ -136,6 +134,10 @@ class GranularStepsPlayer {
         this.pitchVariation  = pitchVariation;
         this.stopMode        = stopMode; // "pause" | "finish"
         this.grainSize       = grainSize;
+        // NOTE: overlap = 0.5 (i.e. hop = grainSize / 2) is what makes the
+        // Hann-window overlap-add satisfy the COLA condition (flat summed
+        // amplitude, no buzz). Other overlap values still work but may
+        // reintroduce a faint amplitude ripple.
         this.overlap         = overlap;
         this.hop             = grainSize * (1 - overlap);
 
@@ -166,11 +168,9 @@ class GranularStepsPlayer {
         src.playbackRate.value = this._pitchRatio;
 
         const g = this.ctx.createGain();
-        const half = this.grainSize * this.overlap * 0.5;
-        g.gain.setValueAtTime(0, outputTime);
-        g.gain.linearRampToValueAtTime(1, outputTime + half);
-        g.gain.setValueAtTime(1, Math.max(outputTime + half, outputTime + this.grainSize - half));
-        g.gain.linearRampToValueAtTime(0, outputTime + this.grainSize);
+        // Hann window stretched over the grain's real-time duration. Smooth
+        // (C1-continuous) fade in/out — no clicks, no buzz at the grain rate.
+        g.gain.setValueCurveAtTime(HANN_CURVE, outputTime, this.grainSize);
 
         src.connect(g).connect(this.gainNode);
         try {
