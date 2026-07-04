@@ -55,42 +55,6 @@ function writeHashState(x, y, z, yaw) {
     history.replaceState(null, "", `#${f(x)},${f(y)},${f(z)},${f(yaw)}`);
 }
 
-// ── BSP tree / PVS occlusion culling ────────────────────────────────────────
-// findCluster() walks the compiled BSP node tree (same planes q3map2 used to
-// split the level) to find which leaf/cluster a world-space point sits in.
-// clusterVisible() then checks the PVS bit matrix q3map2 -vis baked into the
-// map to see whether "testCluster" can be seen at all from "fromCluster".
-// Both degrade safely: if a mesh/tree has no cluster info, it's just always
-// visible — this is what keeps older maps (no -vis pass) rendering exactly
-// as before.
-const BSP_TREE_MAX_DEPTH = 10000;
-
-function findCluster(tree, point) {
-    let node = 0, guard = 0;
-    while (node >= 0 && guard++ < BSP_TREE_MAX_DEPTH) {
-        const planeIdx = tree.nodePlane[node];
-        const po = 4 * planeIdx;
-        const dist = tree.planes[po] * point.x + tree.planes[po + 1] * point.y + tree.planes[po + 2] * point.z - tree.planes[po + 3];
-        const side = dist >= 0 ? 0 : 1;
-        const next = tree.nodeChildren[2 * node + side];
-        if (next < 0) {
-            const leaf = -next - 1;
-            return leaf >= 0 && leaf < tree.leafCluster.length ? tree.leafCluster[leaf] : -1;
-        }
-        node = next;
-    }
-    return -1;
-}
-
-function clusterVisible(tree, fromCluster, testCluster) {
-    if (fromCluster < 0 || testCluster < 0) return true;
-    if (fromCluster === testCluster) return true;
-    if (!tree.visBits) return true;
-    const byteIdx = fromCluster * tree.bytesPerCluster + (testCluster >> 3);
-    if (byteIdx < 0 || byteIdx >= tree.visBits.length) return true;
-    return (tree.visBits[byteIdx] & (1 << (testCluster & 7))) !== 0;
-}
-
 const AUDIO_EXTS = new Set([".mp3", ".ogg", ".wav", ".flac", ".aac"]);
 
 function isAudioUrl(url) {
@@ -575,12 +539,6 @@ export async function initEngine({
     const solidMeshes = [];
     const invisMeshes = [];
 
-    // PVS state: clusterMeshes buckets every BSP-tagged mesh by its cluster id;
-    // bspTree stays null (== disabled) unless the loaded map actually shipped
-    // visdata, so untouched/legacy maps behave exactly as before.
-    const clusterMeshes = new Map();
-    let bspTree = null;
-
     const bgMusicPromise = findBackgroundMusic(mapBaseFromUrl(mapUrl));
 
     // Steps: create the AudioContext eagerly (it starts suspended until a
@@ -644,19 +602,7 @@ export async function initEngine({
             if (portalMeshSet.has(obj)) return;
             if (obj.userData.invisible)                    invisMeshes.push(obj);
             else if (obj.material?.depthWrite !== false)   solidMeshes.push(obj);
-            if (obj.userData.cluster !== undefined) {
-                let bucket = clusterMeshes.get(obj.userData.cluster);
-                if (!bucket) clusterMeshes.set(obj.userData.cluster, bucket = []);
-                bucket.push(obj);
-            }
         });
-
-        if (bsp.bspTree && bsp.bspTree.hasVis) {
-            bspTree = bsp.bspTree;
-            console.log(`[Engine] PVS occlusion culling active — ${clusterMeshes.size} clusters tagged, ${bspTree.numClusters} total in map`);
-        } else {
-            console.log("[Engine] No PVS data on this map (compile without -vis?) — rendering fully every frame, as before");
-        }
 
         setTimeout(() => {
             console.log("[Engine] Scene ready — full render pipeline active");
@@ -759,19 +705,6 @@ export async function initEngine({
             console.log(`Programs:    ${info.programs?.length ?? "N/A"}`);
             console.log("======================");
         }
-        if (e.key.toLowerCase() === "v") {
-            console.log("=== PVS DEBUG ===");
-            if (!bspTree) {
-                console.log("No PVS data loaded for this map.");
-            } else {
-                const cluster = findCluster(bspTree, cam.position);
-                let visibleClusters = 0;
-                for (const c of clusterMeshes.keys()) if (clusterVisible(bspTree, cluster, c)) visibleClusters++;
-                console.log(`Camera cluster: ${cluster}`);
-                console.log(`Visible clusters: ${visibleClusters} / ${clusterMeshes.size} tagged (map has ${bspTree.numClusters} total)`);
-            }
-            console.log("==================");
-        }
     }, { passive: true });
 
     window.addEventListener("keyup", e => { keys[e.key.toLowerCase()] = false; });
@@ -810,7 +743,6 @@ export async function initEngine({
     console.log(`[Engine] bobStrength=${bobStrength}, bobSpeed=${bobSpeed}, shaderTexSize=${shaderTexSize}, shaderFps=${shaderFps||"unlimited"}, shaderFilter=${shaderFilter}, targetFps=${targetFps||"unlimited"}, stepsVolume=${stepsVolume}, stepsPitchVariation=${stepsPitchVariation}, stepsStopMode=${stepsStopMode}`);
 
     let _bobPhase = 0, _bobFactor = 0;
-    let _lastCamCluster = -2; // sentinel: "not computed yet", distinct from a valid -1 (unknown/outside) cluster
 
     const _frameInterval = targetFps > 0 ? 1000 / targetFps : 0;
     let _lastFrameTime   = 0;
@@ -834,17 +766,6 @@ export async function initEngine({
 
         const prevX = cam.position.x, prevZ = cam.position.z;
         yaw = physics.update(cam, keys, yaw, dt);
-
-        if (bspTree) {
-            const camCluster = findCluster(bspTree, cam.position);
-            if (camCluster !== _lastCamCluster) {
-                _lastCamCluster = camCluster;
-                for (const [cluster, meshes] of clusterMeshes) {
-                    const visible = clusterVisible(bspTree, camCluster, cluster);
-                    for (const mesh of meshes) mesh.visible = visible;
-                }
-            }
-        }
 
         const dx = cam.position.x - prevX, dz = cam.position.z - prevZ;
         const horizDist = Math.sqrt(dx*dx + dz*dz);

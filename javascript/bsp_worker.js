@@ -1,33 +1,17 @@
 "use strict";
-// SPELEC BSP Worker — now also parses the compiled BSP tree (planes/nodes/leafs)
-// and PVS visdata, and tags render batches with their cluster id. This is what
-// lets engine.js do camera-cluster occlusion culling instead of rendering the
-// whole map every frame. Falls back cleanly (hasTree/hasVis = false) when a map
-// has no tree/visdata lumps (e.g. compiled without a -vis pass) — legacy maps
-// keep rendering fully, unchanged.
-
 const MAGIC = 1347633737,
     VERSION = 46,
     LUMP_ENTITIES = 0,
     LUMP_TEXTURES = 1,
-    LUMP_PLANES = 2,
-    LUMP_NODES = 3,
-    LUMP_LEAFS = 4,
-    LUMP_LEAFFACES = 5,
     LUMP_MODELS = 7,
     LUMP_LIGHTMAPS = 14,
     LUMP_VERTS = 10,
     LUMP_MESH_VERTS = 11,
     LUMP_FACES = 13,
-    LUMP_VISDATA = 16,
     TEX_RECORD_SIZE = 72,
     VERT_RECORD_SIZE = 44,
     FACE_RECORD_SIZE = 104,
     MODEL_RECORD_SIZE = 40,
-    PLANE_RECORD_SIZE = 16,
-    NODE_RECORD_SIZE = 36,
-    LEAF_RECORD_SIZE = 48,
-    LEAFFACE_RECORD_SIZE = 4,
     LM_SIZE = 49152,
     UNIT = 0.02,
     NOCLIP_CLASSNAMES = new Set(["func_wall", "func_illusionary", "func_detail", "func_fog"]),
@@ -43,536 +27,321 @@ const MAGIC = 1347633737,
         "hint",
     ]),
     LIGHT_CLASSNAMES = new Set(["light", "light_spot", "light_point"]);
-
-function parseEntityLump(text) {
-    const entities = [];
-    let pos = 0;
-    const len = text.length;
-    while (pos < len) {
-        while (pos < len && text[pos] !== "{") pos++;
-        if (pos >= len) break;
-        pos++;
-        const ent = {};
-        while (pos < len && text[pos] !== "}") {
-            while (pos < len && text[pos] !== '"' && text[pos] !== "}") pos++;
-            if (pos >= len || text[pos] === "}") break;
-            pos++; // consume key's opening quote
-            let key = "";
-            while (pos < len && text[pos] !== '"') key += text[pos++];
-            pos++; // consume key's closing quote
-            while (pos < len && text[pos] !== '"') pos++; // skip to value's opening quote
-            pos++; // consume value's opening quote
-            let value = "";
-            while (pos < len && text[pos] !== '"') value += text[pos++];
-            pos++; // consume value's closing quote
-            if (key) ent[key] = value;
+function parseEntityLump(t) {
+    const e = [];
+    let s = 0;
+    const n = t.length;
+    for (; s < n; ) {
+        for (; s < n && "{" !== t[s]; ) s++;
+        if (s >= n) break;
+        s++;
+        const o = {};
+        for (; s < n && "}" !== t[s]; ) {
+            for (; s < n && '"' !== t[s] && "}" !== t[s]; ) s++;
+            if (s >= n || "}" === t[s]) break;
+            s++;
+            let e = "";
+            for (; s < n && '"' !== t[s]; ) e += t[s++];
+            for (s++; s < n && '"' !== t[s]; ) s++;
+            s++;
+            let r = "";
+            for (; s < n && '"' !== t[s]; ) r += t[s++];
+            s++, e && (o[e] = r);
         }
-        pos++;
-        if (Object.keys(ent).length) entities.push(ent);
+        s++, Object.keys(o).length && e.push(o);
     }
-    return entities;
+    return e;
 }
-
-function buildNoclipFaceSet(entities, buffer, modelsLump) {
-    const noclipFaces = new Set(),
-        numModels = (modelsLump.length / MODEL_RECORD_SIZE) | 0,
-        dv = new DataView(buffer);
-    for (const ent of entities) {
-        if (!NOCLIP_CLASSNAMES.has(ent.classname)) continue;
-        const modelStr = ent.model ?? "";
-        if (!modelStr.startsWith("*")) continue;
-        const modelIdx = parseInt(modelStr.slice(1), 10);
-        if (isNaN(modelIdx) || modelIdx < 1 || modelIdx >= numModels) continue;
-        const o = modelsLump.offset + MODEL_RECORD_SIZE * modelIdx,
-            firstFace = dv.getInt32(o + 24, true),
-            numFaces = dv.getInt32(o + 28, true);
-        console.log(`[BSP Worker] ${ent.classname} model=*${modelIdx}: firstFace=${firstFace}, numFaces=${numFaces}`);
-        if (firstFace < 0 || numFaces < 0 || numFaces > 1e5) {
-            console.warn(`[BSP Worker] Skipping ${ent.classname} — invalid face values`);
-        } else {
-            for (let f = firstFace; f < firstFace + numFaces; f++) noclipFaces.add(f);
-        }
+function buildNoclipFaceSet(t, e, s) {
+    const n = new Set(),
+        o = (s.length / 40) | 0,
+        r = new DataView(e);
+    for (const e of t) {
+        if (!NOCLIP_CLASSNAMES.has(e.classname)) continue;
+        const t = e.model ?? "";
+        if (!t.startsWith("*")) continue;
+        const a = parseInt(t.slice(1), 10);
+        if (isNaN(a) || a < 1 || a >= o) continue;
+        const l = s.offset + 40 * a,
+            i = r.getInt32(l + 24, !0),
+            c = r.getInt32(l + 28, !0);
+        if (
+            (console.log(`[BSP Worker] ${e.classname} model=*${a}: firstFace=${i}, numFaces=${c}`),
+            i < 0 || c < 0 || c > 1e5)
+        )
+            console.warn(`[BSP Worker] Skipping ${e.classname} — invalid face values`);
+        else for (let t = i; t < i + c; t++) n.add(t);
     }
-    return noclipFaces;
+    return n;
 }
-
-function parseLights(entities) {
-    const lights = [];
-    for (const ent of entities) {
-        if (!LIGHT_CLASSNAMES.has(ent.classname)) continue;
-        const [ox, oy, oz] = (ent.origin || "0 0 0").split(" ").map(Number);
+function parseLights(t) {
+    const e = [];
+    for (const s of t) {
+        if (!LIGHT_CLASSNAMES.has(s.classname)) continue;
+        const [t, n, o] = (s.origin || "0 0 0").split(" ").map(Number);
         let r = 1,
-            g = 1,
+            a = 1,
+            l = 1,
+            i = 200,
+            c = !1,
+            f = !1;
+        if (s.color) {
+            const t = s.color.trim().split(/\s+/).map(Number);
+            t.length >= 3 && ((r = t[0] / 255), (a = t[1] / 255), (l = t[2] / 255), (c = !0));
+        } else if (s._color) {
+            const t = s._color.trim().split(/\s+/).map(Number);
+            t.length >= 3 && ((r = t[0] / 255), (a = t[1] / 255), (l = t[2] / 255), (c = !0));
+        }
+        const p = parseFloat(s.light);
+        if ((isNaN(p) || ((i = p), (f = !0)), s._light)) {
+            const t = s._light.trim().split(/\s+/).map(Number);
+            t.length >= 4
+                ? (c || ((r = t[0] / 255), (a = t[1] / 255), (l = t[2] / 255), (c = !0)), f || ((i = t[3]), (f = !0)))
+                : 1 === t.length && !f && ((i = t[0]), (f = !0));
+        }
+        (r = Math.max(0, Math.min(1, r))), (a = Math.max(0, Math.min(1, a))), (l = Math.max(0, Math.min(1, l)));
+        const g = "1" === s._sprite;
+        e.push({ x: 0.02 * t, y: 0.02 * o, z: 0.02 * -n, r: r, g: a, b: l, intensity: i, sprite: g });
+    }
+    if (e.length > 0) {
+        const t = e.filter((t) => t.sprite).length;
+        console.log(`[BSP Worker] Lights: ${e.length} total, ${t} with sprite`);
+    }
+    return e;
+}
+function buildLightmapAtlas(t, e, s) {
+    if (0 === s) return null;
+    const n = Math.ceil(Math.sqrt(s)),
+        o = Math.ceil(s / n),
+        r = 128 * n,
+        a = 128 * o,
+        l = new Uint8Array(r * a * 4),
+        i = new Uint8Array(384);
+    let c = 0;
+    for (let o = 0; o < s; o++) {
+        const s = e.offset + 49152 * o,
+            a = (o % n) * 128,
+            f = 128 * ((o / n) | 0),
+            p = new Uint8Array(t, s, 49152);
+        for (let t = 0; t < 128; t++) {
+            i.set(p.subarray(384 * t, 384 * t + 384));
+            const e = 4 * ((f + t) * r + a);
+            for (let t = 0; t < 128; t++) {
+                const s = 3 * t,
+                    n = e + 4 * t;
+                (l[n] = i[s]),
+                    (l[n + 1] = i[s + 1]),
+                    (l[n + 2] = i[s + 2]),
+                    (l[n + 3] = 255),
+                    i[s] | i[s + 1] | i[s + 2] && c++;
+            }
+        }
+    }
+    return { atlasData: l.buffer, W: r, H: a, cols: n, rows: o, nonZero: c };
+}
+function parseVertices(t, e) {
+    const s = (e.length / 44) | 0,
+        n = new DataView(t),
+        o = new Float32Array(3 * s),
+        r = new Float32Array(2 * s),
+        a = new Float32Array(2 * s),
+        l = new Float32Array(3 * s);
+    for (let t = 0; t < s; t++) {
+        const s = e.offset + 44 * t,
+            i = n.getFloat32(s, !0),
+            c = n.getFloat32(s + 4, !0),
+            f = n.getFloat32(s + 8, !0);
+        (o[3 * t] = 0.02 * i),
+            (o[3 * t + 1] = 0.02 * f),
+            (o[3 * t + 2] = 0.02 * -c),
+            (r[2 * t] = n.getFloat32(s + 12, !0)),
+            (r[2 * t + 1] = n.getFloat32(s + 16, !0)),
+            (a[2 * t] = n.getFloat32(s + 20, !0)),
+            (a[2 * t + 1] = n.getFloat32(s + 24, !0));
+        const p = n.getFloat32(s + 28, !0),
+            g = n.getFloat32(s + 32, !0),
+            u = n.getFloat32(s + 36, !0);
+        (l[3 * t] = p), (l[3 * t + 1] = u), (l[3 * t + 2] = -g);
+    }
+    return { rawPos: o, rawUV1: r, rawUV2: a, rawNorm: l };
+}
+function buildBatches(t, e, s, n, o, r, a, l, i, c, f) {
+    const p = new DataView(t),
+        g = (e.length / 104) | 0,
+        u = (s.length / 4) | 0,
+        m = new Int32Array(t, s.offset, u),
+        h = new Map(),
+        I = n.length / 3;
+    for (let t = 0; t < g; t++) {
+        const s = e.offset + 104 * t,
+            n = p.getInt32(s, !0),
+            o = p.getInt32(s + 8, !0);
+        if (1 !== o && 3 !== o) continue;
+        const r = p.getInt32(s + 12, !0),
+            a = p.getInt32(s + 16, !0);
+        if (a < 3) continue;
+        if (r < 0 || r >= I) continue;
+        const l = p.getInt32(s + 20, !0),
+            i = p.getInt32(s + 24, !0),
+            g = p.getInt32(s + 28, !0),
+            w = c.has(t),
+            S = (f[n] || "").toLowerCase(),
+            d = INVISIBLE_TEXTURES.has(S),
+            _ = `${n}:${g}:${w ? "n" : "s"}:${d ? "i" : "v"}`;
+        let b = h.get(_);
+        b || ((b = { texIdx: n, lmIdx: g, noclip: w, invisible: d, absIndices: [] }), h.set(_, b));
+        const y = b.absIndices;
+        if (i > 0)
+            for (let t = 0; t < i; t++) {
+                const e = l + t;
+                if (e < 0 || e >= u) continue;
+                const s = r + m[e];
+                s >= 0 && s < I && y.push(s);
+            }
+        else
+            for (let t = 1; t < a - 1; t++) {
+                const e = r,
+                    s = r + t,
+                    n = r + t + 1;
+                e < I && s < I && n < I && y.push(e, s, n);
+            }
+    }
+    const w = l ? l.cols : 1,
+        S = l ? l.W : 1,
+        d = l ? l.H : 1,
+        _ = [];
+    for (const [, t] of h) {
+        const e = t.absIndices;
+        if (!e.length) continue;
+        const s = new Map(),
+            c = e.length,
+            f = new Float32Array(3 * c),
+            p = new Float32Array(3 * c),
+            g = new Float32Array(2 * c),
+            u = new Float32Array(2 * c),
+            m = new Uint32Array(e.length);
+        let h = 0,
+            I = 0,
             b = 1,
-            intensity = 200,
-            hasColor = false,
-            hasIntensity = false;
-
-        if (ent.color) {
-            const parts = ent.color.trim().split(/\s+/).map(Number);
-            if (parts.length >= 3) {
-                r = parts[0] / 255;
-                g = parts[1] / 255;
-                b = parts[2] / 255;
-                hasColor = true;
-            }
-        } else if (ent._color) {
-            const parts = ent._color.trim().split(/\s+/).map(Number);
-            if (parts.length >= 3) {
-                r = parts[0] / 255;
-                g = parts[1] / 255;
-                b = parts[2] / 255;
-                hasColor = true;
-            }
+            y = 1;
+        l &&
+            t.lmIdx >= 0 &&
+            t.lmIdx < i &&
+            ((h = ((t.lmIdx % w) * 128) / S), (I = (128 * ((t.lmIdx / w) | 0)) / d), (b = 128 / S), (y = 128 / d));
+        let M = 0;
+        for (let t = 0; t < e.length; t++) {
+            const l = e[t];
+            let i = s.get(l);
+            void 0 === i &&
+                ((i = M++),
+                s.set(l, i),
+                (f[3 * i] = n[3 * l]),
+                (f[3 * i + 1] = n[3 * l + 1]),
+                (f[3 * i + 2] = n[3 * l + 2]),
+                (p[3 * i] = a[3 * l]),
+                (p[3 * i + 1] = a[3 * l + 1]),
+                (p[3 * i + 2] = a[3 * l + 2]),
+                (g[2 * i] = o[2 * l]),
+                (g[2 * i + 1] = 1 - o[2 * l + 1]),
+                (u[2 * i] = r[2 * l] * b + h),
+                (u[2 * i + 1] = r[2 * l + 1] * y + I)),
+                (m[t] = i);
         }
-
-        const lightVal = parseFloat(ent.light);
-        if (!isNaN(lightVal)) {
-            intensity = lightVal;
-            hasIntensity = true;
-        }
-
-        if (ent._light) {
-            const parts = ent._light.trim().split(/\s+/).map(Number);
-            if (parts.length >= 4) {
-                if (!hasColor) {
-                    r = parts[0] / 255;
-                    g = parts[1] / 255;
-                    b = parts[2] / 255;
-                    hasColor = true;
-                }
-                if (!hasIntensity) {
-                    intensity = parts[3];
-                    hasIntensity = true;
-                }
-            } else if (parts.length === 1 && !hasIntensity) {
-                intensity = parts[0];
-                hasIntensity = true;
-            }
-        }
-
-        r = Math.max(0, Math.min(1, r));
-        g = Math.max(0, Math.min(1, g));
-        b = Math.max(0, Math.min(1, b));
-        const sprite = ent._sprite === "1";
-        lights.push({ x: UNIT * ox, y: UNIT * oz, z: UNIT * -oy, r, g, b, intensity, sprite });
-    }
-    if (lights.length > 0) {
-        const spriteCount = lights.filter((l) => l.sprite).length;
-        console.log(`[BSP Worker] Lights: ${lights.length} total, ${spriteCount} with sprite`);
-    }
-    return lights;
-}
-
-function buildLightmapAtlas(buffer, lightmapsLump, numLightmaps) {
-    if (numLightmaps === 0) return null;
-    const cols = Math.ceil(Math.sqrt(numLightmaps)),
-        rows = Math.ceil(numLightmaps / cols),
-        W = 128 * cols,
-        H = 128 * rows,
-        atlas = new Uint8Array(W * H * 4),
-        rowBuf = new Uint8Array(384);
-    let nonZero = 0;
-    for (let lm = 0; lm < numLightmaps; lm++) {
-        const srcOffset = lightmapsLump.offset + LM_SIZE * lm,
-            destX = (lm % cols) * 128,
-            destY = 128 * ((lm / cols) | 0),
-            src = new Uint8Array(buffer, srcOffset, LM_SIZE);
-        for (let y = 0; y < 128; y++) {
-            rowBuf.set(src.subarray(384 * y, 384 * y + 384));
-            const rowBase = 4 * ((destY + y) * W + destX);
-            for (let x = 0; x < 128; x++) {
-                const s = 3 * x,
-                    d = rowBase + 4 * x;
-                atlas[d] = rowBuf[s];
-                atlas[d + 1] = rowBuf[s + 1];
-                atlas[d + 2] = rowBuf[s + 2];
-                atlas[d + 3] = 255;
-                if (rowBuf[s] | rowBuf[s + 1] | rowBuf[s + 2]) nonZero++;
-            }
-        }
-    }
-    return { atlasData: atlas.buffer, W, H, cols, rows, nonZero };
-}
-
-function parseVertices(buffer, vertsLump) {
-    const numVerts = (vertsLump.length / VERT_RECORD_SIZE) | 0,
-        dv = new DataView(buffer),
-        rawPos = new Float32Array(3 * numVerts),
-        rawUV1 = new Float32Array(2 * numVerts),
-        rawUV2 = new Float32Array(2 * numVerts),
-        rawNorm = new Float32Array(3 * numVerts);
-    for (let i = 0; i < numVerts; i++) {
-        const o = vertsLump.offset + VERT_RECORD_SIZE * i,
-            vx = dv.getFloat32(o, true),
-            vy = dv.getFloat32(o + 4, true),
-            vz = dv.getFloat32(o + 8, true);
-        rawPos[3 * i] = UNIT * vx;
-        rawPos[3 * i + 1] = UNIT * vz;
-        rawPos[3 * i + 2] = UNIT * -vy;
-        rawUV1[2 * i] = dv.getFloat32(o + 12, true);
-        rawUV1[2 * i + 1] = dv.getFloat32(o + 16, true);
-        rawUV2[2 * i] = dv.getFloat32(o + 20, true);
-        rawUV2[2 * i + 1] = dv.getFloat32(o + 24, true);
-        const nx = dv.getFloat32(o + 28, true),
-            ny = dv.getFloat32(o + 32, true),
-            nz = dv.getFloat32(o + 36, true);
-        rawNorm[3 * i] = nx;
-        rawNorm[3 * i + 1] = nz;
-        rawNorm[3 * i + 2] = -ny;
-    }
-    return { rawPos, rawUV1, rawUV2, rawNorm };
-}
-
-// Parses planes/nodes/leafs/leaffaces/visdata and builds a face -> PVS cluster
-// lookup. Plane normal/dist are converted into the same coordinate space as
-// vertices/lights (permutation x,z,-y + UNIT scale) so findCluster() in
-// engine.js can test camera position directly, no per-frame conversion needed.
-function parseBSPTree(buffer, planesLump, nodesLump, leafsLump, leaffacesLump, visLump, numFaces) {
-    const dv = new DataView(buffer);
-
-    const numPlanes = (planesLump.length / PLANE_RECORD_SIZE) | 0;
-    const planes = new Float32Array(4 * numPlanes);
-    for (let i = 0; i < numPlanes; i++) {
-        const o = planesLump.offset + PLANE_RECORD_SIZE * i,
-            nx = dv.getFloat32(o, true),
-            ny = dv.getFloat32(o + 4, true),
-            nz = dv.getFloat32(o + 8, true),
-            d = dv.getFloat32(o + 12, true);
-        planes[4 * i] = nx;
-        planes[4 * i + 1] = nz;
-        planes[4 * i + 2] = -ny;
-        planes[4 * i + 3] = d * UNIT;
-    }
-
-    const numNodes = (nodesLump.length / NODE_RECORD_SIZE) | 0;
-    const nodePlane = new Int32Array(numNodes);
-    const nodeChildren = new Int32Array(2 * numNodes);
-    for (let i = 0; i < numNodes; i++) {
-        const o = nodesLump.offset + NODE_RECORD_SIZE * i;
-        nodePlane[i] = dv.getInt32(o, true);
-        nodeChildren[2 * i] = dv.getInt32(o + 4, true);
-        nodeChildren[2 * i + 1] = dv.getInt32(o + 8, true);
-    }
-
-    const numLeafs = (leafsLump.length / LEAF_RECORD_SIZE) | 0;
-    const leafCluster = new Int32Array(numLeafs);
-    const leafFirstFace = new Int32Array(numLeafs);
-    const leafNumFaces = new Int32Array(numLeafs);
-    for (let i = 0; i < numLeafs; i++) {
-        const o = leafsLump.offset + LEAF_RECORD_SIZE * i;
-        leafCluster[i] = dv.getInt32(o, true);
-        leafFirstFace[i] = dv.getInt32(o + 32, true);
-        leafNumFaces[i] = dv.getInt32(o + 36, true);
-    }
-
-    const numLeafFaces = (leaffacesLump.length / LEAFFACE_RECORD_SIZE) | 0;
-    const leafFaces = new Int32Array(numLeafFaces);
-    for (let i = 0; i < numLeafFaces; i++) leafFaces[i] = dv.getInt32(leaffacesLump.offset + 4 * i, true);
-
-    const faceCluster = new Int32Array(numFaces).fill(-1);
-    for (let l = 0; l < numLeafs; l++) {
-        const cluster = leafCluster[l];
-        if (cluster < 0) continue;
-        const first = leafFirstFace[l],
-            count = leafNumFaces[l];
-        for (let f = 0; f < count; f++) {
-            const li = first + f;
-            if (li < 0 || li >= numLeafFaces) continue;
-            const faceIdx = leafFaces[li];
-            if (faceIdx >= 0 && faceIdx < numFaces) faceCluster[faceIdx] = cluster;
-        }
-    }
-
-    // IBSP46 stores visdata as a plain per-cluster bit matrix (no RLE, unlike
-    // Quake1/2) — numClusters rows of bytesPerCluster bytes each, right after
-    // the 8-byte header.
-    let numClusters = 0,
-        bytesPerCluster = 0,
-        visBits = null;
-    if (visLump.length >= 8) {
-        numClusters = dv.getInt32(visLump.offset, true);
-        bytesPerCluster = dv.getInt32(visLump.offset + 4, true);
-        const need = 8 + numClusters * bytesPerCluster;
-        if (numClusters > 0 && bytesPerCluster > 0 && visLump.length >= need) {
-            visBits = new Uint8Array(buffer, visLump.offset + 8, numClusters * bytesPerCluster).slice();
-        } else {
-            numClusters = 0;
-            bytesPerCluster = 0;
-        }
-    }
-
-    const hasTree = numNodes > 0 && numPlanes > 0 && numLeafs > 0;
-    const hasVis = hasTree && visBits !== null;
-    console.log(
-        hasVis
-            ? `[BSP Worker] PVS: ${numClusters} clusters, ${bytesPerCluster} bytes/row — occlusion culling enabled`
-            : "[BSP Worker] No visdata/BSP tree — PVS culling disabled, map renders fully (legacy behavior)"
-    );
-
-    return {
-        hasTree,
-        hasVis,
-        planes,
-        nodePlane,
-        nodeChildren,
-        leafCluster,
-        faceCluster,
-        numClusters,
-        bytesPerCluster,
-        visBits,
-    };
-}
-
-function buildBatches(buffer, facesLump, meshvertsLump, rawPos, rawUV1, rawUV2, rawNorm, lmAtlas, numLightmaps, noclipFaceSet, texNames, faceCluster) {
-    const dv = new DataView(buffer),
-        numFaces = (facesLump.length / FACE_RECORD_SIZE) | 0,
-        numMeshVerts = (meshvertsLump.length / 4) | 0,
-        meshVerts = new Int32Array(buffer, meshvertsLump.offset, numMeshVerts),
-        groups = new Map(),
-        numVerts = rawPos.length / 3;
-
-    for (let f = 0; f < numFaces; f++) {
-        const o = facesLump.offset + FACE_RECORD_SIZE * f,
-            texIdx = dv.getInt32(o, true),
-            faceType = dv.getInt32(o + 8, true);
-        if (faceType !== 1 && faceType !== 3) continue;
-        const firstVert = dv.getInt32(o + 12, true),
-            numVertsInFace = dv.getInt32(o + 16, true);
-        if (numVertsInFace < 3) continue;
-        if (firstVert < 0 || firstVert >= numVerts) continue;
-        const firstMeshVert = dv.getInt32(o + 20, true),
-            numMeshVertsInFace = dv.getInt32(o + 24, true),
-            lmIdx = dv.getInt32(o + 28, true),
-            noclip = noclipFaceSet.has(f),
-            texLower = (texNames[texIdx] || "").toLowerCase(),
-            invisible = INVISIBLE_TEXTURES.has(texLower),
-            cluster = faceCluster ? faceCluster[f] : -1,
-            key = `${texIdx}:${lmIdx}:${noclip ? "n" : "s"}:${invisible ? "i" : "v"}:${cluster}`;
-
-        let group = groups.get(key);
-        if (!group) {
-            group = { texIdx, lmIdx, noclip, invisible, cluster, absIndices: [] };
-            groups.set(key, group);
-        }
-        const indices = group.absIndices;
-
-        if (numMeshVertsInFace > 0) {
-            for (let i = 0; i < numMeshVertsInFace; i++) {
-                const mv = firstMeshVert + i;
-                if (mv < 0 || mv >= numMeshVerts) continue;
-                const vi = firstVert + meshVerts[mv];
-                if (vi >= 0 && vi < numVerts) indices.push(vi);
-            }
-        } else {
-            for (let i = 1; i < numVertsInFace - 1; i++) {
-                const a = firstVert,
-                    b = firstVert + i,
-                    c = firstVert + i + 1;
-                if (a < numVerts && b < numVerts && c < numVerts) indices.push(a, b, c);
-            }
-        }
-    }
-
-    const lmCols = lmAtlas ? lmAtlas.cols : 1,
-        lmW = lmAtlas ? lmAtlas.W : 1,
-        lmH = lmAtlas ? lmAtlas.H : 1,
-        batches = [];
-
-    for (const [, group] of groups) {
-        const indices = group.absIndices;
-        if (!indices.length) continue;
-
-        const remap = new Map(),
-            count = indices.length,
-            pos = new Float32Array(3 * count),
-            nrm = new Float32Array(3 * count),
-            uv1 = new Float32Array(2 * count),
-            uv2 = new Float32Array(2 * count),
-            idx = new Uint32Array(indices.length);
-
-        let lmOffX = 0,
-            lmOffY = 0,
-            lmScaleX = 1,
-            lmScaleY = 1;
-        if (lmAtlas && group.lmIdx >= 0 && group.lmIdx < numLightmaps) {
-            lmOffX = ((group.lmIdx % lmCols) * 128) / lmW;
-            lmOffY = (128 * ((group.lmIdx / lmCols) | 0)) / lmH;
-            lmScaleX = 128 / lmW;
-            lmScaleY = 128 / lmH;
-        }
-
-        let next = 0;
-        for (let i = 0; i < indices.length; i++) {
-            const v = indices[i];
-            let mapped = remap.get(v);
-            if (mapped === undefined) {
-                mapped = next++;
-                remap.set(v, mapped);
-                pos[3 * mapped] = rawPos[3 * v];
-                pos[3 * mapped + 1] = rawPos[3 * v + 1];
-                pos[3 * mapped + 2] = rawPos[3 * v + 2];
-                nrm[3 * mapped] = rawNorm[3 * v];
-                nrm[3 * mapped + 1] = rawNorm[3 * v + 1];
-                nrm[3 * mapped + 2] = rawNorm[3 * v + 2];
-                uv1[2 * mapped] = rawUV1[2 * v];
-                uv1[2 * mapped + 1] = 1 - rawUV1[2 * v + 1];
-                uv2[2 * mapped] = rawUV2[2 * v] * lmScaleX + lmOffX;
-                uv2[2 * mapped + 1] = rawUV2[2 * v + 1] * lmScaleY + lmOffY;
-            }
-            idx[i] = mapped;
-        }
-
-        batches.push({
-            texIdx: group.texIdx,
-            lmIdx: group.lmIdx,
-            noclip: group.noclip,
-            invisible: group.invisible,
-            cluster: group.cluster,
-            hasLM: lmAtlas !== null && group.lmIdx >= 0 && group.lmIdx < numLightmaps,
-            pos: pos.subarray(0, 3 * next),
-            nrm: nrm.subarray(0, 3 * next),
-            uv1: uv1.subarray(0, 2 * next),
-            uv2: uv2.subarray(0, 2 * next),
-            idx,
+        _.push({
+            texIdx: t.texIdx,
+            lmIdx: t.lmIdx,
+            noclip: t.noclip,
+            invisible: t.invisible,
+            hasLM: null !== l && t.lmIdx >= 0 && t.lmIdx < i,
+            pos: f.subarray(0, 3 * M),
+            nrm: p.subarray(0, 3 * M),
+            uv1: g.subarray(0, 2 * M),
+            uv2: u.subarray(0, 2 * M),
+            idx: m,
         });
     }
-    return batches;
+    return _;
 }
-
-self.onmessage = function ({ data }) {
+self.onmessage = function ({ data: t }) {
     try {
-        const { buffer, textureBase, fallbackTexBase } = data,
-            dv = new DataView(buffer);
-        if (dv.getUint32(0, true) !== MAGIC) throw new Error("File is not IBSP");
-        if (dv.getInt32(4, true) !== VERSION) throw new Error(`BSP version ${dv.getInt32(4, true)} is not supported`);
-        const lump = (i) => ({ offset: dv.getInt32(8 + 8 * i, true), length: dv.getInt32(8 + 8 * i + 4, true) });
-
+        const { buffer: e, textureBase: s, fallbackTexBase: n } = t,
+            o = new DataView(e);
+        if (o.getUint32(0, !0) !== MAGIC) throw new Error("File is not IBSP");
+        if (46 !== o.getInt32(4, !0)) throw new Error(`BSP version ${o.getInt32(4, !0)} is not supported`);
+        const r = (t) => ({ offset: o.getInt32(8 + 8 * t, !0), length: o.getInt32(8 + 8 * t + 4, !0) });
         self.postMessage({ type: "progress", pct: 5 });
-
-        const entitiesLump = lump(LUMP_ENTITIES),
-            entities = parseEntityLump(new TextDecoder().decode(new Uint8Array(buffer, entitiesLump.offset, entitiesLump.length))),
-            portals = [];
-        let ambientIntensity, ambientColorArr, playerStart = null;
-
-        for (const ent of entities) {
-            if (ent.classname === "trigger_portal") {
-                portals.push(ent);
-            } else if (ent.classname === "info_player_start") {
-                const [px, py, pz] = (ent.origin || "0 0 0").split(" ").map(Number);
-                playerStart = { x: UNIT * px, y: UNIT * pz, z: UNIT * -py, angle: parseFloat(ent.angle || "0") };
-            } else if (ent.classname === "worldspawn") {
-                const amb = parseFloat(ent._ambient);
-                if (!isNaN(amb)) ambientIntensity = amb;
-                if (ent._ambient_color) {
-                    const [r, g, b] = ent._ambient_color.trim().split(/\s+/).map(Number);
-                    if (!isNaN(r)) ambientColorArr = [r / 255, g / 255, b / 255];
+        const a = r(0),
+            l = parseEntityLump(new TextDecoder().decode(new Uint8Array(e, a.offset, a.length))),
+            i = [],
+            c = [];
+        let f,
+            p,
+            g = null;
+        for (const t of l)
+            if ("trigger_portal" === t.classname) i.push(t);
+            else if ("info_player_start" === t.classname) {
+                const [e, s, n] = (t.origin || "0 0 0").split(" ").map(Number);
+                g = { x: 0.02 * e, y: 0.02 * n, z: 0.02 * -s, angle: parseFloat(t.angle || "0") };
+            } else if ("worldspawn" === t.classname) {
+                const e = parseFloat(t._ambient);
+                if ((isNaN(e) || (f = e), t._ambient_color)) {
+                    const [e, s, n] = t._ambient_color.trim().split(/\s+/).map(Number);
+                    isNaN(e) || (p = [e / 255, s / 255, n / 255]);
                 }
             }
-        }
-
-        const lights = parseLights(entities);
-        self.postMessage({ type: "progress", pct: 10 });
-
-        const noclipFaceSet = buildNoclipFaceSet(entities, buffer, lump(LUMP_MODELS));
-        if (noclipFaceSet.size > 0) console.log(`[BSP Worker] Noclip faces: ${noclipFaceSet.size} (func_wall etc.)`);
-
-        const texturesLump = lump(LUMP_TEXTURES),
-            numTextures = (texturesLump.length / TEX_RECORD_SIZE) | 0,
-            texNames = [];
-        for (let i = 0; i < numTextures; i++) {
-            const o = texturesLump.offset + TEX_RECORD_SIZE * i;
-            let name = "";
-            for (let c = 0; c < 64; c++) {
-                const byte = dv.getUint8(o + c);
-                if (!byte) break;
-                name += String.fromCharCode(byte);
+        const u = parseLights(l);
+        c.push(...u), self.postMessage({ type: "progress", pct: 10 });
+        const m = buildNoclipFaceSet(l, e, r(7));
+        m.size > 0 && console.log(`[BSP Worker] Noclip faces: ${m.size} (func_wall etc.)`);
+        const h = r(1),
+            I = (h.length / 72) | 0,
+            w = [];
+        for (let t = 0; t < I; t++) {
+            const e = h.offset + 72 * t;
+            let s = "";
+            for (let t = 0; t < 64; t++) {
+                const n = o.getUint8(e + t);
+                if (!n) break;
+                s += String.fromCharCode(n);
             }
-            texNames.push(name.replace(/\\/g, "/").replace(/^textures\//i, ""));
+            w.push(s.replace(/\\/g, "/").replace(/^textures\//i, ""));
         }
         self.postMessage({ type: "progress", pct: 20 });
-
-        const lightmapsLump = lump(LUMP_LIGHTMAPS),
-            numLightmaps = (lightmapsLump.length / LM_SIZE) | 0,
-            lmAtlas = buildLightmapAtlas(buffer, lightmapsLump, numLightmaps);
-        self.postMessage({ type: "progress", pct: 35 });
-
-        const { rawPos, rawUV1, rawUV2, rawNorm } = parseVertices(buffer, lump(LUMP_VERTS));
-        self.postMessage({ type: "progress", pct: 48 });
-
-        const facesLump = lump(LUMP_FACES),
-            numFaces = (facesLump.length / FACE_RECORD_SIZE) | 0;
-
-        let bspTree = null;
-        try {
-            bspTree = parseBSPTree(buffer, lump(LUMP_PLANES), lump(LUMP_NODES), lump(LUMP_LEAFS), lump(LUMP_LEAFFACES), lump(LUMP_VISDATA), numFaces);
-        } catch (e) {
-            console.warn("[BSP Worker] BSP tree parse failed — PVS culling disabled:", e.message);
-        }
+        const S = r(14),
+            d = (S.length / 49152) | 0,
+            _ = buildLightmapAtlas(e, S, d);
+        self.postMessage({ type: "progress", pct: 40 });
+        const { rawPos: b, rawUV1: y, rawUV2: M, rawNorm: E } = parseVertices(e, r(10));
         self.postMessage({ type: "progress", pct: 55 });
-
-        const batches = buildBatches(
-            buffer,
-            facesLump,
-            lump(LUMP_MESH_VERTS),
-            rawPos,
-            rawUV1,
-            rawUV2,
-            rawNorm,
-            lmAtlas,
-            numLightmaps,
-            noclipFaceSet,
-            texNames,
-            bspTree && bspTree.hasTree ? bspTree.faceCluster : null
-        );
+        const A = buildBatches(e, r(13), r(11), b, y, M, E, _, d, m, w);
         self.postMessage({ type: "progress", pct: 85 });
-
-        const transfer = [];
-        if (lmAtlas) transfer.push(lmAtlas.atlasData);
-        for (const b of batches) {
-            b.pos = b.pos.slice().buffer;
-            b.nrm = b.nrm.slice().buffer;
-            b.uv1 = b.uv1.slice().buffer;
-            b.uv2 = b.uv2.slice().buffer;
-            b.idx = b.idx.buffer;
-            transfer.push(b.pos, b.nrm, b.uv1, b.uv2, b.idx);
-        }
-
-        let bspTreeMsg = null;
-        if (bspTree && bspTree.hasTree) {
-            bspTreeMsg = {
-                hasVis: bspTree.hasVis,
-                planes: bspTree.planes.buffer,
-                nodePlane: bspTree.nodePlane.buffer,
-                nodeChildren: bspTree.nodeChildren.buffer,
-                leafCluster: bspTree.leafCluster.buffer,
-                numClusters: bspTree.numClusters,
-                bytesPerCluster: bspTree.bytesPerCluster,
-                visBits: bspTree.visBits ? bspTree.visBits.buffer : null,
-            };
-            transfer.push(bspTreeMsg.planes, bspTreeMsg.nodePlane, bspTreeMsg.nodeChildren, bspTreeMsg.leafCluster);
-            if (bspTreeMsg.visBits) transfer.push(bspTreeMsg.visBits);
-        }
-
-        self.postMessage({ type: "progress", pct: 95 });
-        self.postMessage(
-            {
-                type: "done",
-                portals,
-                lights,
-                playerStart,
-                ambientIntensity,
-                ambientColorArr,
-                texNames,
-                lmAtlas: lmAtlas
-                    ? { data: lmAtlas.atlasData, W: lmAtlas.W, H: lmAtlas.H, cols: lmAtlas.cols, rows: lmAtlas.rows, nonZero: lmAtlas.nonZero }
-                    : null,
-                batches,
-                bspTree: bspTreeMsg,
-            },
-            transfer
-        );
-    } catch (err) {
-        self.postMessage({ type: "error", message: err.message });
+        const N = [];
+        _ && N.push(_.atlasData);
+        for (const t of A)
+            (t.pos = t.pos.slice().buffer),
+                (t.nrm = t.nrm.slice().buffer),
+                (t.uv1 = t.uv1.slice().buffer),
+                (t.uv2 = t.uv2.slice().buffer),
+                (t.idx = t.idx.buffer),
+                N.push(t.pos, t.nrm, t.uv1, t.uv2, t.idx);
+        self.postMessage({ type: "progress", pct: 95 }),
+            self.postMessage(
+                {
+                    type: "done",
+                    portals: i,
+                    lights: c,
+                    playerStart: g,
+                    ambientIntensity: f,
+                    ambientColorArr: p,
+                    texNames: w,
+                    lmAtlas: _
+                        ? { data: _.atlasData, W: _.W, H: _.H, cols: _.cols, rows: _.rows, nonZero: _.nonZero }
+                        : null,
+                    batches: A,
+                },
+                N
+            );
+    } catch (t) {
+        self.postMessage({ type: "error", message: t.message });
     }
 };
