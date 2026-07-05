@@ -6,11 +6,20 @@
 // map has no tree/visdata lumps (e.g. compiled without a -vis pass) — legacy
 // maps keep rendering fully, unchanged.
 //
-// IMPORTANT: a face can be referenced by more than one leaf (boundary faces
-// between clusters, or large surfaces cut across many leafs). Each face keeps
-// the FULL list of clusters that reference it (not just the last one seen) —
-// otherwise a boundary face gets assigned to only one cluster and disappears
-// when the camera is standing in another cluster that can also see it.
+// IMPORTANT: per-cluster batch splitting (buildBatches) only kicks in when
+// hasVis is true. A leaf's cluster id exists from the -bsp phase regardless
+// of whether -vis ever ran, but without visdata there is no PVS matrix to
+// cull anything with — splitting batches by cluster in that case would only
+// add draw calls/duplicated geometry for zero benefit, which is a real perf
+// regression, not an optimization. So: no usable visdata -> exactly the old
+// single-batch-per-texture/lightmap behavior, no fragmentation at all.
+//
+// IMPORTANT #2: a face can be referenced by more than one leaf (boundary
+// faces between clusters, or large surfaces cut across many leafs). Each
+// face keeps the FULL list of clusters that reference it (not just the last
+// one seen) — otherwise a boundary face gets assigned to only one cluster
+// and disappears when the camera is standing in another cluster that can
+// also see it.
 
 const MAGIC = 1347633737,
     VERSION = 46,
@@ -344,11 +353,18 @@ function parseBSPTree(buffer, planesLump, nodesLump, leafsLump, leaffacesLump, v
 
     const hasTree = numNodes > 0 && numPlanes > 0 && numLeafs > 0;
     const hasVis = hasTree && visBits !== null;
-    console.log(
-        hasVis
-            ? `[BSP Worker] PVS: ${numClusters} clusters, ${bytesPerCluster} bytes/row — occlusion culling enabled`
-            : "[BSP Worker] No visdata/BSP tree — PVS culling disabled, map renders fully (legacy behavior)"
-    );
+
+    if (hasVis) {
+        console.log(`[BSP Worker] PVS: ${numClusters} clusters, ${bytesPerCluster} bytes/row — occlusion culling enabled`);
+    } else if (hasTree) {
+        console.warn(
+            `[BSP Worker] BSP tree found (${numNodes} nodes, ${numLeafs} leafs) but no usable visdata ` +
+            `(visLump.length=${visLump.length}, parsed numClusters=${numClusters}, bytesPerCluster=${bytesPerCluster}). ` +
+            "PVS culling disabled — map renders fully (legacy behavior). Was this map compiled with q3map2 -vis, and does the .bsp/.expore actually come from that fresh compile (not a cached/older build)?"
+        );
+    } else {
+        console.log("[BSP Worker] No BSP tree lumps found — PVS culling disabled, map renders fully (legacy behavior)");
+    }
 
     return {
         hasTree,
@@ -566,6 +582,10 @@ self.onmessage = function ({ data }) {
         }
         self.postMessage({ type: "progress", pct: 55 });
 
+        // Per-cluster batch splitting only when we actually have usable PVS
+        // data (hasVis). Splitting on cluster id alone (hasTree, no vis)
+        // would fragment geometry into more draw calls with nothing to gain
+        // from it, since there'd be no visibility matrix to cull against.
         const batches = buildBatches(
             buffer,
             facesLump,
@@ -578,7 +598,7 @@ self.onmessage = function ({ data }) {
             numLightmaps,
             noclipFaceSet,
             texNames,
-            bspTree && bspTree.hasTree ? { offsets: bspTree.faceClusterOffsets, list: bspTree.faceClusterList } : null
+            bspTree && bspTree.hasVis ? { offsets: bspTree.faceClusterOffsets, list: bspTree.faceClusterList } : null
         );
         self.postMessage({ type: "progress", pct: 85 });
 
