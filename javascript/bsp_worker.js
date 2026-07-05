@@ -442,7 +442,11 @@ function buildBatches(buffer, facesLump, meshvertsLump, rawPos, rawUV1, rawUV2, 
         if (faceClusterInfo) {
             const start = faceClusterInfo.offsets[f],
                 end = faceClusterInfo.offsets[f + 1];
-            for (let ci = start; ci < end; ci++) group.clusterSet.add(faceClusterInfo.list[ci]);
+            if (end > start) {
+                for (let ci = start; ci < end; ci++) group.clusterSet.add(faceClusterInfo.list[ci]);
+            } else {
+                group.clusterSet.add(-1);
+            }
         } else {
             group.clusterSet.add(-1);
         }
