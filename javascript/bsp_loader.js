@@ -498,19 +498,25 @@ function buildGeometry(e) {
 function mergeBatchGeometries(e) {
     const t = new Map();
     for (const a of e) {
-        const cluster = a.cluster ?? -1,
-            key = `${a.texIdx}|${a.lmIdx}|${a.noclip ? 1 : 0}|${a.invisible ? 1 : 0}|${cluster}`;
-        t.has(key) ||
+        const key = `${a.texIdx}|${a.lmIdx}|${a.noclip ? 1 : 0}|${a.invisible ? 1 : 0}`;
+        if (!t.has(key)) {
             t.set(key, {
                 texIdx: a.texIdx,
                 lmIdx: a.lmIdx,
                 noclip: a.noclip,
                 invisible: a.invisible,
                 hasLM: a.hasLM,
-                cluster,
+                clusterSet: new Set(),
                 parts: [],
             });
-        t.get(key).parts.push(a);
+        }
+        const group = t.get(key);
+        if (a.clusters) {
+            for (const c of a.clusters) group.clusterSet.add(c);
+        } else if (a.cluster !== undefined) {
+            group.clusterSet.add(a.cluster);
+        }
+        group.parts.push(a);
     }
     const a = [];
     for (const [, e] of t) {
@@ -523,7 +529,7 @@ function mergeBatchGeometries(e) {
                 noclip: e.noclip,
                 invisible: e.invisible,
                 hasLM: e.hasLM,
-                cluster: e.cluster,
+                clusters: Array.from(e.clusterSet),
             });
     }
     return a;
@@ -538,6 +544,7 @@ async function buildMeshesProgressively(e, t, a, n, r, o) {
         c = 0,
         g = 0;
     const d = new Map();
+    const sharedMaterials = new Map();
     for (let u = 0; u < e.length; u++) {
         u > 0 && u % 10 == 0 && (o?.(90 + (u / e.length) * 10), await yieldToEventLoop());
         const h = e[u],
@@ -545,26 +552,39 @@ async function buildMeshesProgressively(e, t, a, n, r, o) {
         let m;
         if (h.invisible) m = _invisibleMat;
         else {
-            const e = n.get(p) ?? null;
-            (m = new THREE.MeshLambertMaterial({ map: e ?? _whiteTex, side: THREE.DoubleSide, alphaTest: 0.5 })),
-                e || (d.has(p) || d.set(p, []), d.get(p).push(m));
+            const matKey = p + (h.hasLM && a && !h.invisible ? "_lm" : "");
+            if (sharedMaterials.has(matKey)) {
+                m = sharedMaterials.get(matKey);
+            } else {
+                const tex = n.get(p) ?? null;
+                m = new THREE.MeshLambertMaterial({ map: tex ?? _whiteTex, side: THREE.DoubleSide, alphaTest: 0.5 });
+                if (h.hasLM && a && !h.invisible) {
+                    m.lightMap = a;
+                    m.lightMapIntensity = 1;
+                }
+                sharedMaterials.set(matKey, m);
+                tex || (d.has(p) || d.set(p, []), d.get(p).push(m));
+            }
         }
         const f = new THREE.Mesh(h.geo, m);
-        (f.onBeforeRender = function () {
+        f.onBeforeRender = function () {
             m.map && (m.map._lastVisibleFrame = _currentFrame);
-        }),
-            (f.matrixAutoUpdate = !1),
-            f.updateMatrix(),
-            (f.frustumCulled = !0),
-            h.invisible && ((f.userData.invisible = !0), c++),
-            h.noclip && ((f.userData.noclip = !0), l++),
-            h.hasLM && a && !h.invisible && ((m.lightMap = a), (m.lightMapIntensity = 1), s++),
-            h.cluster !== undefined && h.cluster >= 0 && ((f.userData.cluster = h.cluster), g++),
-            r.add(f),
-            i++;
+        };
+        f.matrixAutoUpdate = !1;
+        f.updateMatrix();
+        f.frustumCulled = !0;
+        h.invisible && ((f.userData.invisible = !0), c++);
+        h.noclip && ((f.userData.noclip = !0), l++);
+        h.hasLM && a && !h.invisible && s++;
+        if (h.clusters && h.clusters.length > 0) {
+            f.userData.clusterSet = new Set(h.clusters);
+            g++;
+        }
+        r.add(f);
+        i++;
     }
     return (
-        console.log(`[BSP] Meshes: ${i} total, with lightmap: ${s}, noclip: ${l}, invisible clip: ${c}, PVS-tagged: ${g}`),
+        console.log(`[BSP] Meshes: ${i} total, noclip: ${l}, invisible clip: ${c}, PVS-tagged: ${g}`),
         { totalMeshes: i, pendingSwap: d }
     );
 }

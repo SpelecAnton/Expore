@@ -531,6 +531,18 @@ export async function initEngine({
     window._rendererInfo = renderer.info;
     initTexLoader(renderer);
 
+    const fpsOverlay = document.createElement("div");
+    fpsOverlay.style.position = "absolute";
+    fpsOverlay.style.top = "10px";
+    fpsOverlay.style.right = "10px";
+    fpsOverlay.style.color = "#0f0";
+    fpsOverlay.style.fontFamily = "monospace";
+    fpsOverlay.style.fontSize = "16px";
+    fpsOverlay.style.zIndex = "1000";
+    fpsOverlay.style.pointerEvents = "none";
+    fpsOverlay.style.textShadow = "1px 1px 2px #000";
+    document.body.appendChild(fpsOverlay);
+
     const scene  = new THREE.Scene;
     const fogCol = new THREE.Color(fogColor).convertSRGBToLinear();
     scene.fog        = new THREE.Fog(fogCol, 0.2 * renderDistance, renderDistance);
@@ -575,16 +587,11 @@ export async function initEngine({
     const solidMeshes = [];
     const invisMeshes = [];
 
-    // PVS state: every BSP-tagged mesh gets reparented under a small
-    // THREE.Group per cluster (clusterGroups), so toggling visibility on a
-    // camera-cluster change is one "group.visible = ..." per cluster instead
-    // of walking every mesh in that cluster — this matters a lot on maps
-    // where the camera sits near a splitting plane (e.g. eye height exactly
-    // at a floor/step plane) and the detected cluster can flicker between
-    // two values every frame from float jitter. bspTree stays null (PVS
-    // disabled) unless the loaded map actually shipped visdata, so
-    // untouched/legacy maps behave exactly as before.
-    const clusterGroups = new Map();
+    // PVS state: Instead of THREE.Group reparenting, we keep a flat array
+    // of all meshes that have clusterSet data. When the camera cluster
+    // changes, we iterate this array and set mesh.visible based on the
+    // visibility of any of the clusters in its clusterSet.
+    const pvsMeshes = [];
     let bspTree = null;
 
     const bgMusicPromise = findBackgroundMusic(mapBaseFromUrl(mapUrl));
@@ -645,37 +652,19 @@ export async function initEngine({
         }
 
         const portalMeshSet = new Set(portals.map(p => p.mesh));
-        const clusterMeshesTmp = new Map();
         scene.traverse(obj => {
             if (!obj.isMesh || !obj.geometry) return;
             if (portalMeshSet.has(obj)) return;
             if (obj.userData.invisible)                    invisMeshes.push(obj);
             else if (obj.material?.depthWrite !== false)   solidMeshes.push(obj);
-            if (obj.userData.cluster !== undefined) {
-                let bucket = clusterMeshesTmp.get(obj.userData.cluster);
-                if (!bucket) clusterMeshesTmp.set(obj.userData.cluster, bucket = []);
-                bucket.push(obj);
+            if (obj.userData.clusterSet !== undefined) {
+                pvsMeshes.push(obj);
             }
         });
 
         if (bsp.bspTree && bsp.bspTree.hasVis) {
             bspTree = bsp.bspTree;
-            // Reparent tagged meshes into one THREE.Group per cluster. The
-            // meshes already sit at identity local transform (BSP geometry
-            // is baked in world space), and the Group itself is added at
-            // identity too, so this is a pure hierarchy change — nothing
-            // moves on screen.
-            for (const [cluster, meshes] of clusterMeshesTmp) {
-                const group = new THREE.Group();
-                group.name = `pvs-cluster-${cluster}`;
-                scene.add(group);
-                for (const mesh of meshes) {
-                    scene.remove(mesh);
-                    group.add(mesh);
-                }
-                clusterGroups.set(cluster, group);
-            }
-            console.log(`[Engine] PVS occlusion culling active — ${clusterGroups.size} cluster groups, ${bspTree.numClusters} total in map`);
+            console.log(`[Engine] PVS occlusion culling active — ${pvsMeshes.length} PVS meshes, ${bspTree.numClusters} total in map`);
         } else {
             console.log("[Engine] No PVS data on this map (compile without -vis?) — rendering fully every frame, as before");
         }
@@ -774,6 +763,7 @@ export async function initEngine({
         if (e.key.toLowerCase() === "p") {
             const info = renderer.info;
             console.log("=== RENDERER STATS ===");
+            console.log(`Current FPS: ${currentFps}`);
             console.log(`Draw calls:  ${info.render.calls}`);
             console.log(`Triangles:   ${info.render.triangles}`);
             console.log(`Geometries:  ${info.memory.geometries}`);
@@ -781,16 +771,22 @@ export async function initEngine({
             console.log(`Programs:    ${info.programs?.length ?? "N/A"}`);
             console.log("======================");
         }
+        if (e.key.toLowerCase() === "b") {
+            if (bloomPass) {
+                bloomPass.enabled = !bloomPass.enabled;
+                console.log(`[Engine] Bloom ${bloomPass.enabled ? "enabled" : "disabled"}`);
+            }
+        }
         if (e.key.toLowerCase() === "v") {
             console.log("=== PVS DEBUG ===");
             if (!bspTree) {
                 console.log("No PVS data loaded for this map.");
             } else {
                 const cluster = findCluster(bspTree, cam.position);
-                let visibleClusters = 0;
-                for (const c of clusterGroups.keys()) if (clusterVisible(bspTree, cluster, c)) visibleClusters++;
+                let visibleMeshes = 0;
+                for (const m of pvsMeshes) if (m.visible) visibleMeshes++;
                 console.log(`Camera cluster: ${cluster} (stable cluster used for culling: ${_lastCamCluster})`);
-                console.log(`Visible cluster groups: ${visibleClusters} / ${clusterGroups.size} (map has ${bspTree.numClusters} total)`);
+                console.log(`Visible PVS meshes: ${visibleMeshes} / ${pvsMeshes.length} (map has ${bspTree.numClusters} total clusters)`);
             }
             console.log("==================");
         }
@@ -851,6 +847,10 @@ export async function initEngine({
     const clock  = new THREE.Clock;
     let frameN   = 0;
     let lastHash = 0;
+    let fpsFrames = 0;
+    let lastFpsTime = performance.now();
+    let currentFps = 0;
+    let currentPixelRatio = renderer.getPixelRatio();
 
     (function loop() {
         requestAnimationFrame(loop);
@@ -878,8 +878,15 @@ export async function initEngine({
             }
             if (_pendingStreak >= PVS_STABLE_FRAMES && camCluster !== _lastCamCluster) {
                 _lastCamCluster = camCluster;
-                for (const [cluster, group] of clusterGroups) {
-                    group.visible = clusterVisible(bspTree, camCluster, cluster);
+                for (const mesh of pvsMeshes) {
+                    let visible = false;
+                    for (const c of mesh.userData.clusterSet) {
+                        if (clusterVisible(bspTree, camCluster, c)) {
+                            visible = true;
+                            break;
+                        }
+                    }
+                    mesh.visible = visible;
                 }
             }
         }
@@ -938,5 +945,24 @@ export async function initEngine({
         cam.position.y = savedY + bobOffset;
         composer.render();
         cam.position.y = savedY;
+
+        fpsFrames++;
+        if (now - lastFpsTime >= 1000) {
+            currentFps = Math.round((fpsFrames * 1000) / (now - lastFpsTime));
+            fpsFrames = 0;
+            lastFpsTime = now;
+            fpsOverlay.textContent = `${currentFps} FPS`;
+            
+            // Dynamic resolution
+            if (currentFps < 30 && currentPixelRatio > 0.5) {
+                currentPixelRatio = Math.max(0.5, currentPixelRatio - 0.25);
+                renderer.setPixelRatio(currentPixelRatio);
+                console.log(`[Engine] Low FPS (${currentFps}), reducing pixelRatio to ${currentPixelRatio}`);
+            } else if (currentFps > 55 && currentPixelRatio < Math.min(window.devicePixelRatio, maxPixelRatio)) {
+                currentPixelRatio = Math.min(Math.min(window.devicePixelRatio, maxPixelRatio), currentPixelRatio + 0.25);
+                renderer.setPixelRatio(currentPixelRatio);
+                console.log(`[Engine] High FPS (${currentFps}), increasing pixelRatio to ${currentPixelRatio}`);
+            }
+        }
     })();
 }

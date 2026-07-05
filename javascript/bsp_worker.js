@@ -427,22 +427,28 @@ function buildBatches(buffer, facesLump, meshvertsLump, rawPos, rawUV1, rawUV2, 
         }
         if (!faceIndices.length) continue;
 
-        let clusters = singleAlwaysVisible;
+        // Merge key does NOT include cluster — geometry merges by
+        // texture/lightmap/flags only, keeping draw calls low.  We track
+        // which clusters each merged batch covers via clusterSet so the
+        // engine can still do PVS visibility per mesh.
+        const key = `${texIdx}:${lmIdx}:${noclip ? "n" : "s"}:${invisible ? "i" : "v"}`;
+        let group = groups.get(key);
+        if (!group) {
+            group = { texIdx, lmIdx, noclip, invisible, clusterSet: new Set(), absIndices: [] };
+            groups.set(key, group);
+        }
+
+        // Record which clusters this face belongs to (for PVS lookup).
         if (faceClusterInfo) {
             const start = faceClusterInfo.offsets[f],
                 end = faceClusterInfo.offsets[f + 1];
-            if (end > start) clusters = faceClusterInfo.list.subarray(start, end);
+            for (let ci = start; ci < end; ci++) group.clusterSet.add(faceClusterInfo.list[ci]);
+        } else {
+            group.clusterSet.add(-1);
         }
 
-        for (const cluster of clusters) {
-            const key = `${texIdx}:${lmIdx}:${noclip ? "n" : "s"}:${invisible ? "i" : "v"}:${cluster}`;
-            let group = groups.get(key);
-            if (!group) {
-                group = { texIdx, lmIdx, noclip, invisible, cluster, absIndices: [] };
-                groups.set(key, group);
-            }
-            for (const idx of faceIndices) group.absIndices.push(idx);
-        }
+        // Face indices added ONCE (not duplicated per cluster).
+        for (const idx of faceIndices) group.absIndices.push(idx);
     }
 
     const lmCols = lmAtlas ? lmAtlas.cols : 1,
@@ -499,7 +505,7 @@ function buildBatches(buffer, facesLump, meshvertsLump, rawPos, rawUV1, rawUV2, 
             lmIdx: group.lmIdx,
             noclip: group.noclip,
             invisible: group.invisible,
-            cluster: group.cluster,
+            clusters: Array.from(group.clusterSet),
             hasLM: lmAtlas !== null && group.lmIdx >= 0 && group.lmIdx < numLightmaps,
             pos: pos.subarray(0, 3 * next),
             nrm: nrm.subarray(0, 3 * next),
