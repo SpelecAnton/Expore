@@ -531,18 +531,6 @@ export async function initEngine({
     window._rendererInfo = renderer.info;
     initTexLoader(renderer);
 
-    const fpsOverlay = document.createElement("div");
-    fpsOverlay.style.position = "absolute";
-    fpsOverlay.style.top = "10px";
-    fpsOverlay.style.right = "10px";
-    fpsOverlay.style.color = "#0f0";
-    fpsOverlay.style.fontFamily = "monospace";
-    fpsOverlay.style.fontSize = "16px";
-    fpsOverlay.style.zIndex = "1000";
-    fpsOverlay.style.pointerEvents = "none";
-    fpsOverlay.style.textShadow = "1px 1px 2px #000";
-    document.body.appendChild(fpsOverlay);
-
     const scene  = new THREE.Scene;
     const fogCol = new THREE.Color(fogColor).convertSRGBToLinear();
     scene.fog        = new THREE.Fog(fogCol, 0.2 * renderDistance, renderDistance);
@@ -951,18 +939,6 @@ export async function initEngine({
             currentFps = Math.round((fpsFrames * 1000) / (now - lastFpsTime));
             fpsFrames = 0;
             lastFpsTime = now;
-            fpsOverlay.textContent = `${currentFps} FPS`;
-            
-            // Dynamic resolution
-            if (currentFps < 30 && currentPixelRatio > 0.5) {
-                currentPixelRatio = Math.max(0.5, currentPixelRatio - 0.25);
-                renderer.setPixelRatio(currentPixelRatio);
-                console.log(`[Engine] Low FPS (${currentFps}), reducing pixelRatio to ${currentPixelRatio}`);
-            } else if (currentFps > 55 && currentPixelRatio < Math.min(window.devicePixelRatio, maxPixelRatio)) {
-                currentPixelRatio = Math.min(Math.min(window.devicePixelRatio, maxPixelRatio), currentPixelRatio + 0.25);
-                renderer.setPixelRatio(currentPixelRatio);
-                console.log(`[Engine] High FPS (${currentFps}), increasing pixelRatio to ${currentPixelRatio}`);
-            }
         }
     })();
 }
