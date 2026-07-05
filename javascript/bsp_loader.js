@@ -490,20 +490,27 @@ function buildGeometry(e) {
     }
     return r(), t;
 }
+// Groups now include the PVS cluster id in the merge key, so a single merged
+// draw call never spans the whole map anymore — each mesh stays spatially
+// local, which is what makes both frustum culling AND the PVS visibility
+// toggle in engine.js actually effective (previously one mesh could cover
+// the entire level, defeating any per-object culling).
 function mergeBatchGeometries(e) {
     const t = new Map();
     for (const a of e) {
-        const e = `${a.texIdx}|${a.lmIdx}|${a.noclip ? 1 : 0}|${a.invisible ? 1 : 0}`;
-        t.has(e) ||
-            t.set(e, {
+        const cluster = a.cluster ?? -1,
+            key = `${a.texIdx}|${a.lmIdx}|${a.noclip ? 1 : 0}|${a.invisible ? 1 : 0}|${cluster}`;
+        t.has(key) ||
+            t.set(key, {
                 texIdx: a.texIdx,
                 lmIdx: a.lmIdx,
                 noclip: a.noclip,
                 invisible: a.invisible,
                 hasLM: a.hasLM,
+                cluster,
                 parts: [],
-            }),
-            t.get(e).parts.push(a);
+            });
+        t.get(key).parts.push(a);
     }
     const a = [];
     for (const [, e] of t) {
@@ -516,6 +523,7 @@ function mergeBatchGeometries(e) {
                 noclip: e.noclip,
                 invisible: e.invisible,
                 hasLM: e.hasLM,
+                cluster: e.cluster,
             });
     }
     return a;
@@ -527,7 +535,8 @@ async function buildMeshesProgressively(e, t, a, n, r, o) {
     let i = 0,
         s = 0,
         l = 0,
-        c = 0;
+        c = 0,
+        g = 0;
     const d = new Map();
     for (let u = 0; u < e.length; u++) {
         u > 0 && u % 10 == 0 && (o?.(90 + (u / e.length) * 10), await yieldToEventLoop());
@@ -550,11 +559,12 @@ async function buildMeshesProgressively(e, t, a, n, r, o) {
             h.invisible && ((f.userData.invisible = !0), c++),
             h.noclip && ((f.userData.noclip = !0), l++),
             h.hasLM && a && !h.invisible && ((m.lightMap = a), (m.lightMapIntensity = 1), s++),
+            h.cluster !== undefined && h.cluster >= 0 && ((f.userData.cluster = h.cluster), g++),
             r.add(f),
             i++;
     }
     return (
-        console.log(`[BSP] Meshes: ${i} total, with lightmap: ${s}, noclip: ${l}, invisible clip: ${c}`),
+        console.log(`[BSP] Meshes: ${i} total, with lightmap: ${s}, noclip: ${l}, invisible clip: ${c}, PVS-tagged: ${g}`),
         { totalMeshes: i, pendingSwap: d }
     );
 }
@@ -647,10 +657,28 @@ export async function loadBSP({
             console.warn("[BSP] Background texture load error:", e);
         }));
     const _ = { portals: s, playerStart: l };
-    return (
-        void 0 !== c && (_.ambientIntensity = c),
-        d && (_.ambientColor = new THREE.Color(...d)),
-        (_.lights = i.lights ?? []),
-        _
-    );
+    void 0 !== c && (_.ambientIntensity = c);
+    d && (_.ambientColor = new THREE.Color(...d));
+    _.lights = i.lights ?? [];
+
+    // Rebuild the BSP tree / PVS typed arrays from the worker's transferred
+    // ArrayBuffers. Left as null when the map has no tree/visdata (older
+    // compile, or -vis skipped) — engine.js treats null as "PVS disabled,
+    // render everything", so nothing changes on those maps.
+    if (i.bspTree) {
+        _.bspTree = {
+            hasVis: i.bspTree.hasVis,
+            planes: new Float32Array(i.bspTree.planes),
+            nodePlane: new Int32Array(i.bspTree.nodePlane),
+            nodeChildren: new Int32Array(i.bspTree.nodeChildren),
+            leafCluster: new Int32Array(i.bspTree.leafCluster),
+            numClusters: i.bspTree.numClusters,
+            bytesPerCluster: i.bspTree.bytesPerCluster,
+            visBits: i.bspTree.visBits ? new Uint8Array(i.bspTree.visBits) : null,
+        };
+    } else {
+        _.bspTree = null;
+    }
+
+    return _;
 }

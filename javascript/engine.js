@@ -55,6 +55,42 @@ function writeHashState(x, y, z, yaw) {
     history.replaceState(null, "", `#${f(x)},${f(y)},${f(z)},${f(yaw)}`);
 }
 
+// ── BSP tree / PVS occlusion culling ────────────────────────────────────────
+// findCluster() walks the compiled BSP node tree (same planes q3map2 used to
+// split the level) to find which leaf/cluster a world-space point sits in.
+// clusterVisible() then checks the PVS bit matrix q3map2 -vis baked into the
+// map to see whether "testCluster" can be seen at all from "fromCluster".
+// Both degrade safely: if a mesh/tree has no cluster info, it's just always
+// visible — this is what keeps older maps (no -vis pass) rendering exactly
+// as before.
+const BSP_TREE_MAX_DEPTH = 10000;
+
+function findCluster(tree, point) {
+    let node = 0, guard = 0;
+    while (node >= 0 && guard++ < BSP_TREE_MAX_DEPTH) {
+        const planeIdx = tree.nodePlane[node];
+        const po = 4 * planeIdx;
+        const dist = tree.planes[po] * point.x + tree.planes[po + 1] * point.y + tree.planes[po + 2] * point.z - tree.planes[po + 3];
+        const side = dist >= 0 ? 0 : 1;
+        const next = tree.nodeChildren[2 * node + side];
+        if (next < 0) {
+            const leaf = -next - 1;
+            return leaf >= 0 && leaf < tree.leafCluster.length ? tree.leafCluster[leaf] : -1;
+        }
+        node = next;
+    }
+    return -1;
+}
+
+function clusterVisible(tree, fromCluster, testCluster) {
+    if (fromCluster < 0 || testCluster < 0) return true;
+    if (fromCluster === testCluster) return true;
+    if (!tree.visBits) return true;
+    const byteIdx = fromCluster * tree.bytesPerCluster + (testCluster >> 3);
+    if (byteIdx < 0 || byteIdx >= tree.visBits.length) return true;
+    return (tree.visBits[byteIdx] & (1 << (testCluster & 7))) !== 0;
+}
+
 const AUDIO_EXTS = new Set([".mp3", ".ogg", ".wav", ".flac", ".aac"]);
 
 function isAudioUrl(url) {
@@ -539,6 +575,18 @@ export async function initEngine({
     const solidMeshes = [];
     const invisMeshes = [];
 
+    // PVS state: every BSP-tagged mesh gets reparented under a small
+    // THREE.Group per cluster (clusterGroups), so toggling visibility on a
+    // camera-cluster change is one "group.visible = ..." per cluster instead
+    // of walking every mesh in that cluster — this matters a lot on maps
+    // where the camera sits near a splitting plane (e.g. eye height exactly
+    // at a floor/step plane) and the detected cluster can flicker between
+    // two values every frame from float jitter. bspTree stays null (PVS
+    // disabled) unless the loaded map actually shipped visdata, so
+    // untouched/legacy maps behave exactly as before.
+    const clusterGroups = new Map();
+    let bspTree = null;
+
     const bgMusicPromise = findBackgroundMusic(mapBaseFromUrl(mapUrl));
 
     // Steps: create the AudioContext eagerly (it starts suspended until a
@@ -597,12 +645,40 @@ export async function initEngine({
         }
 
         const portalMeshSet = new Set(portals.map(p => p.mesh));
+        const clusterMeshesTmp = new Map();
         scene.traverse(obj => {
             if (!obj.isMesh || !obj.geometry) return;
             if (portalMeshSet.has(obj)) return;
             if (obj.userData.invisible)                    invisMeshes.push(obj);
             else if (obj.material?.depthWrite !== false)   solidMeshes.push(obj);
+            if (obj.userData.cluster !== undefined) {
+                let bucket = clusterMeshesTmp.get(obj.userData.cluster);
+                if (!bucket) clusterMeshesTmp.set(obj.userData.cluster, bucket = []);
+                bucket.push(obj);
+            }
         });
+
+        if (bsp.bspTree && bsp.bspTree.hasVis) {
+            bspTree = bsp.bspTree;
+            // Reparent tagged meshes into one THREE.Group per cluster. The
+            // meshes already sit at identity local transform (BSP geometry
+            // is baked in world space), and the Group itself is added at
+            // identity too, so this is a pure hierarchy change — nothing
+            // moves on screen.
+            for (const [cluster, meshes] of clusterMeshesTmp) {
+                const group = new THREE.Group();
+                group.name = `pvs-cluster-${cluster}`;
+                scene.add(group);
+                for (const mesh of meshes) {
+                    scene.remove(mesh);
+                    group.add(mesh);
+                }
+                clusterGroups.set(cluster, group);
+            }
+            console.log(`[Engine] PVS occlusion culling active — ${clusterGroups.size} cluster groups, ${bspTree.numClusters} total in map`);
+        } else {
+            console.log("[Engine] No PVS data on this map (compile without -vis?) — rendering fully every frame, as before");
+        }
 
         setTimeout(() => {
             console.log("[Engine] Scene ready — full render pipeline active");
@@ -705,6 +781,19 @@ export async function initEngine({
             console.log(`Programs:    ${info.programs?.length ?? "N/A"}`);
             console.log("======================");
         }
+        if (e.key.toLowerCase() === "v") {
+            console.log("=== PVS DEBUG ===");
+            if (!bspTree) {
+                console.log("No PVS data loaded for this map.");
+            } else {
+                const cluster = findCluster(bspTree, cam.position);
+                let visibleClusters = 0;
+                for (const c of clusterGroups.keys()) if (clusterVisible(bspTree, cluster, c)) visibleClusters++;
+                console.log(`Camera cluster: ${cluster} (stable cluster used for culling: ${_lastCamCluster})`);
+                console.log(`Visible cluster groups: ${visibleClusters} / ${clusterGroups.size} (map has ${bspTree.numClusters} total)`);
+            }
+            console.log("==================");
+        }
     }, { passive: true });
 
     window.addEventListener("keyup", e => { keys[e.key.toLowerCase()] = false; });
@@ -744,6 +833,18 @@ export async function initEngine({
 
     let _bobPhase = 0, _bobFactor = 0;
 
+    // PVS hysteresis: findCluster() runs every frame (it's cheap — just a
+    // tree walk), but the resulting cluster is only *acted on* once the same
+    // value has been seen for PVS_STABLE_FRAMES frames in a row. Without
+    // this, standing with the camera exactly on a splitting plane (e.g. eye
+    // height level with a floor/step plane) can make the detected cluster
+    // flip every single frame from float jitter, which used to force a full
+    // visibility re-toggle every frame — that was the stutter.
+    const PVS_STABLE_FRAMES = 2;
+    let _lastCamCluster  = -2; // sentinel: "not computed yet", distinct from a valid -1 (unknown/outside)
+    let _pendingCluster  = -2;
+    let _pendingStreak   = 0;
+
     const _frameInterval = targetFps > 0 ? 1000 / targetFps : 0;
     let _lastFrameTime   = 0;
 
@@ -766,6 +867,22 @@ export async function initEngine({
 
         const prevX = cam.position.x, prevZ = cam.position.z;
         yaw = physics.update(cam, keys, yaw, dt);
+
+        if (bspTree) {
+            const camCluster = findCluster(bspTree, cam.position);
+            if (camCluster === _pendingCluster) {
+                _pendingStreak++;
+            } else {
+                _pendingCluster = camCluster;
+                _pendingStreak = 1;
+            }
+            if (_pendingStreak >= PVS_STABLE_FRAMES && camCluster !== _lastCamCluster) {
+                _lastCamCluster = camCluster;
+                for (const [cluster, group] of clusterGroups) {
+                    group.visible = clusterVisible(bspTree, camCluster, cluster);
+                }
+            }
+        }
 
         const dx = cam.position.x - prevX, dz = cam.position.z - prevZ;
         const horizDist = Math.sqrt(dx*dx + dz*dz);
