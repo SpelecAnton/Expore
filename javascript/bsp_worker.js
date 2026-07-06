@@ -430,18 +430,33 @@ function buildBatches(buffer, facesLump, meshvertsLump, rawPos, rawUV1, rawUV2, 
                 }
             }
         } else if (numMeshVertsInFace > 0) {
-            for (let i = 0; i < numMeshVertsInFace; i++) {
-                const mv = firstMeshVert + i;
-                if (mv < 0 || mv >= numMeshVerts) continue;
-                const vi = firstVert + meshVerts[mv];
-                if (vi >= 0 && vi < numVerts) faceIndices.push(vi);
+            // Process in groups of 3 (triangles) to avoid misaligning the index buffer
+            // if a single vertex happens to be out of bounds.
+            const limit = numMeshVertsInFace - (numMeshVertsInFace % 3);
+            for (let i = 0; i < limit; i += 3) {
+                const mv1 = firstMeshVert + i,
+                      mv2 = firstMeshVert + i + 1,
+                      mv3 = firstMeshVert + i + 2;
+                if (mv1 < 0 || mv3 >= numMeshVerts) continue;
+                
+                const vi1 = firstVert + meshVerts[mv1],
+                      vi2 = firstVert + meshVerts[mv2],
+                      vi3 = firstVert + meshVerts[mv3];
+                      
+                if (vi1 >= 0 && vi1 < numVerts &&
+                    vi2 >= 0 && vi2 < numVerts &&
+                    vi3 >= 0 && vi3 < numVerts) {
+                    faceIndices.push(vi1, vi2, vi3);
+                }
             }
         } else {
             for (let i = 1; i < numVertsInFace - 1; i++) {
                 const a = firstVert,
                     b = firstVert + i,
                     c = firstVert + i + 1;
-                if (a < numVerts && b < numVerts && c < numVerts) faceIndices.push(a, b, c);
+                if (a >= 0 && a < numVerts && b >= 0 && b < numVerts && c >= 0 && c < numVerts) {
+                    faceIndices.push(a, b, c);
+                }
             }
         }
         if (!faceIndices.length) continue;
