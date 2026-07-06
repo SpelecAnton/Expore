@@ -55,38 +55,44 @@ export function createPhysics(e, t = {}) {
         }
         p = [];
         const t = collectCollidables(e);
-        let o = 0,
-            n = 0;
+        let n = 0;
+        
+        const allVertices = [];
+        const allIndices = [];
+        let vertexOffset = 0;
+
         for (const e of t) {
             const s = e.geometry;
             if (!s.attributes.position) continue;
             const r = s.attributes.position,
-                l = r.count,
-                a = new Float32Array(3 * l);
-            for (let t = 0; t < l; t++)
-                _vtmp.fromBufferAttribute(r, t).applyMatrix4(e.matrixWorld),
-                    (a[3 * t] = _vtmp.x),
-                    (a[3 * t + 1] = _vtmp.y),
-                    (a[3 * t + 2] = _vtmp.z);
-            let c;
+                l = r.count;
+            for (let t = 0; t < l; t++) {
+                _vtmp.fromBufferAttribute(r, t).applyMatrix4(e.matrixWorld);
+                allVertices.push(_vtmp.x, _vtmp.y, _vtmp.z);
+            }
             const E = s.index;
             if (E) {
-                c = new Uint32Array(E.count);
-                for (let e = 0; e < E.count; e++) c[e] = E.getX(e);
+                for (let e = 0; e < E.count; e++) allIndices.push(E.getX(e) + vertexOffset);
             } else {
-                c = new Uint32Array(l);
-                for (let e = 0; e < l; e++) c[e] = e;
+                for (let e = 0; e < l; e++) allIndices.push(e + vertexOffset);
             }
-            if (!(c.length < 3))
-                try {
-                    const e = RAPIER.ColliderDesc.trimesh(a, c).setFriction(0.7).setRestitution(0),
-                        t = i.createCollider(e);
-                    p.push(t.handle), o++;
-                } catch (t) {
-                    console.warn(`[Physics] TriMesh přeskočen: ${e.name || e.uuid.slice(0, 8)} — ${t.message}`), n++;
-                }
+            vertexOffset += l;
         }
-        (a = !0), console.log(`[Physics] Collidery: ${o} postaveny, ${n} přeskočeno (z ${t.length} meshů)`);
+
+        if (allIndices.length >= 3) {
+            try {
+                const a = new Float32Array(allVertices);
+                const c = new Uint32Array(allIndices);
+                const desc = RAPIER.ColliderDesc.trimesh(a, c).setFriction(0.7).setRestitution(0);
+                const coll = i.createCollider(desc);
+                p.push(coll.handle);
+            } catch (err) {
+                console.warn(`[Physics] Sloučený TriMesh selhal: ${err.message}`);
+                n++;
+            }
+        }
+        
+        (a = !0), console.log(`[Physics] Collidery: 1 postaven, ${n} chyb (z ${t.length} meshů sloučeno)`);
     }
     return (
         (async function () {

@@ -394,11 +394,14 @@ function buildBatches(buffer, facesLump, meshvertsLump, rawPos, rawUV1, rawUV2, 
         const o = facesLump.offset + FACE_RECORD_SIZE * f,
             texIdx = dv.getInt32(o, true),
             faceType = dv.getInt32(o + 8, true);
-        if (faceType !== 1 && faceType !== 3) continue;
+        
+        if (faceType !== 1 && faceType !== 2 && faceType !== 3) continue;
+        
         const firstVert = dv.getInt32(o + 12, true),
             numVertsInFace = dv.getInt32(o + 16, true);
         if (numVertsInFace < 3) continue;
         if (firstVert < 0 || firstVert >= numVerts) continue;
+        
         const firstMeshVert = dv.getInt32(o + 20, true),
             numMeshVertsInFace = dv.getInt32(o + 24, true),
             lmIdx = dv.getInt32(o + 28, true),
@@ -406,11 +409,27 @@ function buildBatches(buffer, facesLump, meshvertsLump, rawPos, rawUV1, rawUV2, 
             texLower = (texNames[texIdx] || "").toLowerCase(),
             invisible = INVISIBLE_TEXTURES.has(texLower);
 
-        // Gather this face's absolute vertex indices ONCE, then fan them out
-        // to every cluster group it belongs to (usually just one — see the
-        // comment on parseBSPTree above for why it can be more than one).
         const faceIndices = [];
-        if (numMeshVertsInFace > 0) {
+        
+        if (faceType === 2) {
+            // Biquadratic Bezier Patch
+            const patchWidth = dv.getInt32(o + 96, true),
+                  patchHeight = dv.getInt32(o + 100, true);
+            if (patchWidth > 0 && patchHeight > 0 && patchWidth * patchHeight <= numVertsInFace) {
+                // Tessellate patch by rendering the control point grid directly for simplicity,
+                // which fills the gap and provides collision.
+                for (let y = 0; y < patchHeight - 1; y++) {
+                    for (let x = 0; x < patchWidth - 1; x++) {
+                        const a = firstVert + y * patchWidth + x;
+                        const b = firstVert + (y + 1) * patchWidth + x;
+                        const c = firstVert + (y + 1) * patchWidth + (x + 1);
+                        const d = firstVert + y * patchWidth + (x + 1);
+                        faceIndices.push(a, b, c);
+                        faceIndices.push(a, c, d);
+                    }
+                }
+            }
+        } else if (numMeshVertsInFace > 0) {
             for (let i = 0; i < numMeshVertsInFace; i++) {
                 const mv = firstMeshVert + i;
                 if (mv < 0 || mv >= numMeshVerts) continue;
