@@ -63,6 +63,14 @@ function writeHashState(x, y, z, yaw) {
 // Both degrade safely: if a mesh/tree has no cluster info, it's just always
 // visible — this is what keeps older maps (no -vis pass) rendering exactly
 // as before.
+//
+// v7.25 — PVS culling is now config-gated (pvsCulling, default false). The
+// worker always parses the tree/visdata if present in the BSP (cheap, and
+// useful for the V debug key regardless), but the engine only ever wires up
+// `bspTree` (the thing the render loop actually checks every frame) when the
+// map author explicitly opts in via index.html. Without that flag, `bspTree`
+// stays null and the render loop's PVS branch never runs — same as a map
+// with no visdata at all.
 const BSP_TREE_MAX_DEPTH = 10000;
 
 function findCluster(tree, point) {
@@ -515,6 +523,7 @@ export async function initEngine({
     stepsVolume = 0.6,
     stepsPitchVariation = 0.15,
     stepsStopMode = "pause",
+    pvsCulling = false, // PVS/cluster occlusion culling — opt-in, off by default
 }) {
     setShaderConfig(shaderFps, shaderFilter);
     setShaderTexSize(shaderTexSize);
@@ -579,6 +588,10 @@ export async function initEngine({
     // of all meshes that have clusterSet data. When the camera cluster
     // changes, we iterate this array and set mesh.visible based on the
     // visibility of any of the clusters in its clusterSet.
+    // NOTE: pvsMeshes is still collected regardless of the pvsCulling flag
+    // (cheap bookkeeping), but bspTree — the thing the render loop actually
+    // checks — is only ever assigned when pvsCulling is true. That's the
+    // single gate that turns culling on or off.
     const pvsMeshes = [];
     let bspTree = null;
 
@@ -650,11 +663,13 @@ export async function initEngine({
             }
         });
 
-        if (bsp.bspTree && bsp.bspTree.hasVis) {
+        if (!pvsCulling) {
+            console.log("[Engine] PVS occlusion culling disabled by config (pvsCulling=false) — rendering fully every frame");
+        } else if (bsp.bspTree && bsp.bspTree.hasVis) {
             bspTree = bsp.bspTree;
             console.log(`[Engine] PVS occlusion culling active — ${pvsMeshes.length} PVS meshes, ${bspTree.numClusters} total in map`);
         } else {
-            console.log("[Engine] No PVS data on this map (compile without -vis?) — rendering fully every frame, as before");
+            console.log("[Engine] pvsCulling=true but this map has no usable PVS data (compile without -vis?) — rendering fully every frame, as before");
         }
 
         setTimeout(() => {
@@ -767,7 +782,9 @@ export async function initEngine({
         }
         if (e.key.toLowerCase() === "v") {
             console.log("=== PVS DEBUG ===");
-            if (!bspTree) {
+            if (!pvsCulling) {
+                console.log("PVS culling disabled by config (pvsCulling=false in index.html).");
+            } else if (!bspTree) {
                 console.log("No PVS data loaded for this map.");
             } else {
                 const cluster = findCluster(bspTree, cam.position);
@@ -813,7 +830,7 @@ export async function initEngine({
     });
 
     onReady?.();
-    console.log(`[Engine] bobStrength=${bobStrength}, bobSpeed=${bobSpeed}, shaderTexSize=${shaderTexSize}, shaderFps=${shaderFps||"unlimited"}, shaderFilter=${shaderFilter}, targetFps=${targetFps||"unlimited"}, stepsVolume=${stepsVolume}, stepsPitchVariation=${stepsPitchVariation}, stepsStopMode=${stepsStopMode}`);
+    console.log(`[Engine] bobStrength=${bobStrength}, bobSpeed=${bobSpeed}, shaderTexSize=${shaderTexSize}, shaderFps=${shaderFps||"unlimited"}, shaderFilter=${shaderFilter}, targetFps=${targetFps||"unlimited"}, stepsVolume=${stepsVolume}, stepsPitchVariation=${stepsPitchVariation}, stepsStopMode=${stepsStopMode}, pvsCulling=${pvsCulling}`);
 
     let _bobPhase = 0, _bobFactor = 0;
 
