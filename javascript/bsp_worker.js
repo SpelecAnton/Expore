@@ -389,18 +389,25 @@ function buildBatches(buffer, facesLump, meshvertsLump, rawPos, rawUV1, rawUV2, 
         groups = new Map(),
         numVerts = rawPos.length / 3,
         singleAlwaysVisible = [-1];
+    // Diagnostics
+    let _dbg_total = 0, _dbg_wrongType = 0, _dbg_tooFewVerts = 0, _dbg_badFirstVert = 0,
+        _dbg_emptyIdx = 0, _dbg_ok = 0, _dbg_t1 = 0, _dbg_t2 = 0, _dbg_t3 = 0;
 
     for (let f = 0; f < numFaces; f++) {
+        _dbg_total++;
         const o = facesLump.offset + FACE_RECORD_SIZE * f,
             texIdx = dv.getInt32(o, true),
             faceType = dv.getInt32(o + 8, true);
         
-        if (faceType !== 1 && faceType !== 2 && faceType !== 3) continue;
+        if (faceType !== 1 && faceType !== 2 && faceType !== 3) { _dbg_wrongType++; continue; }
+        if (faceType === 1) _dbg_t1++;
+        if (faceType === 2) _dbg_t2++;
+        if (faceType === 3) _dbg_t3++;
         
         const firstVert = dv.getInt32(o + 12, true),
             numVertsInFace = dv.getInt32(o + 16, true);
-        if (numVertsInFace < 3) continue;
-        if (firstVert < 0 || firstVert >= numVerts) continue;
+        if (numVertsInFace < 3) { _dbg_tooFewVerts++; continue; }
+        if (firstVert < 0 || firstVert >= numVerts) { _dbg_badFirstVert++; continue; }
         
         const firstMeshVert = dv.getInt32(o + 20, true),
             numMeshVertsInFace = dv.getInt32(o + 24, true),
@@ -459,7 +466,8 @@ function buildBatches(buffer, facesLump, meshvertsLump, rawPos, rawUV1, rawUV2, 
                 }
             }
         }
-        if (!faceIndices.length) continue;
+        if (!faceIndices.length) { _dbg_emptyIdx++; continue; }
+        _dbg_ok++;
 
         // Merge key does NOT include cluster — geometry merges by
         // texture/lightmap/flags only, keeping draw calls low.  We track
@@ -552,6 +560,7 @@ function buildBatches(buffer, facesLump, meshvertsLump, rawPos, rawUV1, rawUV2, 
             idx,
         });
     }
+    console.log(`[BSP Worker] buildBatches diagnostics: total=${_dbg_total}, ok=${_dbg_ok}, wrongType=${_dbg_wrongType} (t1=${_dbg_t1} t2=${_dbg_t2} t3=${_dbg_t3}), tooFewVerts=${_dbg_tooFewVerts}, badFirstVert=${_dbg_badFirstVert}, emptyIdx=${_dbg_emptyIdx}`);
     return batches;
 }
 
