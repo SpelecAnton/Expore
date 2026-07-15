@@ -516,6 +516,9 @@ function mergeBatchGeometries(e) {
         } else if (a.cluster !== undefined) {
             group.clusterSet.add(a.cluster);
         }
+        const verts = new Float32Array(a.pos).length / 3;
+        const tris = new Uint32Array(a.idx).length / 3;
+        console.log(`[BSP] batch key="${key}" verts=${verts} tris=${tris} texIdx=${a.texIdx} lmIdx=${a.lmIdx}`);
         group.parts.push(a);
     }
     const a = [];
