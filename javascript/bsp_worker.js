@@ -438,13 +438,16 @@ function buildBatches(buffer, facesLump, meshvertsLump, rawPos, rawUV1, rawUV2, 
             }
         } else if (numMeshVertsInFace > 0) {
             // Process in groups of 3 (triangles) to avoid misaligning the index buffer
-            // if a single vertex happens to be out of bounds.
+            if (numMeshVertsInFace % 3 !== 0) console.warn(`[BSP Worker] Face ${f} has non-multiple of 3 meshverts: ${numMeshVertsInFace}`);
             const limit = numMeshVertsInFace - (numMeshVertsInFace % 3);
             for (let i = 0; i < limit; i += 3) {
                 const mv1 = firstMeshVert + i,
                       mv2 = firstMeshVert + i + 1,
                       mv3 = firstMeshVert + i + 2;
-                if (mv1 < 0 || mv3 >= numMeshVerts) continue;
+                if (mv1 < 0 || mv3 >= numMeshVerts) {
+                    console.warn(`[BSP Worker] Face ${f} out of bounds meshVerts: ${mv1}..${mv3} (max ${numMeshVerts})`);
+                    continue;
+                }
                 
                 const vi1 = firstVert + meshVerts[mv1],
                       vi2 = firstVert + meshVerts[mv2],
@@ -453,7 +456,12 @@ function buildBatches(buffer, facesLump, meshvertsLump, rawPos, rawUV1, rawUV2, 
                 if (vi1 >= 0 && vi1 < numVerts &&
                     vi2 >= 0 && vi2 < numVerts &&
                     vi3 >= 0 && vi3 < numVerts) {
+                    if (vi1 === vi2 || vi2 === vi3 || vi1 === vi3) {
+                        console.warn(`[BSP Worker] Face ${f} has degenerate triangle: ${vi1}, ${vi2}, ${vi3}`);
+                    }
                     faceIndices.push(vi1, vi2, vi3);
+                } else {
+                    console.warn(`[BSP Worker] Face ${f} out of bounds absolute vertices: ${vi1}, ${vi2}, ${vi3} (max ${numVerts})`);
                 }
             }
         } else {

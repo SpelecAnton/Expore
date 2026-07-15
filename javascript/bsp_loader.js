@@ -575,7 +575,7 @@ async function buildMeshesProgressively(e, t, a, n, r, o) {
         };
         f.matrixAutoUpdate = !1;
         f.updateMatrix();
-        f.frustumCulled = false; // TEST: disabled to check if frustum culling causes gaps
+        f.frustumCulled = !0;
         h.invisible && ((f.userData.invisible = !0), c++);
         h.noclip && ((f.userData.noclip = !0), l++);
         h.hasLM && a && !h.invisible && s++;
