@@ -581,6 +581,15 @@ async function buildMeshesProgressively(e, t, a, n, r, o) {
             g++;
         }
         r.add(f);
+        // Diagnostics: detect broken bounding spheres which cause wrong frustum culling
+        const bs = f.geometry.boundingSphere;
+        const bb = f.geometry.boundingBox;
+        if (!bs || isNaN(bs.radius) || !isFinite(bs.radius) || bs.radius <= 0) {
+            console.warn(`[BSP] BROKEN bounding sphere on mesh #${i}: radius=${bs?.radius}, tex=${p}`);
+        }
+        if (bb) {
+            console.log(`[BSP] mesh #${i} tex="${p}" Y: ${bb.min.y.toFixed(2)}..${bb.max.y.toFixed(2)}, X: ${bb.min.x.toFixed(2)}..${bb.max.x.toFixed(2)}, Z: ${bb.min.z.toFixed(2)}..${bb.max.z.toFixed(2)}, clusters=${JSON.stringify(h.clusters?.slice(0,4))}`);
+        }
         i++;
     }
     return (
