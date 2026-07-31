@@ -55,6 +55,25 @@ function writeHashState(x, y, z, yaw) {
     history.replaceState(null, "", `#${f(x)},${f(y)},${f(z)},${f(yaw)}`);
 }
 
+// ── Portal target_url coordinate-teleport parsing ───────────────────────────
+// A target_url whose value is ONLY a hash fragment in the same format as
+// writeHashState()/readHashState() above ("#x,y,z,yaw", e.g.
+// "#-0.114,2.9,-38.282,3.138") is treated as an in-place teleport instead of
+// a page navigation. This lets a mapper link two spots on the SAME map
+// without a full reload. Anything else in target_url (a real URL, a URL with
+// its own hash, etc.) keeps the old page-navigation behavior unchanged.
+//
+// Only bare "#..." values qualify — deliberately strict so a normal link
+// like "https://example.com/#section" is never misread as a teleport target.
+function parseTeleportHash(targetUrl) {
+    const s = (targetUrl || "").trim();
+    if (!s.startsWith("#")) return null;
+    const parts = s.slice(1).split(",").map(Number);
+    if (parts.length !== 4 || parts.some(isNaN)) return null;
+    const [x, y, z, yaw] = parts;
+    return { x, y, z, yaw };
+}
+
 // ── BSP tree / PVS occlusion culling ────────────────────────────────────────
 // findCluster() walks the compiled BSP node tree (same planes q3map2 used to
 // split the level) to find which leaf/cluster a world-space point sits in.
@@ -383,6 +402,7 @@ function buildPortal(entity, scene, portals) {
     const [ox, oy, oz] = (entity.origin || "0 0 0").split(" ").map(Number);
     const url          = (entity.target_url || "").trim();
     const hasUrl        = url.length > 0;
+    const teleport      = parseTeleportHash(url);
     const label        = (entity.label || "").trim();
     const hasColor      = !!(entity.color && entity.color.trim());
     const color        = parseEntityColor(entity.color, 0xff2200);
@@ -415,7 +435,7 @@ function buildPortal(entity, scene, portals) {
 
     const isMedia = isPortalMediaLabel(label);
     isMedia ? applyPortalMediaTexture(label, mesh) : buildPortalLabel(label, color, mesh);
-    portals.push({ x: px, y: py, z: pz, url, label, col: color, mesh, opacity, isMedia, billboard, clickable: hasUrl });
+    portals.push({ x: px, y: py, z: pz, url, label, col: color, mesh, opacity, isMedia, billboard, clickable: hasUrl, teleport });
 }
 
 function makeSpriteTexture(r, g, b) {
@@ -804,7 +824,14 @@ export async function initEngine({
         unmuteVideos();
         const portal = getHoveredPortal();
         if (portal) {
-            if (isAudioUrl(portal.url)) {
+            if (portal.teleport) {
+                // In-place teleport: target_url was just "#x,y,z,yaw" — apply
+                // position + rotation directly instead of navigating away.
+                const { x, y, z, yaw: newYaw } = portal.teleport;
+                physics.teleport(cam, x, y, z);
+                yaw = newYaw;
+                writeHashState(x, y, z, yaw);
+            } else if (isAudioUrl(portal.url)) {
                 playPortalAudio(portal.url);
             } else {
                 document.getElementById("fade")?.classList.add("out");
