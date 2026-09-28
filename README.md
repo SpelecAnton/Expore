@@ -1,14 +1,13 @@
-# Expore 🚶‍♂️✨
+# Expore 
 
 A 3D walking simulator engine made specifically for people who don't know how to code.
-
 ---
 
-## 🚀 Quick Start & How to Use
+## Quick Start & How to Use
 
 ### 1. Get TrenchBroom
 Expore uses **TrenchBroom** as its level editor. If you don't have it yet, download and install it first.
-*🔧 [Download TrenchBroom](https://github.com/TrenchBroom/TrenchBroom/releases/)
+* 🔧 [Download TrenchBroom](https://github.com/TrenchBroom/TrenchBroom/releases/)
 
 ### 2. Download the Expore Package
 Grab the latest release of the Expore Map Maker package and extract it to your computer.
@@ -23,8 +22,9 @@ Ready to build? Follow the official step-by-step guide to configure TrenchBroom 
 * 📖 [Expore Documentation & Tutorial](https://github.com/SpelecAnton/Expore/wiki) 
 * 📺 [YouTube Tutorial](https://www.youtube.com/watch?v=odt3qntKuvs) (czech)
 
+Checkout the example games: [Snailovtich GameJam 2026](https://spelec.cz/expore/snailjam2026/)
 ---
 
-## ✨ Features
+##  Features
 * **No Code Required:** Perfect for artists, writers, and beginners who want to build 3D spaces instantly.
 * **TrenchBroom Integration:** Design levels using a clean, intuitive, and modern brush-based editor.
